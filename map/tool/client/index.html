@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AutoDrive Studio</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>AutoDrive Studio (RViz-like)</h1>
+    <div class="toolbar">
+      <input id="serverUrl" value="ws://127.0.0.1:8080/ws/stream" />
+      <button id="connectBtn">连接</button>
+      <button id="startScanBtn">开始扫图</button>
+      <button id="stopScanBtn">停止扫图</button>
+      <button id="saveMapBtn">保存地图</button>
+      <span id="status">未连接</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="left-panel">
+      <h3>机器人状态</h3>
+      <pre id="posePanel">-</pre>
+      <h3>底盘状态</h3>
+      <pre id="chassisPanel">-</pre>
+      <h3>路径打点（点击画布）</h3>
+      <button id="sendPathBtn">发送路径</button>
+      <ul id="pathList"></ul>
+      <h3>近场控制</h3>
+      <div>键盘：W/S 前后，A/D 转向，空格急停</div>
+      <button onclick="sendMove(0.8,0,0.2)">前进</button>
+      <button onclick="sendMove(0.5,0.8,0.2)">左转</button>
+      <button onclick="sendMove(0.5,-0.8,0.2)">右转</button>
+      <button onclick="stopMove()">急停</button>
+    </section>
+
+    <section class="center-panel">
+      <canvas id="lidarCanvas" width="900" height="600"></canvas>
+    </section>
+
+    <section class="right-panel">
+      <h3>四路相机概览</h3>
+      <div id="cameraGrid" class="camera-grid"></div>
+      <h3>GPS</h3>
+      <pre id="gpsPanel">-</pre>
+      <h3>通信诊断</h3>
+      <pre id="commPanel">-</pre>
+      <small>Shift + 点击画布 = 添加 POI（保存到 STCM）</small>
+    </section>
+  </main>
+
+  <script src="main.js"></script>
+</body>
+</html>
