@@ -1,0 +1,11 @@
+body { font-family: Arial, sans-serif; background:#0f1115; color:#d8dee9; margin:0; }
+header { padding:10px; background:#1a1f2b; border-bottom:1px solid #333; }
+.toolbar { display:flex; gap:8px; align-items:center; }
+.toolbar input { width:320px; }
+main { display:grid; grid-template-columns: 260px 1fr 300px; height: calc(100vh - 72px); }
+.left-panel, .right-panel { padding:10px; border-right:1px solid #2b2f3a; overflow:auto; }
+.right-panel { border-left:1px solid #2b2f3a; border-right:none; }
+.center-panel { display:flex; justify-content:center; align-items:center; }
+#lidarCanvas { background:#05070a; border:1px solid #2e3440; cursor:crosshair; }
+.camera-grid { display:grid; grid-template-columns:1fr; gap:8px; }
+.camera-card { background:#1b2230; padding:8px; border-radius:6px; }
