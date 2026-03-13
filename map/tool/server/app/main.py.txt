@@ -33,6 +33,15 @@ map_dir = Path("data/maps")
 latest_points: list[tuple[float, float, float]] = []
 seq_by_topic: dict[str, int] = defaultdict(int)
 ws_clients: set[int] = set()
+server_tasks: list[asyncio.Task] = []
+STREAM_RUNTIME = {
+    "published_bytes_by_topic": defaultdict(int),
+    "published_count_by_topic": defaultdict(int),
+    "sent_count_by_topic": defaultdict(int),
+    "sent_bytes_by_topic": defaultdict(int),
+    "ws_disconnects": 0,
+    "ws_send_timeouts": 0,
+}
 
 
 STREAM_TOPICS = [
@@ -48,6 +57,21 @@ STREAM_TOPICS = [
     "/camera/4/compressed",
     "/map/grid",
 ]
+
+
+STREAM_TOPIC_MAX_HZ = {
+    "/robot/pose": CONFIG.ws_pose_hz,
+    "/robot/gps": 1.0,
+    "/chassis/odom": CONFIG.ws_chassis_hz,
+    "/chassis/status": CONFIG.ws_chassis_hz,
+    "/lidar/front": CONFIG.ws_lidar_hz,
+    "/lidar/rear": CONFIG.ws_lidar_hz,
+    "/camera/1/compressed": CONFIG.ws_camera_hz,
+    "/camera/2/compressed": CONFIG.ws_camera_hz,
+    "/camera/3/compressed": CONFIG.ws_camera_hz,
+    "/camera/4/compressed": CONFIG.ws_camera_hz,
+    "/map/grid": CONFIG.ws_map_hz,
+}
 
 
 SCAN_SESSION = {
@@ -68,6 +92,16 @@ def _checksum(topic: str, stamp: float, seq: int, payload: dict) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _should_skip_checksum(topic: str) -> bool:
+    if not CONFIG.ws_enable_checksum:
+        return True
+    return (
+        topic.startswith("/lidar/")
+        or topic.startswith("/camera/")
+        or topic == "/map/grid"
+    )
+
+
 def _pack_message(message: dict) -> dict:
     topic = message["topic"]
     stamp = float(message["stamp"])
@@ -80,8 +114,42 @@ def _pack_message(message: dict) -> dict:
         "server_time_ms": int(time.time() * 1000),
         "seq": seq,
         "payload": payload,
-        "checksum": _checksum(topic, stamp, seq, payload),
+        "checksum": "" if _should_skip_checksum(topic) else _checksum(topic, stamp, seq, payload),
     }
+
+
+def _estimate_json_bytes(payload: Any) -> int:
+    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+async def _diag_logger_loop() -> None:
+    print("diag loop started", flush=True)
+    previous_published: dict[str, int] = defaultdict(int)
+    previous_sent: dict[str, int] = defaultdict(int)
+    while True:
+        await asyncio.sleep(CONFIG.diag_log_interval_sec)
+        published_now = dict(STREAM_RUNTIME["published_count_by_topic"])
+        sent_now = dict(STREAM_RUNTIME["sent_count_by_topic"])
+        published_delta = {
+            topic: published_now.get(topic, 0) - previous_published.get(topic, 0) for topic in STREAM_TOPICS
+        }
+        sent_delta = {topic: sent_now.get(topic, 0) - previous_sent.get(topic, 0) for topic in STREAM_TOPICS}
+        previous_published = published_now
+        previous_sent = sent_now
+        published_nonzero = {k: v for k, v in published_delta.items() if v}
+        sent_nonzero = {k: v for k, v in sent_delta.items() if v}
+        diag_line = (
+            "diag "
+            f"ws_clients={len(ws_clients)} "
+            f"disconnects={int(STREAM_RUNTIME['ws_disconnects'])} "
+            f"send_timeouts={int(STREAM_RUNTIME['ws_send_timeouts'])} "
+            f"published={published_nonzero} "
+            f"sent={sent_nonzero} "
+            f"bus={bus.stats()} "
+            f"ros={_ros_diag()}"
+        )
+        logger.info(diag_line)
+        print(diag_line, flush=True)
 
 
 def _reset_scan_session(voxel_size: float | None = None, keep_points: bool = False) -> None:
@@ -188,6 +256,7 @@ async def startup() -> None:
 
     map_dir.mkdir(parents=True, exist_ok=True)
     loop = asyncio.get_running_loop()
+    print("startup begin", flush=True)
     ros = detect_ros(bus=bus, loop=loop, config=CONFIG.ros)
 
     if ros.enabled:
@@ -197,12 +266,19 @@ async def startup() -> None:
         if CONFIG.ros.fallback_to_simulator_on_failure:
             await sim.start()
             logger.info("Simulator fallback started")
+    print(f"startup complete ros_enabled={ros.enabled} reason={ros.reason}", flush=True)
+    server_tasks.append(asyncio.create_task(_diag_logger_loop()))
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    for task in server_tasks:
+        task.cancel()
+    if server_tasks:
+        await asyncio.gather(*server_tasks, return_exceptions=True)
+        server_tasks.clear()
     if ros.enabled and ros.bridge is not None:
-        ros.bridge.stop()
+        await ros.bridge.stop_async()
     if sim._running:
         await sim.stop()
 
@@ -235,6 +311,14 @@ async def diag_stream_stats() -> dict:
         "ws_clients": len(ws_clients),
         "topic_stats": bus.stats(),
         "seq_by_topic": dict(seq_by_topic),
+        "stream_runtime": {
+            "published_count_by_topic": dict(STREAM_RUNTIME["published_count_by_topic"]),
+            "published_bytes_by_topic": dict(STREAM_RUNTIME["published_bytes_by_topic"]),
+            "sent_count_by_topic": dict(STREAM_RUNTIME["sent_count_by_topic"]),
+            "sent_bytes_by_topic": dict(STREAM_RUNTIME["sent_bytes_by_topic"]),
+            "ws_disconnects": int(STREAM_RUNTIME["ws_disconnects"]),
+            "ws_send_timeouts": int(STREAM_RUNTIME["ws_send_timeouts"]),
+        },
         "server_time_ms": int(time.time() * 1000),
         "scan_summary": _scan_summary(),
         "ros_diag": _ros_diag(),
@@ -413,9 +497,18 @@ async def ws_stream(websocket: WebSocket) -> None:
     await websocket.accept()
     ws_id = id(websocket)
     ws_clients.add(ws_id)
-    logger.info("ws connected id=%s clients=%s", ws_id, len(ws_clients))
+    client_host = getattr(getattr(websocket, "client", None), "host", "?")
+    user_agent = websocket.headers.get("user-agent", "-")
+    origin = websocket.headers.get("origin", "-")
+    logger.info("ws connected id=%s clients=%s host=%s origin=%s ua=%s", ws_id, len(ws_clients), client_host, origin, user_agent)
+    print(f"ws connected id={ws_id} host={client_host} origin={origin} ua={user_agent}", flush=True)
     tasks = []
     outbound_queue: asyncio.Queue = asyncio.Queue(maxsize=CONFIG.ws_queue_size * 2)
+    latest_by_topic: dict[str, dict] = {}
+    latest_seq_by_topic: dict[str, int] = defaultdict(int)
+    sent_seq_by_topic: dict[str, int] = defaultdict(int)
+    last_sent_at_by_topic: dict[str, float] = defaultdict(float)
+    topic_update_event = asyncio.Event()
 
     async def enqueue_topic(topic: str) -> None:
         global latest_points
@@ -435,20 +528,52 @@ async def ws_stream(websocket: WebSocket) -> None:
                     latest_points = ros_points
 
             packed = _pack_message(message)
-            if outbound_queue.full():
-                try:
-                    outbound_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            await outbound_queue.put(("json", packed))
+            STREAM_RUNTIME["published_count_by_topic"][topic] += 1
+            STREAM_RUNTIME["published_bytes_by_topic"][topic] += _estimate_json_bytes(packed)
+            latest_by_topic[topic] = packed
+            latest_seq_by_topic[topic] = int(packed["seq"])
+            topic_update_event.set()
+
+    async def flush_latest() -> None:
+        while True:
+            await topic_update_event.wait()
+            topic_update_event.clear()
+            now = time.monotonic()
+            sent_any = False
+            for topic in STREAM_TOPICS:
+                packed = latest_by_topic.get(topic)
+                if packed is None:
+                    continue
+                current_seq = latest_seq_by_topic.get(topic, 0)
+                if current_seq <= sent_seq_by_topic.get(topic, 0):
+                    continue
+                max_hz = float(STREAM_TOPIC_MAX_HZ.get(topic, 5.0))
+                min_period = 1.0 / max(0.1, max_hz)
+                last_sent_at = last_sent_at_by_topic.get(topic, 0.0)
+                if now - last_sent_at < min_period:
+                    continue
+                if outbound_queue.full():
+                    try:
+                        outbound_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                await outbound_queue.put(("json", packed))
+                sent_seq_by_topic[topic] = current_seq
+                last_sent_at_by_topic[topic] = now
+                STREAM_RUNTIME["sent_count_by_topic"][topic] += 1
+                STREAM_RUNTIME["sent_bytes_by_topic"][topic] += _estimate_json_bytes(packed)
+                sent_any = True
+            if not sent_any:
+                await asyncio.sleep(0.01)
+                topic_update_event.set()
 
     async def send_outbound() -> None:
         while True:
             message_type, payload = await outbound_queue.get()
             if message_type == "json":
-                await websocket.send_json(payload)
+                await asyncio.wait_for(websocket.send_json(payload), timeout=CONFIG.ws_send_timeout_sec)
             elif message_type == "text":
-                await websocket.send_text(payload)
+                await asyncio.wait_for(websocket.send_text(payload), timeout=CONFIG.ws_send_timeout_sec)
 
     async def receive_keepalive() -> None:
         while True:
@@ -464,6 +589,7 @@ async def ws_stream(websocket: WebSocket) -> None:
     try:
         for topic in STREAM_TOPICS:
             tasks.append(asyncio.create_task(enqueue_topic(topic)))
+        tasks.append(asyncio.create_task(flush_latest()))
         tasks.append(asyncio.create_task(send_outbound()))
         tasks.append(asyncio.create_task(receive_keepalive()))
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
@@ -472,7 +598,11 @@ async def ws_stream(websocket: WebSocket) -> None:
             if exc is not None and not isinstance(exc, WebSocketDisconnect):
                 raise exc
     except WebSocketDisconnect:
-        logger.warning("ws disconnected id=%s", ws_id)
+        STREAM_RUNTIME["ws_disconnects"] += 1
+        logger.warning("ws disconnected id=%s host=%s", ws_id, client_host)
+    except TimeoutError:
+        STREAM_RUNTIME["ws_send_timeouts"] += 1
+        logger.warning("ws send timeout id=%s host=%s", ws_id, client_host)
     except asyncio.CancelledError:
         logger.info("ws task cancelled id=%s", ws_id)
         raise

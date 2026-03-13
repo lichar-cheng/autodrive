@@ -1,11 +1,401 @@
-body { font-family: Arial, sans-serif; background:#0f1115; color:#d8dee9; margin:0; }
-header { padding:10px; background:#1a1f2b; border-bottom:1px solid #333; }
-.toolbar { display:flex; gap:8px; align-items:center; }
-.toolbar input { width:320px; }
-main { display:grid; grid-template-columns: 260px 1fr 300px; height: calc(100vh - 72px); }
-.left-panel, .right-panel { padding:10px; border-right:1px solid #2b2f3a; overflow:auto; }
-.right-panel { border-left:1px solid #2b2f3a; border-right:none; }
-.center-panel { display:flex; justify-content:center; align-items:center; }
-#lidarCanvas { background:#05070a; border:1px solid #2e3440; cursor:crosshair; }
-.camera-grid { display:grid; grid-template-columns:1fr; gap:8px; }
-.camera-card { background:#1b2230; padding:8px; border-radius:6px; }
+:root {
+  --bg: #e7edf1;
+  --surface: rgba(255, 255, 255, 0.8);
+  --surface-strong: #ffffff;
+  --line: rgba(19, 42, 55, 0.12);
+  --text: #14232d;
+  --muted: #5c6f7a;
+  --primary: #0c7c78;
+  --primary-strong: #075b58;
+  --danger: #cc4b37;
+  --shadow: 0 18px 50px rgba(13, 34, 46, 0.12);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: var(--text);
+  background:
+    radial-gradient(circle at top left, rgba(12, 124, 120, 0.18), transparent 28%),
+    radial-gradient(circle at right center, rgba(166, 174, 180, 0.22), transparent 24%),
+    linear-gradient(180deg, #f4f7f8 0%, #dfe8ec 100%);
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+  align-items: flex-end;
+  padding: 18px 24px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.62);
+  backdrop-filter: blur(18px);
+}
+
+.eyebrow {
+  margin: 0 0 6px;
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+h1,
+h2 {
+  margin: 0;
+}
+
+h1 {
+  font-size: 28px;
+  line-height: 1.1;
+}
+
+h2 {
+  font-size: 18px;
+}
+
+.layout {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 360px minmax(0, 1fr) 320px;
+  gap: 18px;
+  padding: 18px;
+}
+
+.panel {
+  min-height: 0;
+}
+
+.left-panel,
+.right-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  overflow: auto;
+}
+
+.center-panel {
+  min-width: 0;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  border-radius: 20px;
+  box-shadow: var(--shadow);
+  padding: 18px;
+}
+
+.canvas-card {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 14px;
+}
+
+.connection-bar,
+.action-row,
+.field-grid,
+.legend,
+.drive-pad,
+.canvas-toolbar,
+.camera-meta {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.canvas-toolbar,
+.camera-meta {
+  justify-content: space-between;
+  align-items: center;
+}
+
+.field-grid {
+  margin-bottom: 10px;
+}
+
+.field-grid.compact {
+  align-items: center;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 120px;
+  flex: 1;
+}
+
+.field.grow {
+  min-width: 320px;
+}
+
+.field.inline {
+  flex-direction: row;
+  align-items: center;
+}
+
+.checkbox-field {
+  justify-content: center;
+}
+
+.field span,
+.camera-meta,
+.view-metrics {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+input,
+textarea,
+button,
+select {
+  font: inherit;
+}
+
+input,
+textarea,
+select {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(19, 42, 55, 0.15);
+  background: var(--surface-strong);
+  color: var(--text);
+}
+
+textarea {
+  resize: vertical;
+}
+
+button {
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: none;
+  background: #d9e3e9;
+  color: var(--text);
+  cursor: pointer;
+  transition: transform 120ms ease, background 120ms ease;
+}
+
+button:hover {
+  transform: translateY(-1px);
+  background: #cddbe2;
+}
+
+button.primary {
+  background: var(--primary);
+  color: #f7fffe;
+}
+
+button.primary:hover {
+  background: var(--primary-strong);
+}
+
+button.danger {
+  background: var(--danger);
+  color: #fff4f2;
+}
+
+.status-chip,
+.scan-state,
+.kbd-state,
+.view-chip {
+  padding: 8px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  background: rgba(19, 42, 55, 0.08);
+  color: var(--muted);
+}
+
+.status-detail {
+  min-width: 140px;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: rgba(19, 42, 55, 0.06);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.status-chip.connected,
+.scan-state.active,
+.kbd-state.active {
+  background: #0c7c78;
+  color: #f7fffe;
+}
+
+.status-chip.warning,
+.scan-state.warning {
+  background: #f1d68a;
+  color: #5f4700;
+}
+
+.status-chip.error,
+.kbd-state.error {
+  background: #cc4b37;
+  color: #fff4f2;
+}
+
+.hint {
+  margin-top: 10px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.drive-pad {
+  margin-top: 8px;
+}
+
+.drive-pad button {
+  flex: 1 1 140px;
+}
+
+.toggle {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(19, 42, 55, 0.06);
+  font-size: 13px;
+}
+
+#pathList {
+  margin: 12px 0 0;
+  padding-left: 18px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+#lidarCanvas {
+  width: 100%;
+  height: calc(100vh - 220px);
+  min-height: 620px;
+  border-radius: 18px;
+  background: linear-gradient(180deg, #8e9398 0%, #757b81 100%);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  cursor: grab;
+}
+
+#lidarCanvas.ws-connected {
+  box-shadow: inset 0 0 0 3px rgba(12, 124, 120, 0.7);
+}
+
+#lidarCanvas.ws-warning {
+  box-shadow: inset 0 0 0 3px rgba(241, 214, 138, 0.9);
+}
+
+#lidarCanvas.ws-error {
+  box-shadow: inset 0 0 0 3px rgba(204, 75, 55, 0.8);
+}
+
+#lidarCanvas.dragging {
+  cursor: grabbing;
+}
+
+pre {
+  margin: 0;
+  padding: 14px;
+  border-radius: 16px;
+  background: rgba(19, 42, 55, 0.06);
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.camera-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.camera-card {
+  padding: 12px;
+  border-radius: 14px;
+  background: rgba(19, 42, 55, 0.06);
+}
+
+.camera-card time {
+  display: block;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.legend {
+  justify-content: flex-end;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend-dot {
+  width: 10px;
+  height: 10px;
+  display: inline-block;
+  border-radius: 999px;
+  border: 1px solid rgba(19, 42, 55, 0.2);
+}
+
+.legend-dot.occ { background: #0f1317; }
+.legend-dot.free { background: #ffffff; }
+.legend-dot.unknown { background: #8f969c; }
+
+@media (max-width: 1380px) {
+  .layout {
+    grid-template-columns: 320px minmax(0, 1fr);
+  }
+
+  .right-panel {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-content: start;
+  }
+}
+
+@media (max-width: 980px) {
+  .topbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  .right-panel {
+    grid-template-columns: 1fr;
+  }
+
+  #lidarCanvas {
+    min-height: 420px;
+    height: 60vh;
+  }
+}

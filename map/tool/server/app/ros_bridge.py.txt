@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import queue
 import threading
 import time
 from dataclasses import dataclass, field
@@ -32,6 +33,10 @@ class RosBridgeState:
     camera_payloads: dict[str, dict[str, Any]] = field(default_factory=dict)
     tf_tree: dict[tuple[str, str], dict[str, float | str]] = field(default_factory=dict)
     scanning: bool = False
+    bus_queue_dropped: int = 0
+    bus_messages_pumped: int = 0
+    received_count_by_topic: dict[str, int] = field(default_factory=dict)
+    received_bytes_by_topic: dict[str, int] = field(default_factory=dict)
 
 
 def _yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
@@ -42,6 +47,23 @@ def _yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
 
 def _normalize_frame(frame_id: str) -> str:
     return str(frame_id).lstrip("/")
+
+
+def _estimate_payload_bytes(payload: Any) -> int:
+    if isinstance(payload, (bytes, bytearray)):
+        return len(payload)
+    if isinstance(payload, str):
+        return len(payload.encode("utf-8"))
+    if isinstance(payload, (int, float, bool)) or payload is None:
+        return len(str(payload).encode("utf-8"))
+    if isinstance(payload, dict):
+        size = 2
+        for key, value in payload.items():
+            size += len(str(key).encode("utf-8")) + _estimate_payload_bytes(value)
+        return size
+    if isinstance(payload, (list, tuple)):
+        return 2 + sum(_estimate_payload_bytes(item) for item in payload)
+    return len(str(payload).encode("utf-8"))
 
 
 class RosBridge:
@@ -59,6 +81,10 @@ class RosBridge:
         self._twist_cls = None
         self._subscriptions: list[Any] = []
         self._import_error: str | None = None
+        self._bus_queue: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue(
+            maxsize=max(64, int(self.config.bus_bridge_queue_size))
+        )
+        self._pump_task: asyncio.Task | None = None
 
     def import_error(self) -> str | None:
         return self._import_error
@@ -145,18 +171,48 @@ class RosBridge:
         if self.config.topics.occupancy_grid:
             self.state.connected_topics.append(self.config.topics.occupancy_grid)
         self._running = True
+        self._pump_task = self.loop.create_task(self._pump_bus_messages())
         self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True, name="ros-bridge-spin")
         self._spin_thread.start()
 
-    def stop(self) -> None:
+    async def stop_async(self) -> None:
         self._running = False
+        if self._pump_task is not None:
+            self._pump_task.cancel()
+            await asyncio.gather(self._pump_task, return_exceptions=True)
+            self._pump_task = None
+        if self._rclpy is not None:
+            try:
+                if hasattr(self._rclpy, "try_shutdown"):
+                    self._rclpy.try_shutdown()
+                elif self._rclpy.ok():
+                    self._rclpy.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
         if self._spin_thread:
-            self._spin_thread.join(timeout=2.0)
+            await asyncio.to_thread(self._spin_thread.join, 2.0)
+            self._spin_thread = None
         if self._node is not None:
-            self._node.destroy_node()
+            try:
+                self._node.destroy_node()
+            except Exception:  # noqa: BLE001
+                pass
             self._node = None
-        if self._rclpy is not None and self._rclpy.ok():
-            self._rclpy.shutdown()
+
+    def stop(self) -> None:
+        if self.loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(self.stop_async(), self.loop)
+            future.result(timeout=5.0)
+        else:
+            self._running = False
+            if self._rclpy is not None:
+                try:
+                    if hasattr(self._rclpy, "try_shutdown"):
+                        self._rclpy.try_shutdown()
+                    elif self._rclpy.ok():
+                        self._rclpy.shutdown()
+                except Exception:  # noqa: BLE001
+                    pass
 
     def diagnostics(self) -> dict[str, Any]:
         with self._lock:
@@ -168,6 +224,11 @@ class RosBridge:
                 "occupancy_points": len(self.state.latest_occupancy_points),
                 "front_scan_points": len(self.state.latest_front_points),
                 "rear_scan_points": len(self.state.latest_rear_points),
+                "bus_queue_depth": self._bus_queue.qsize(),
+                "bus_queue_dropped": int(self.state.bus_queue_dropped),
+                "bus_messages_pumped": int(self.state.bus_messages_pumped),
+                "received_count_by_topic": dict(self.state.received_count_by_topic),
+                "received_bytes_by_topic": dict(self.state.received_bytes_by_topic),
                 "imu": dict(self.state.last_imu),
                 "has_occupancy_grid": bool(self.config.topics.occupancy_grid),
                 "tf_pairs": [f"{parent}->{child}" for parent, child in self.state.tf_tree.keys()],
@@ -214,20 +275,57 @@ class RosBridge:
 
     def _spin_loop(self) -> None:
         assert self._rclpy is not None
-        while self._running and self._rclpy.ok():
-            self._rclpy.spin_once(self._node, timeout_sec=1.0 / max(1.0, float(self.config.spin_hz)))
+        try:
+            while self._running and self._rclpy.ok():
+                self._rclpy.spin_once(self._node, timeout_sec=1.0 / max(1.0, float(self.config.spin_hz)))
+        except Exception as exc:  # noqa: BLE001
+            if exc.__class__.__name__ != "ExternalShutdownException":
+                raise
+
+    async def _pump_bus_messages(self) -> None:
+        while self._running or not self._bus_queue.empty():
+            pumped = 0
+            while pumped < 128:
+                try:
+                    topic, message = self._bus_queue.get_nowait()
+                except queue.Empty:
+                    break
+                await self.bus.publish(topic, message)
+                pumped += 1
+                with self._lock:
+                    self.state.bus_messages_pumped += 1
+            if pumped == 0:
+                await asyncio.sleep(0.005)
 
     def _publish_async(self, topic: str, payload: dict[str, Any], stamp: float | None = None) -> None:
+        if not self._running:
+            return
         message = {
             "topic": topic,
             "stamp": float(stamp if stamp is not None else time.time()),
             "payload": payload,
         }
-        asyncio.run_coroutine_threadsafe(self.bus.publish(topic, message), self.loop)
+        if self._bus_queue.full():
+            try:
+                self._bus_queue.get_nowait()
+                with self._lock:
+                    self.state.bus_queue_dropped += 1
+            except queue.Empty:
+                pass
+        try:
+            self._bus_queue.put_nowait((topic, message))
+        except queue.Full:
+            with self._lock:
+                self.state.bus_queue_dropped += 1
 
     def _mark_topic(self, topic_name: str) -> None:
         with self._lock:
             self.state.last_message_time_by_topic[topic_name] = time.time()
+
+    def _record_topic_volume(self, topic_name: str, payload: Any) -> None:
+        with self._lock:
+            self.state.received_count_by_topic[topic_name] = int(self.state.received_count_by_topic.get(topic_name, 0)) + 1
+            self.state.received_bytes_by_topic[topic_name] = int(self.state.received_bytes_by_topic.get(topic_name, 0)) + _estimate_payload_bytes(payload)
 
     def _store_transform(self, parent: str, child: str, tx: float, ty: float, tz: float, yaw: float, source: str) -> None:
         key = (_normalize_frame(parent), _normalize_frame(child))
@@ -294,6 +392,7 @@ class RosBridge:
             self.state.last_chassis.update(chassis_payload)
         stamp = time.time()
         self._mark_topic(self.config.topics.odom)
+        self._record_topic_volume(self.config.topics.odom, payload)
         self._publish_async("/robot/pose", payload, stamp)
         self._publish_async("/chassis/odom", payload, stamp)
         self._publish_async("/chassis/status", chassis_payload, stamp)
@@ -303,6 +402,7 @@ class RosBridge:
         with self._lock:
             self.state.last_gps = dict(payload)
         self._mark_topic(self.config.topics.gps)
+        self._record_topic_volume(self.config.topics.gps, payload)
         self._publish_async("/robot/gps", payload, time.time())
 
     def _on_imu(self, msg) -> None:  # noqa: ANN001
@@ -317,9 +417,11 @@ class RosBridge:
         with self._lock:
             self.state.last_imu = payload
         self._mark_topic(self.config.topics.imu)
+        self._record_topic_volume(self.config.topics.imu, payload)
 
     def _on_tf(self, msg) -> None:  # noqa: ANN001
         self._mark_topic(self.config.topics.tf)
+        self._record_topic_volume(self.config.topics.tf, {"transforms": len(msg.transforms)})
         for transform in msg.transforms:
             yaw = _yaw_from_quaternion(
                 transform.transform.rotation.x,
@@ -339,6 +441,7 @@ class RosBridge:
 
     def _on_tf_static(self, msg) -> None:  # noqa: ANN001
         self._mark_topic(self.config.topics.tf_static)
+        self._record_topic_volume(self.config.topics.tf_static, {"transforms": len(msg.transforms)})
         for transform in msg.transforms:
             yaw = _yaw_from_quaternion(
                 transform.transform.rotation.x,
@@ -399,6 +502,7 @@ class RosBridge:
         if not topic_name:
             topic_name = self.config.topics.lidar_fallback
         self._mark_topic(topic_name)
+        self._record_topic_volume(topic_name, {"points": len(points), "frame": scan_frame})
         self._publish_async(
             f"/lidar/{side}",
             {
@@ -455,6 +559,7 @@ class RosBridge:
             self.state.latest_occupancy_payload = payload
             self.state.latest_occupancy_points = occupied_points
         self._mark_topic(self.config.topics.occupancy_grid)
+        self._record_topic_volume(self.config.topics.occupancy_grid, {"occupied": len(occupied), "free": len(free)})
         self._publish_async("/map/grid", payload, time.time())
 
     def _on_camera(self, msg, camera_id: int, ros_topic: str) -> None:  # noqa: ANN001
@@ -470,6 +575,7 @@ class RosBridge:
         with self._lock:
             self.state.camera_payloads[ros_topic] = payload
         self._mark_topic(ros_topic)
+        self._record_topic_volume(ros_topic, {"camera_id": camera_id, "byte_size": len(msg.data)})
         self._publish_async(f"/camera/{camera_id}/compressed", payload, time.time())
 
 
