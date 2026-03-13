@@ -3,53 +3,190 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AutoDrive Studio</title>
+  <title>AutoDrive Mapping Console</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <header>
-    <h1>AutoDrive Studio (RViz-like)</h1>
-    <div class="toolbar">
-      <input id="serverUrl" value="ws://127.0.0.1:8080/ws/stream" />
-      <button id="connectBtn">连接</button>
-      <button id="startScanBtn">开始扫图</button>
-      <button id="stopScanBtn">停止扫图</button>
-      <button id="saveMapBtn">保存地图</button>
-      <span id="status">未连接</span>
-    </div>
-  </header>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Browser Demo</p>
+        <h1>AutoDrive Mapping Console</h1>
+      </div>
+      <div class="connection-bar">
+        <label class="field grow">
+          <span>Server WS</span>
+          <input id="serverUrl" value="ws://192.168.3.56:8080/ws/stream" />
+        </label>
+        <button id="connectBtn" class="primary">Connect</button>
+        <div class="status-chip" id="status">Disconnected</div>
+        <div class="status-detail" id="statusDetail">WS offline</div>
+      </div>
+    </header>
 
-  <main>
-    <section class="left-panel">
-      <h3>机器人状态</h3>
-      <pre id="posePanel">-</pre>
-      <h3>底盘状态</h3>
-      <pre id="chassisPanel">-</pre>
-      <h3>路径打点（点击画布）</h3>
-      <button id="sendPathBtn">发送路径</button>
-      <ul id="pathList"></ul>
-      <h3>近场控制</h3>
-      <div>键盘：W/S 前后，A/D 转向，空格急停</div>
-      <button onclick="sendMove(0.8,0,0.2)">前进</button>
-      <button onclick="sendMove(0.5,0.8,0.2)">左转</button>
-      <button onclick="sendMove(0.5,-0.8,0.2)">右转</button>
-      <button onclick="stopMove()">急停</button>
-    </section>
+    <main class="layout">
+      <aside class="panel left-panel">
+        <section class="card">
+          <div class="section-head">
+            <h2>Scan Session</h2>
+            <div class="scan-state" id="scanState">Idle</div>
+          </div>
+          <div class="action-row">
+            <button id="startScanBtn" class="primary">Start Scan</button>
+            <button id="stopScanBtn">Stop Scan</button>
+            <button id="clearAccumBtn">Clear Accumulation</button>
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>Map Name</span>
+              <input id="mapNameInput" value="demo_map" />
+            </label>
+            <label class="field">
+              <span>Voxel (m)</span>
+              <input id="voxelSizeInput" type="number" min="0.02" max="1" step="0.01" value="0.12" />
+            </label>
+          </div>
+          <label class="field">
+            <span>Notes</span>
+            <textarea id="mapNotesInput" rows="4">Browser scan session</textarea>
+          </label>
+          <div class="action-row">
+            <button id="saveMapBtn">Save Map</button>
+          </div>
+          <pre id="scanPanel">-</pre>
+        </section>
 
-    <section class="center-panel">
-      <canvas id="lidarCanvas" width="900" height="600"></canvas>
-    </section>
+        <section class="card">
+          <div class="section-head">
+            <h2>Motion Control</h2>
+            <div class="kbd-state" id="keyboardState">Keyboard inactive</div>
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>Forward Speed (m/s)</span>
+              <input id="forwardSpeedInput" type="number" min="0.1" max="2" step="0.1" value="0.8" />
+            </label>
+            <label class="field">
+              <span>Reverse Speed (m/s)</span>
+              <input id="reverseSpeedInput" type="number" min="0.1" max="2" step="0.1" value="0.5" />
+            </label>
+            <label class="field">
+              <span>Turn Rate (rad/s)</span>
+              <input id="turnRateInput" type="number" min="0.1" max="2" step="0.1" value="1.0" />
+            </label>
+            <label class="field">
+              <span>Cmd Duration (s)</span>
+              <input id="cmdDurationInput" type="number" min="0.05" max="1" step="0.05" value="0.15" />
+            </label>
+          </div>
+          <div class="field-grid compact">
+            <label class="field inline">
+              <span>Repeat (ms)</span>
+              <input id="repeatMsInput" type="number" min="60" max="1000" step="20" value="120" />
+            </label>
+            <label class="field inline checkbox-field">
+              <input id="stopOnKeyupInput" type="checkbox" checked />
+              <span>Stop on keyup</span>
+            </label>
+          </div>
+          <div class="drive-pad">
+            <button data-move="forward">W Forward</button>
+            <button data-move="left">A Left</button>
+            <button data-move="stop" class="danger">Space Stop</button>
+            <button data-move="right">D Right</button>
+            <button data-move="backward">S Reverse</button>
+          </div>
+          <div class="hint">
+            Click on the page once before using the keyboard. Supported keys: W/A/S/D, arrow keys, Space.
+          </div>
+        </section>
 
-    <section class="right-panel">
-      <h3>四路相机概览</h3>
-      <div id="cameraGrid" class="camera-grid"></div>
-      <h3>GPS</h3>
-      <pre id="gpsPanel">-</pre>
-      <h3>通信诊断</h3>
-      <pre id="commPanel">-</pre>
-      <small>Shift + 点击画布 = 添加 POI（保存到 STCM）</small>
-    </section>
-  </main>
+        <section class="card">
+          <div class="section-head">
+            <h2>Path And POI</h2>
+            <div class="view-chip" id="drawModeBadge">Point + Line</div>
+          </div>
+          <div class="hint">
+            Click canvas to append path nodes. Hold Shift and click to add a POI using the latest GPS coordinate.
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>Path Draw Mode</span>
+              <select id="pathDrawMode">
+                <option value="points">Only Points</option>
+                <option value="both" selected>Points + Lines</option>
+                <option value="lines">Only Lines</option>
+              </select>
+            </label>
+          </div>
+          <div class="action-row">
+            <label class="toggle"><input id="showPathToggle" type="checkbox" checked />Show Path</label>
+            <label class="toggle"><input id="showPoiToggle" type="checkbox" checked />Show POI</label>
+            <label class="toggle"><input id="showRobotToggle" type="checkbox" checked />Show Robot</label>
+          </div>
+          <div class="action-row">
+            <button id="sendPathBtn">Send Path</button>
+            <button id="clearPathBtn">Clear Path</button>
+          </div>
+          <ul id="pathList"></ul>
+        </section>
+      </aside>
+
+      <section class="panel center-panel">
+        <div class="card canvas-card">
+          <div class="section-head">
+            <h2>Map View</h2>
+            <div class="legend">
+              <span><i class="legend-dot occ"></i>Obstacle</span>
+              <span><i class="legend-dot free"></i>Safe</span>
+              <span><i class="legend-dot unknown"></i>Unknown</span>
+            </div>
+          </div>
+          <div class="canvas-toolbar">
+            <div class="action-row">
+              <button id="centerViewBtn">Center Robot</button>
+              <button id="resetViewBtn">Reset View</button>
+            </div>
+            <div class="view-metrics" id="viewMetrics">Pan 0,0 | Zoom 25 px/m</div>
+          </div>
+          <canvas id="lidarCanvas" width="1040" height="720"></canvas>
+          <div class="hint">
+            Drag canvas to pan. Use mouse wheel to zoom. Occupancy view: black = obstacle, white = safe, gray = unknown.
+          </div>
+        </div>
+      </section>
+
+      <aside class="panel right-panel">
+        <section class="card">
+          <h2>Robot Pose</h2>
+          <pre id="posePanel">-</pre>
+        </section>
+        <section class="card">
+          <h2>Chassis</h2>
+          <pre id="chassisPanel">-</pre>
+        </section>
+        <section class="card">
+          <h2>GPS</h2>
+          <pre id="gpsPanel">-</pre>
+        </section>
+        <section class="card">
+          <div class="section-head">
+            <h2>Cameras</h2>
+            <button id="refreshCameraBtn">Refresh Latest</button>
+          </div>
+          <div class="camera-meta">
+            <span>Manual display refresh</span>
+            <span id="cameraRefreshStatus">No snapshot yet</span>
+          </div>
+          <div id="cameraGrid" class="camera-grid"></div>
+        </section>
+        <section class="card">
+          <h2>Communication</h2>
+          <pre id="commPanel">-</pre>
+        </section>
+      </aside>
+    </main>
+  </div>
 
   <script src="main.js"></script>
 </body>
