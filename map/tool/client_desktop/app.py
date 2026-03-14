@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 import tkinter as tk
@@ -28,6 +29,10 @@ class ServerBridge:
         self.connected = False
         self.on_message = None
 
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+
     def post(self, path: str, body: dict, retries: int = 3) -> dict:
         last_err = None
         for i in range(retries + 1):
@@ -40,7 +45,27 @@ class ServerBridge:
                 time.sleep(0.2 * (2**i))
         raise RuntimeError(f"POST failed: {path}: {last_err}")
 
+    def start(self) -> None:
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self.connect_ws, daemon=True)
+            self._thread.start()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop_event.set()
+            self.connected = False
+            if self.ws is not None:
+                try:
+                    self.ws.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
     def connect_ws(self) -> None:
+        retry = 0
+
         def _on_message(_ws, msg: str) -> None:
             if msg == "pong":
                 return
@@ -48,20 +73,31 @@ class ServerBridge:
                 self.on_message(json.loads(msg))
 
         def _on_open(_ws) -> None:
+            nonlocal retry
+            retry = 0
             self.connected = True
 
         def _on_close(_ws, _code, _msg) -> None:
             self.connected = False
 
-        while True:
+        def _on_error(_ws, _err) -> None:
+            self.connected = False
+
+        while not self._stop_event.is_set():
             self.ws = websocket.WebSocketApp(
                 self.ws_url,
                 on_message=_on_message,
                 on_open=_on_open,
                 on_close=_on_close,
+                on_error=_on_error,
             )
-            self.ws.run_forever(ping_interval=5, ping_timeout=2)
-            time.sleep(1.0)
+            self.ws.run_forever(ping_interval=5, ping_timeout=3)
+            if self._stop_event.is_set():
+                break
+
+            retry += 1
+            backoff = min(10.0, (2 ** min(retry, 6)) * 0.2 + random.uniform(0.0, 0.3))
+            time.sleep(backoff)
 
 
 class MappingClientUI:
@@ -83,6 +119,7 @@ class MappingClientUI:
         self.rear = []
 
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root)
@@ -128,9 +165,13 @@ class MappingClientUI:
     def connect(self) -> None:
         ws = self.ws_entry.get().strip()
         http = ws.replace("ws://", "http://").replace("/ws/stream", "")
+
+        if self.bridge is not None:
+            self.bridge.stop()
+
         self.bridge = ServerBridge(base_http=http, ws_url=ws)
         self.bridge.on_message = self.handle_topic
-        threading.Thread(target=self.bridge.connect_ws, daemon=True).start()
+        self.bridge.start()
 
     def handle_topic(self, msg: dict) -> None:
         topic = msg.get("topic")
@@ -269,6 +310,11 @@ class MappingClientUI:
         for poi in self.poi_list:
             x, y = self.world_to_screen(poi.x, poi.y)
             self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, outline="#ff6b6b")
+
+    def _on_close(self) -> None:
+        if self.bridge is not None:
+            self.bridge.stop()
+        self.root.destroy()
 
     def run(self) -> None:
         self.root.mainloop()
