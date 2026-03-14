@@ -32,22 +32,6 @@ class TopicBus:
         now = time.time()
 
         for q in list(self._subscribers[topic]):
-            if q.maxsize > 0:
-                fill_ratio = q.qsize() / q.maxsize
-                stat.peak_fill_ratio = max(stat.peak_fill_ratio, fill_ratio)
-                if fill_ratio >= 0.8:
-                    stat.near_capacity_events += 1
-                    if now - stat.last_warn_at >= 5.0:
-                        drop_rate = stat.dropped / stat.published if stat.published else 0.0
-                        logger.warning(
-                            "topic bus near capacity topic=%s fill=%.2f drop_rate=%.2f subscribers=%s",
-                            topic,
-                            fill_ratio,
-                            drop_rate,
-                            len(self._subscribers[topic]),
-                        )
-                        stat.last_warn_at = now
-
             # Never block publishers on slow consumers. Otherwise a single
             # stalled websocket subscriber can backpressure the whole event
             # loop and make the server appear "frozen" (including slow Ctrl+C).
@@ -58,7 +42,7 @@ class TopicBus:
                 except asyncio.QueueFull:
                     try:
                         q.get_nowait()
-                        stat.dropped += 1
+                        self._stats[topic].dropped += 1
                     except asyncio.QueueEmpty:
                         # Consumer raced and emptied queue; retry put_nowait.
                         continue

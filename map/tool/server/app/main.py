@@ -59,15 +59,6 @@ TOPIC_MIN_INTERVAL_SEC = {
 LIDAR_MAX_WS_POINTS = 1200
 LIDAR_KEYFRAME_INTERVAL_SEC = 1.0
 
-QUEUE_NEAR_CAPACITY_RATIO = 0.8
-QUEUE_WARN_INTERVAL_SEC = 5.0
-
-SERVER_RUNTIME = {
-    "ws_overflow_total": 0,
-    "ws_near_capacity_total": 0,
-    "ws_last_warn_at": 0.0,
-}
-
 
 SCAN_SESSION = {
     "active": False,
@@ -465,42 +456,12 @@ async def ws_stream(websocket: WebSocket) -> None:
     last_sent_at: dict[str, float] = {}
     last_lidar_keyframe_at: dict[str, float] = {}
 
-    ws_overflow_local = 0
-    ws_near_capacity_local = 0
-    ws_last_warn_local = 0.0
-
-    def maybe_warn_capacity(fill_ratio: float, reason: str) -> None:
-        nonlocal ws_last_warn_local
-        now = time.time()
-        if now - ws_last_warn_local >= QUEUE_WARN_INTERVAL_SEC:
-            logger.warning(
-                "ws queue near limit id=%s reason=%s fill=%.2f qsize=%s max=%s overflow_total=%s",
-                ws_id,
-                reason,
-                fill_ratio,
-                outbound_queue.qsize(),
-                outbound_queue.maxsize,
-                ws_overflow_local,
-            )
-            ws_last_warn_local = now
-            SERVER_RUNTIME["ws_last_warn_at"] = now
-
-    def enqueue_nonblocking(item: tuple[str, dict | str], reason: str) -> None:
-        nonlocal ws_overflow_local, ws_near_capacity_local
+    def enqueue_nonblocking(item: tuple[str, dict | str]) -> None:
         while True:
             try:
-                if outbound_queue.maxsize > 0:
-                    fill_ratio = outbound_queue.qsize() / outbound_queue.maxsize
-                    if fill_ratio >= QUEUE_NEAR_CAPACITY_RATIO:
-                        ws_near_capacity_local += 1
-                        SERVER_RUNTIME["ws_near_capacity_total"] += 1
-                        maybe_warn_capacity(fill_ratio, reason)
                 outbound_queue.put_nowait(item)
                 return
             except asyncio.QueueFull:
-                ws_overflow_local += 1
-                SERVER_RUNTIME["ws_overflow_total"] += 1
-                maybe_warn_capacity(1.0, reason)
                 try:
                     outbound_queue.get_nowait()
                 except asyncio.QueueEmpty:
@@ -550,7 +511,7 @@ async def ws_stream(websocket: WebSocket) -> None:
                 }
 
             packed = _pack_message(outbound_message)
-            enqueue_nonblocking(("json", packed), reason=topic)
+            enqueue_nonblocking(("json", packed))
 
     async def send_outbound() -> None:
         while True:
@@ -564,7 +525,7 @@ async def ws_stream(websocket: WebSocket) -> None:
         while True:
             client_msg = await websocket.receive_text()
             if client_msg == "ping":
-                enqueue_nonblocking(("text", "pong"), reason="keepalive")
+                enqueue_nonblocking(("text", "pong"))
 
     try:
         for topic in STREAM_TOPICS:
