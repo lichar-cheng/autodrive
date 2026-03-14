@@ -49,6 +49,28 @@ STREAM_TOPICS = [
     "/map/grid",
 ]
 
+# 高频传感器流控策略：保留关键帧 + 稀疏非关键帧。
+TOPIC_MIN_INTERVAL_SEC = {
+    "/camera/1/compressed": 0.2,
+    "/camera/2/compressed": 0.2,
+    "/camera/3/compressed": 0.2,
+    "/camera/4/compressed": 0.2,
+}
+LIDAR_MAX_WS_POINTS = 1200
+LIDAR_KEYFRAME_INTERVAL_SEC = 1.0
+
+QUEUE_NEAR_CAPACITY_RATIO = 0.8
+QUEUE_WARN_INTERVAL_SEC = 5.0
+CLIENT_IDLE_TIMEOUT_SEC = 20.0
+
+SERVER_RUNTIME = {
+    "ws_overflow_total": 0,
+    "ws_near_capacity_total": 0,
+    "ws_last_warn_at": 0.0,
+    "active_ws_connections_peak": 0,
+    "forced_disconnect_total": 0,
+}
+
 
 SCAN_SESSION = {
     "active": False,
@@ -82,6 +104,14 @@ def _pack_message(message: dict) -> dict:
         "payload": payload,
         "checksum": _checksum(topic, stamp, seq, payload),
     }
+
+
+def _thin_points(points: list[list[float]] | list[tuple[float, float, float]], limit: int) -> list[list[float]]:
+    if len(points) <= limit:
+        return [list(p) for p in points]
+    step = max(1, len(points) // limit)
+    sampled = points[::step][:limit]
+    return [list(p) for p in sampled]
 
 
 def _reset_scan_session(voxel_size: float | None = None, keep_points: bool = False) -> None:
@@ -138,6 +168,26 @@ def _accumulated_points() -> list[tuple[float, float, float]]:
         (float(item["x"]), float(item["y"]), float(item["intensity"]))
         for item in SCAN_SESSION["accumulated"].values()
     ]
+
+
+def _server_capacity_summary() -> dict[str, Any]:
+    return {
+        "limits": {
+            "ws_queue_size": CONFIG.ws_queue_size * 2,
+            "queue_near_capacity_ratio": QUEUE_NEAR_CAPACITY_RATIO,
+            "camera_min_interval_sec": TOPIC_MIN_INTERVAL_SEC,
+            "lidar_max_ws_points": LIDAR_MAX_WS_POINTS,
+            "lidar_keyframe_interval_sec": LIDAR_KEYFRAME_INTERVAL_SEC,
+            "client_idle_timeout_sec": CLIENT_IDLE_TIMEOUT_SEC,
+        },
+        "runtime": {
+            "ws_overflow_total": int(SERVER_RUNTIME["ws_overflow_total"]),
+            "ws_near_capacity_total": int(SERVER_RUNTIME["ws_near_capacity_total"]),
+            "ws_last_warn_at": float(SERVER_RUNTIME["ws_last_warn_at"]),
+            "active_ws_connections_peak": int(SERVER_RUNTIME["active_ws_connections_peak"]),
+            "forced_disconnect_total": int(SERVER_RUNTIME["forced_disconnect_total"]),
+        },
+    }
 
 
 def _scan_summary() -> dict[str, Any]:
@@ -225,6 +275,7 @@ async def health() -> dict:
             "base": CONFIG.ros.topics.robot_base_frame,
             "lidar": CONFIG.ros.topics.lidar_frame,
         },
+        "capacity": _server_capacity_summary(),
     }
 
 
@@ -238,6 +289,7 @@ async def diag_stream_stats() -> dict:
         "server_time_ms": int(time.time() * 1000),
         "scan_summary": _scan_summary(),
         "ros_diag": _ros_diag(),
+        "capacity": _server_capacity_summary(),
     }
 
 
@@ -413,14 +465,68 @@ async def ws_stream(websocket: WebSocket) -> None:
     await websocket.accept()
     ws_id = id(websocket)
     ws_clients.add(ws_id)
+    SERVER_RUNTIME["active_ws_connections_peak"] = max(int(SERVER_RUNTIME["active_ws_connections_peak"]), len(ws_clients))
     logger.info("ws connected id=%s clients=%s", ws_id, len(ws_clients))
     tasks = []
     outbound_queue: asyncio.Queue = asyncio.Queue(maxsize=CONFIG.ws_queue_size * 2)
+    last_sent_at: dict[str, float] = {}
+    last_lidar_keyframe_at: dict[str, float] = {}
+
+    ws_overflow_local = 0
+    ws_near_capacity_local = 0
+    ws_last_warn_local = 0.0
+    last_client_activity = time.time()
+    closed_by_server_timeout = False
+
+    def maybe_warn_capacity(fill_ratio: float, reason: str) -> None:
+        nonlocal ws_last_warn_local
+        now = time.time()
+        if now - ws_last_warn_local >= QUEUE_WARN_INTERVAL_SEC:
+            logger.warning(
+                "ws queue near limit id=%s reason=%s fill=%.2f qsize=%s max=%s overflow_total=%s",
+                ws_id,
+                reason,
+                fill_ratio,
+                outbound_queue.qsize(),
+                outbound_queue.maxsize,
+                ws_overflow_local,
+            )
+            ws_last_warn_local = now
+            SERVER_RUNTIME["ws_last_warn_at"] = now
+
+    def enqueue_nonblocking(item: tuple[str, dict | str], reason: str) -> None:
+        nonlocal ws_overflow_local, ws_near_capacity_local
+        while True:
+            try:
+                if outbound_queue.maxsize > 0:
+                    fill_ratio = outbound_queue.qsize() / outbound_queue.maxsize
+                    if fill_ratio >= QUEUE_NEAR_CAPACITY_RATIO:
+                        ws_near_capacity_local += 1
+                        SERVER_RUNTIME["ws_near_capacity_total"] += 1
+                        maybe_warn_capacity(fill_ratio, reason)
+                outbound_queue.put_nowait(item)
+                return
+            except asyncio.QueueFull:
+                ws_overflow_local += 1
+                SERVER_RUNTIME["ws_overflow_total"] += 1
+                maybe_warn_capacity(1.0, reason)
+                try:
+                    outbound_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    continue
 
     async def enqueue_topic(topic: str) -> None:
         global latest_points
 
         async for message in bus.subscribe(topic):
+            now = time.time()
+            min_interval = TOPIC_MIN_INTERVAL_SEC.get(topic, 0.0)
+            if min_interval > 0:
+                last = last_sent_at.get(topic, 0.0)
+                if now - last < min_interval:
+                    continue
+                last_sent_at[topic] = now
+
             if topic == "/lidar/front":
                 latest_points = [tuple(point) for point in message["payload"].get("points", [])[:4000]]
                 _accumulate_scan(latest_points, "front")
@@ -434,45 +540,74 @@ async def ws_stream(websocket: WebSocket) -> None:
                 if ros_points:
                     latest_points = ros_points
 
-            packed = _pack_message(message)
-            if outbound_queue.full():
-                try:
-                    outbound_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            await outbound_queue.put(("json", packed))
+            outbound_message = message
+            if topic in {"/lidar/front", "/lidar/rear"}:
+                points = message["payload"].get("points", [])
+                last_kf = last_lidar_keyframe_at.get(topic, 0.0)
+                keyframe = (now - last_kf) >= LIDAR_KEYFRAME_INTERVAL_SEC
+                if keyframe:
+                    last_lidar_keyframe_at[topic] = now
+                thinned = points if keyframe else _thin_points(points, LIDAR_MAX_WS_POINTS)
+                outbound_message = {
+                    **message,
+                    "payload": {
+                        **message["payload"],
+                        "points": thinned,
+                        "raw_points": len(points),
+                        "keyframe": keyframe,
+                    },
+                }
+
+            packed = _pack_message(outbound_message)
+            enqueue_nonblocking(("json", packed), reason=topic)
+
+    async def monitor_client_idle() -> None:
+        nonlocal closed_by_server_timeout
+        while True:
+            await asyncio.sleep(2.0)
+            idle_sec = time.time() - last_client_activity
+            if idle_sec > CLIENT_IDLE_TIMEOUT_SEC:
+                SERVER_RUNTIME["forced_disconnect_total"] += 1
+                closed_by_server_timeout = True
+                logger.warning("ws idle timeout id=%s idle_sec=%.1f, force disconnect", ws_id, idle_sec)
+                await websocket.close(code=4001, reason="idle_timeout")
+                return
 
     async def send_outbound() -> None:
+        nonlocal last_client_activity
         while True:
             message_type, payload = await outbound_queue.get()
             if message_type == "json":
                 await websocket.send_json(payload)
+                last_client_activity = time.time()
             elif message_type == "text":
                 await websocket.send_text(payload)
+                last_client_activity = time.time()
 
     async def receive_keepalive() -> None:
+        nonlocal last_client_activity
         while True:
             client_msg = await websocket.receive_text()
+            last_client_activity = time.time()
             if client_msg == "ping":
-                if outbound_queue.full():
-                    try:
-                        outbound_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                await outbound_queue.put(("text", "pong"))
+                enqueue_nonblocking(("text", "pong"), reason="keepalive")
 
     try:
         for topic in STREAM_TOPICS:
             tasks.append(asyncio.create_task(enqueue_topic(topic)))
         tasks.append(asyncio.create_task(send_outbound()))
         tasks.append(asyncio.create_task(receive_keepalive()))
+        tasks.append(asyncio.create_task(monitor_client_idle()))
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
         for finished in done:
             exc = finished.exception()
             if exc is not None and not isinstance(exc, WebSocketDisconnect):
                 raise exc
     except WebSocketDisconnect:
-        logger.warning("ws disconnected id=%s", ws_id)
+        if closed_by_server_timeout:
+            logger.warning("ws disconnected by server timeout id=%s", ws_id)
+        else:
+            logger.warning("ws disconnected id=%s", ws_id)
     except asyncio.CancelledError:
         logger.info("ws task cancelled id=%s", ws_id)
         raise
@@ -481,6 +616,8 @@ async def ws_stream(websocket: WebSocket) -> None:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         ws_clients.discard(ws_id)
+        if ws_overflow_local > 0:
+            logger.warning("ws disconnected with overflow id=%s dropped=%s near_capacity=%s", ws_id, ws_overflow_local, ws_near_capacity_local)
         try:
             await websocket.close()
         except Exception:  # noqa: BLE001
