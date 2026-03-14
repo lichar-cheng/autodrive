@@ -373,6 +373,11 @@ class MappingClientUI:
             self.bridge.stop()
         self.root.destroy()
 
+    def _on_close(self) -> None:
+        if self.bridge is not None:
+            self.bridge.stop()
+        self.root.destroy()
+
     def run(self) -> None:
         self.root.mainloop()
 
