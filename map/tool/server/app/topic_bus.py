@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import AsyncIterator, Dict, Set
+
+
+logger = logging.getLogger("autodrive.server.topic_bus")
 
 
 @dataclass
 class TopicStats:
     published: int = 0
     dropped: int = 0
+    near_capacity_events: int = 0
+    peak_fill_ratio: float = 0.0
+    last_warn_at: float = 0.0
 
 
 class TopicBus:
@@ -19,7 +27,10 @@ class TopicBus:
         self._stats: Dict[str, TopicStats] = defaultdict(TopicStats)
 
     async def publish(self, topic: str, message: dict) -> None:
-        self._stats[topic].published += 1
+        stat = self._stats[topic]
+        stat.published += 1
+        now = time.time()
+
         for q in list(self._subscribers[topic]):
             # Never block publishers on slow consumers. Otherwise a single
             # stalled websocket subscriber can backpressure the whole event
@@ -53,6 +64,9 @@ class TopicBus:
             t: {
                 "published": s.published,
                 "dropped": s.dropped,
+                "drop_rate": round((s.dropped / s.published) if s.published else 0.0, 4),
+                "near_capacity_events": s.near_capacity_events,
+                "peak_fill_ratio": round(s.peak_fill_ratio, 4),
                 "subscribers": len(self._subscribers[t]),
             }
             for t, s in self._stats.items()
