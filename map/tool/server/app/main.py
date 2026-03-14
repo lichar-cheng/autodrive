@@ -158,6 +158,23 @@ def _accumulated_points() -> list[tuple[float, float, float]]:
     ]
 
 
+def _server_capacity_summary() -> dict[str, Any]:
+    return {
+        "limits": {
+            "ws_queue_size": CONFIG.ws_queue_size * 2,
+            "queue_near_capacity_ratio": QUEUE_NEAR_CAPACITY_RATIO,
+            "camera_min_interval_sec": TOPIC_MIN_INTERVAL_SEC,
+            "lidar_max_ws_points": LIDAR_MAX_WS_POINTS,
+            "lidar_keyframe_interval_sec": LIDAR_KEYFRAME_INTERVAL_SEC,
+        },
+        "runtime": {
+            "ws_overflow_total": int(SERVER_RUNTIME["ws_overflow_total"]),
+            "ws_near_capacity_total": int(SERVER_RUNTIME["ws_near_capacity_total"]),
+            "ws_last_warn_at": float(SERVER_RUNTIME["ws_last_warn_at"]),
+        },
+    }
+
+
 def _scan_summary() -> dict[str, Any]:
     started_at = float(SCAN_SESSION["started_at"])
     stopped_at = float(SCAN_SESSION["stopped_at"])
@@ -243,6 +260,7 @@ async def health() -> dict:
             "base": CONFIG.ros.topics.robot_base_frame,
             "lidar": CONFIG.ros.topics.lidar_frame,
         },
+        "capacity": _server_capacity_summary(),
     }
 
 
@@ -256,6 +274,7 @@ async def diag_stream_stats() -> dict:
         "server_time_ms": int(time.time() * 1000),
         "scan_summary": _scan_summary(),
         "ros_diag": _ros_diag(),
+        "capacity": _server_capacity_summary(),
     }
 
 
@@ -528,6 +547,8 @@ async def ws_stream(websocket: WebSocket) -> None:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         ws_clients.discard(ws_id)
+        if ws_overflow_local > 0:
+            logger.warning("ws disconnected with overflow id=%s dropped=%s near_capacity=%s", ws_id, ws_overflow_local, ws_near_capacity_local)
         try:
             await websocket.close()
         except Exception:  # noqa: BLE001
