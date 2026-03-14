@@ -450,6 +450,7 @@ async def ws_stream(websocket: WebSocket) -> None:
     await websocket.accept()
     ws_id = id(websocket)
     ws_clients.add(ws_id)
+    SERVER_RUNTIME["active_ws_connections_peak"] = max(int(SERVER_RUNTIME["active_ws_connections_peak"]), len(ws_clients))
     logger.info("ws connected id=%s clients=%s", ws_id, len(ws_clients))
     tasks = []
     outbound_queue: asyncio.Queue = asyncio.Queue(maxsize=CONFIG.ws_queue_size * 2)
@@ -522,8 +523,10 @@ async def ws_stream(websocket: WebSocket) -> None:
                 await websocket.send_text(payload)
 
     async def receive_keepalive() -> None:
+        nonlocal last_client_activity
         while True:
             client_msg = await websocket.receive_text()
+            last_client_activity = time.time()
             if client_msg == "ping":
                 enqueue_nonblocking(("text", "pong"))
 
@@ -532,13 +535,17 @@ async def ws_stream(websocket: WebSocket) -> None:
             tasks.append(asyncio.create_task(enqueue_topic(topic)))
         tasks.append(asyncio.create_task(send_outbound()))
         tasks.append(asyncio.create_task(receive_keepalive()))
+        tasks.append(asyncio.create_task(monitor_client_idle()))
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
         for finished in done:
             exc = finished.exception()
             if exc is not None and not isinstance(exc, WebSocketDisconnect):
                 raise exc
     except WebSocketDisconnect:
-        logger.warning("ws disconnected id=%s", ws_id)
+        if closed_by_server_timeout:
+            logger.warning("ws disconnected by server timeout id=%s", ws_id)
+        else:
+            logger.warning("ws disconnected id=%s", ws_id)
     except asyncio.CancelledError:
         logger.info("ws task cancelled id=%s", ws_id)
         raise
