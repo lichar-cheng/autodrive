@@ -49,6 +49,16 @@ STREAM_TOPICS = [
     "/map/grid",
 ]
 
+# 高频传感器流控策略：保留关键帧 + 稀疏非关键帧。
+TOPIC_MIN_INTERVAL_SEC = {
+    "/camera/1/compressed": 0.2,
+    "/camera/2/compressed": 0.2,
+    "/camera/3/compressed": 0.2,
+    "/camera/4/compressed": 0.2,
+}
+LIDAR_MAX_WS_POINTS = 1200
+LIDAR_KEYFRAME_INTERVAL_SEC = 1.0
+
 
 SCAN_SESSION = {
     "active": False,
@@ -82,6 +92,14 @@ def _pack_message(message: dict) -> dict:
         "payload": payload,
         "checksum": _checksum(topic, stamp, seq, payload),
     }
+
+
+def _thin_points(points: list[list[float]] | list[tuple[float, float, float]], limit: int) -> list[list[float]]:
+    if len(points) <= limit:
+        return [list(p) for p in points]
+    step = max(1, len(points) // limit)
+    sampled = points[::step][:limit]
+    return [list(p) for p in sampled]
 
 
 def _reset_scan_session(voxel_size: float | None = None, keep_points: bool = False) -> None:
@@ -416,11 +434,32 @@ async def ws_stream(websocket: WebSocket) -> None:
     logger.info("ws connected id=%s clients=%s", ws_id, len(ws_clients))
     tasks = []
     outbound_queue: asyncio.Queue = asyncio.Queue(maxsize=CONFIG.ws_queue_size * 2)
+    last_sent_at: dict[str, float] = {}
+    last_lidar_keyframe_at: dict[str, float] = {}
+
+    def enqueue_nonblocking(item: tuple[str, dict | str]) -> None:
+        while True:
+            try:
+                outbound_queue.put_nowait(item)
+                return
+            except asyncio.QueueFull:
+                try:
+                    outbound_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    continue
 
     async def enqueue_topic(topic: str) -> None:
         global latest_points
 
         async for message in bus.subscribe(topic):
+            now = time.time()
+            min_interval = TOPIC_MIN_INTERVAL_SEC.get(topic, 0.0)
+            if min_interval > 0:
+                last = last_sent_at.get(topic, 0.0)
+                if now - last < min_interval:
+                    continue
+                last_sent_at[topic] = now
+
             if topic == "/lidar/front":
                 latest_points = [tuple(point) for point in message["payload"].get("points", [])[:4000]]
                 _accumulate_scan(latest_points, "front")
@@ -434,13 +473,26 @@ async def ws_stream(websocket: WebSocket) -> None:
                 if ros_points:
                     latest_points = ros_points
 
-            packed = _pack_message(message)
-            if outbound_queue.full():
-                try:
-                    outbound_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            await outbound_queue.put(("json", packed))
+            outbound_message = message
+            if topic in {"/lidar/front", "/lidar/rear"}:
+                points = message["payload"].get("points", [])
+                last_kf = last_lidar_keyframe_at.get(topic, 0.0)
+                keyframe = (now - last_kf) >= LIDAR_KEYFRAME_INTERVAL_SEC
+                if keyframe:
+                    last_lidar_keyframe_at[topic] = now
+                thinned = points if keyframe else _thin_points(points, LIDAR_MAX_WS_POINTS)
+                outbound_message = {
+                    **message,
+                    "payload": {
+                        **message["payload"],
+                        "points": thinned,
+                        "raw_points": len(points),
+                        "keyframe": keyframe,
+                    },
+                }
+
+            packed = _pack_message(outbound_message)
+            enqueue_nonblocking(("json", packed))
 
     async def send_outbound() -> None:
         while True:
@@ -454,12 +506,7 @@ async def ws_stream(websocket: WebSocket) -> None:
         while True:
             client_msg = await websocket.receive_text()
             if client_msg == "ping":
-                if outbound_queue.full():
-                    try:
-                        outbound_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                await outbound_queue.put(("text", "pong"))
+                enqueue_nonblocking(("text", "pong"))
 
     try:
         for topic in STREAM_TOPICS:
