@@ -59,6 +59,18 @@ TOPIC_MIN_INTERVAL_SEC = {
 LIDAR_MAX_WS_POINTS = 1200
 LIDAR_KEYFRAME_INTERVAL_SEC = 1.0
 
+QUEUE_NEAR_CAPACITY_RATIO = 0.8
+QUEUE_WARN_INTERVAL_SEC = 5.0
+CLIENT_IDLE_TIMEOUT_SEC = 20.0
+
+SERVER_RUNTIME = {
+    "ws_overflow_total": 0,
+    "ws_near_capacity_total": 0,
+    "ws_last_warn_at": 0.0,
+    "active_ws_connections_peak": 0,
+    "forced_disconnect_total": 0,
+}
+
 
 SCAN_SESSION = {
     "active": False,
@@ -166,11 +178,14 @@ def _server_capacity_summary() -> dict[str, Any]:
             "camera_min_interval_sec": TOPIC_MIN_INTERVAL_SEC,
             "lidar_max_ws_points": LIDAR_MAX_WS_POINTS,
             "lidar_keyframe_interval_sec": LIDAR_KEYFRAME_INTERVAL_SEC,
+            "client_idle_timeout_sec": CLIENT_IDLE_TIMEOUT_SEC,
         },
         "runtime": {
             "ws_overflow_total": int(SERVER_RUNTIME["ws_overflow_total"]),
             "ws_near_capacity_total": int(SERVER_RUNTIME["ws_near_capacity_total"]),
             "ws_last_warn_at": float(SERVER_RUNTIME["ws_last_warn_at"]),
+            "active_ws_connections_peak": int(SERVER_RUNTIME["active_ws_connections_peak"]),
+            "forced_disconnect_total": int(SERVER_RUNTIME["forced_disconnect_total"]),
         },
     }
 
@@ -457,12 +472,44 @@ async def ws_stream(websocket: WebSocket) -> None:
     last_sent_at: dict[str, float] = {}
     last_lidar_keyframe_at: dict[str, float] = {}
 
-    def enqueue_nonblocking(item: tuple[str, dict | str]) -> None:
+    ws_overflow_local = 0
+    ws_near_capacity_local = 0
+    ws_last_warn_local = 0.0
+    last_client_activity = time.time()
+    closed_by_server_timeout = False
+
+    def maybe_warn_capacity(fill_ratio: float, reason: str) -> None:
+        nonlocal ws_last_warn_local
+        now = time.time()
+        if now - ws_last_warn_local >= QUEUE_WARN_INTERVAL_SEC:
+            logger.warning(
+                "ws queue near limit id=%s reason=%s fill=%.2f qsize=%s max=%s overflow_total=%s",
+                ws_id,
+                reason,
+                fill_ratio,
+                outbound_queue.qsize(),
+                outbound_queue.maxsize,
+                ws_overflow_local,
+            )
+            ws_last_warn_local = now
+            SERVER_RUNTIME["ws_last_warn_at"] = now
+
+    def enqueue_nonblocking(item: tuple[str, dict | str], reason: str) -> None:
+        nonlocal ws_overflow_local, ws_near_capacity_local
         while True:
             try:
+                if outbound_queue.maxsize > 0:
+                    fill_ratio = outbound_queue.qsize() / outbound_queue.maxsize
+                    if fill_ratio >= QUEUE_NEAR_CAPACITY_RATIO:
+                        ws_near_capacity_local += 1
+                        SERVER_RUNTIME["ws_near_capacity_total"] += 1
+                        maybe_warn_capacity(fill_ratio, reason)
                 outbound_queue.put_nowait(item)
                 return
             except asyncio.QueueFull:
+                ws_overflow_local += 1
+                SERVER_RUNTIME["ws_overflow_total"] += 1
+                maybe_warn_capacity(1.0, reason)
                 try:
                     outbound_queue.get_nowait()
                 except asyncio.QueueEmpty:
@@ -512,15 +559,30 @@ async def ws_stream(websocket: WebSocket) -> None:
                 }
 
             packed = _pack_message(outbound_message)
-            enqueue_nonblocking(("json", packed))
+            enqueue_nonblocking(("json", packed), reason=topic)
+
+    async def monitor_client_idle() -> None:
+        nonlocal closed_by_server_timeout
+        while True:
+            await asyncio.sleep(2.0)
+            idle_sec = time.time() - last_client_activity
+            if idle_sec > CLIENT_IDLE_TIMEOUT_SEC:
+                SERVER_RUNTIME["forced_disconnect_total"] += 1
+                closed_by_server_timeout = True
+                logger.warning("ws idle timeout id=%s idle_sec=%.1f, force disconnect", ws_id, idle_sec)
+                await websocket.close(code=4001, reason="idle_timeout")
+                return
 
     async def send_outbound() -> None:
+        nonlocal last_client_activity
         while True:
             message_type, payload = await outbound_queue.get()
             if message_type == "json":
                 await websocket.send_json(payload)
+                last_client_activity = time.time()
             elif message_type == "text":
                 await websocket.send_text(payload)
+                last_client_activity = time.time()
 
     async def receive_keepalive() -> None:
         nonlocal last_client_activity
@@ -528,7 +590,7 @@ async def ws_stream(websocket: WebSocket) -> None:
             client_msg = await websocket.receive_text()
             last_client_activity = time.time()
             if client_msg == "ping":
-                enqueue_nonblocking(("text", "pong"))
+                enqueue_nonblocking(("text", "pong"), reason="keepalive")
 
     try:
         for topic in STREAM_TOPICS:
