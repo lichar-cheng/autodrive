@@ -124,18 +124,6 @@ class MappingClientUI:
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _configure_style(self) -> None:
-        style = ttk.Style(self.root)
-        style.theme_use("clam")
-        style.configure("Root.TFrame", background="#0f172a")
-        style.configure("Card.TLabelframe", background="#111827", foreground="#e5e7eb", borderwidth=1)
-        style.configure("Card.TLabelframe.Label", background="#111827", foreground="#93c5fd")
-        style.configure("Card.TFrame", background="#111827")
-        style.configure("TLabel", background="#111827", foreground="#e5e7eb")
-        style.configure("Header.TLabel", font=("Segoe UI", 14, "bold"), foreground="#dbeafe", background="#0f172a")
-        style.configure("Sub.TLabel", foreground="#93c5fd", background="#0f172a")
-        style.configure("Primary.TButton", padding=6)
-
     def _build_ui(self) -> None:
         root_frame = ttk.Frame(self.root, style="Root.TFrame", padding=12)
         root_frame.pack(fill=tk.BOTH, expand=True)
@@ -367,6 +355,11 @@ class MappingClientUI:
         for poi in self.poi_list:
             x, y = self.world_to_screen(poi.x, poi.y)
             self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, outline="#fb7185")
+
+    def _on_close(self) -> None:
+        if self.bridge is not None:
+            self.bridge.stop()
+        self.root.destroy()
 
     def _on_close(self) -> None:
         if self.bridge is not None:
