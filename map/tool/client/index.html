@@ -10,8 +10,8 @@
   <div class="app-shell">
     <header class="topbar">
       <div>
-        <p class="eyebrow">Browser Demo</p>
-        <h1>AutoDrive Mapping Console</h1>
+        <p class="eyebrow">Browser Version</p>
+        <h1>AutoDrive Map Tool</h1>
       </div>
       <div class="connection-bar">
         <label class="field grow">
@@ -53,10 +53,25 @@
           <div class="action-row">
             <button id="saveMapBtn">Save Map</button>
           </div>
+          <div class="hint" id="savePathHint">
+            Map export uses the local browser save dialog. You choose the destination folder and filename.
+          </div>
           <pre id="scanPanel">-</pre>
         </section>
 
-        <section class="card">
+        <section class="card visibility-card">
+          <div class="section-head">
+            <h2>Panel Visibility</h2>
+          </div>
+          <div class="action-row">
+            <label class="toggle"><input id="showMotionControlCardToggle" type="checkbox" checked />Motion Control</label>
+            <label class="toggle"><input id="showPoiCardToggle" type="checkbox" checked />POI</label>
+            <label class="toggle"><input id="showTrajectoryCardToggle" type="checkbox" checked />Trajectory</label>
+            <label class="toggle"><input id="showStcmInspectorCardToggle" type="checkbox" />STCM Inspector</label>
+          </div>
+        </section>
+
+        <section class="card" id="motionControlCard">
           <div class="section-head">
             <h2>Motion Control</h2>
             <div class="kbd-state" id="keyboardState">Keyboard inactive</div>
@@ -101,34 +116,114 @@
           </div>
         </section>
 
-        <section class="card">
+        <section class="card" id="poiCard">
           <div class="section-head">
-            <h2>Path And POI</h2>
-            <div class="view-chip" id="drawModeBadge">Point + Line</div>
+            <h2>POI</h2>
+            <div class="view-chip" id="poiCountBadge">0 POI</div>
           </div>
           <div class="hint">
-            Click canvas to append path nodes. Hold Shift and click to add a POI using the latest GPS coordinate.
+            Enter one POI name or batch POI lines, then click Add POI and place them on the canvas one by one. Manual geo format is lon,lat. Each POI records name, x, y, yaw, lat, and lon.
           </div>
           <div class="field-grid">
             <label class="field">
-              <span>Path Draw Mode</span>
-              <select id="pathDrawMode">
-                <option value="points">Only Points</option>
-                <option value="both" selected>Points + Lines</option>
-                <option value="lines">Only Lines</option>
+              <span>POI Name</span>
+              <input id="poiNameInput" placeholder="Input POI name" />
+            </label>
+            <label class="field">
+              <span>Manual Geo</span>
+              <input id="poiGeoInput" placeholder="lon,lat" />
+            </label>
+          </div>
+          <div class="hint" id="poiStatus">POI idle</div>
+          <div class="action-row">
+            <label class="toggle"><input id="showPoiToggle" type="checkbox" checked />Show POI</label>
+          </div>
+          <div class="action-row">
+            <button id="addPoiBtn" class="primary">Add POI</button>
+            <button id="applyPoiGeoBtn">Apply Geo To Selected</button>
+            <button id="copyPoiBtn">Copy POI Data</button>
+            <button id="clearPoiBtn" class="danger">Clear POI</button>
+          </div>
+          <label class="field">
+            <span>Batch POI Input</span>
+            <textarea id="poiBatchCreateInput" rows="5" placeholder="One per line: name&#10;or: name,lon,lat&#10;or: name,lon,lat,yaw"></textarea>
+          </label>
+          <div>
+            <div class="list-title">POI List</div>
+            <ul id="poiList" class="data-list"></ul>
+          </div>
+        </section>
+
+        <section class="card" id="trajectoryCard">
+          <div class="section-head">
+            <h2>Trajectory</h2>
+            <div class="view-chip" id="drawModeBadge">Line</div>
+          </div>
+          <div class="hint">
+            Trajectory only draws line paths. It supports auto loop, POI-to-POI connect, free-point connect, delete, send, and clear.
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>Trajectory Tool</span>
+              <select id="trajectoryToolMode">
+                <option value="free">Connect Any Two Points</option>
+                <option value="poi" selected>Connect Two POIs</option>
               </select>
             </label>
           </div>
+          <div class="hint" id="trajectoryStatus">No segments yet</div>
           <div class="action-row">
-            <label class="toggle"><input id="showPathToggle" type="checkbox" checked />Show Path</label>
-            <label class="toggle"><input id="showPoiToggle" type="checkbox" checked />Show POI</label>
-            <label class="toggle"><input id="showRobotToggle" type="checkbox" checked />Show Robot</label>
+            <label class="toggle"><input id="showPathToggle" type="checkbox" checked />Show Trajectory</label>
+          </div>
+          <div class="action-row">
+            <button id="autoConnectBtn" class="primary">Auto Loop</button>
+            <button id="connectSelectedPoiBtn">Connect Selected POI</button>
+            <button id="deleteSegmentBtn" class="danger">Delete Segment</button>
           </div>
           <div class="action-row">
             <button id="sendPathBtn">Send Path</button>
             <button id="clearPathBtn">Clear Path</button>
           </div>
-          <ul id="pathList"></ul>
+          <div>
+            <div class="list-title">Segment List</div>
+            <ul id="pathList" class="data-list"></ul>
+          </div>
+        </section>
+
+        <section class="card" id="stcmInspectorCard" hidden>
+          <div class="section-head">
+            <h2>STCM Inspector</h2>
+            <div class="view-chip" id="stcmInspectorStatus">Idle</div>
+          </div>
+          <div class="hint">
+            Load a local <code>.stcm</code> file to inspect <code>manifest.json</code>, convert radar points to a preview
+            <code>.pgm</code>, and export a matching config <code>.json</code>.
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>STCM File</span>
+              <input id="stcmFileInput" type="file" accept=".stcm,.zip" />
+            </label>
+            <label class="field">
+              <span>Resolution (m/pixel)</span>
+              <input id="stcmResolutionInput" type="number" min="0.02" max="2" step="0.01" value="0.10" />
+            </label>
+            <label class="field">
+              <span>Padding (cells)</span>
+              <input id="stcmPaddingInput" type="number" min="0" max="200" step="1" value="8" />
+            </label>
+          </div>
+          <div class="action-row">
+            <button id="inspectStcmBtn">Inspect STCM</button>
+            <button id="downloadPgmBtn">Download PGM</button>
+            <button id="downloadStcmJsonBtn">Download JSON</button>
+          </div>
+          <div class="camera-meta">
+            <span id="stcmFileMeta">No file selected</span>
+            <span id="stcmGridMeta">No grid generated</span>
+          </div>
+          <pre id="stcmSummaryPanel">-</pre>
+          <pre id="stcmManifestPanel">-</pre>
         </section>
       </aside>
 
@@ -146,6 +241,7 @@
             <div class="action-row">
               <button id="centerViewBtn">Center Robot</button>
               <button id="resetViewBtn">Reset View</button>
+              <label class="toggle"><input id="showRobotToggle" type="checkbox" checked />Show Robot</label>
             </div>
             <div class="view-metrics" id="viewMetrics">Pan 0,0 | Zoom 25 px/m</div>
           </div>
@@ -158,16 +254,8 @@
 
       <aside class="panel right-panel">
         <section class="card">
-          <h2>Robot Pose</h2>
+          <h2>Odom And Scan</h2>
           <pre id="posePanel">-</pre>
-        </section>
-        <section class="card">
-          <h2>Chassis</h2>
-          <pre id="chassisPanel">-</pre>
-        </section>
-        <section class="card">
-          <h2>GPS</h2>
-          <pre id="gpsPanel">-</pre>
         </section>
         <section class="card">
           <div class="section-head">
