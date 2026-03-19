@@ -50,7 +50,8 @@ class RosBridge:
         self.loop = loop
         self.config = config
         self.state = RosBridgeState()
-        self._lock = threading.Lock()
+        # diagnostics() may re-enter lock via _resolve_lidar_mount() -> _lookup_transform().
+        self._lock = threading.RLock()
         self._running = False
         self._spin_thread: threading.Thread | None = None
         self._rclpy = None
