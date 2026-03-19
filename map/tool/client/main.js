@@ -11,9 +11,23 @@ let lastMessageAtMs = 0;
 
 let lastPose = { x: 0, y: 0, yaw: 0, vx: 0, wz: 0 };
 let lastGps = { lat: 0, lon: 0 };
+let lastOdom = { x: 0, y: 0, yaw: 0, vx: 0, wz: 0 };
 let lastChassis = { wheel_speed_l: 0, wheel_speed_r: 0, battery: 0, mode: "-" };
+let lastScanInfo = {
+  front: { raw_points: 0, keyframe: false, stamp: 0 },
+  rear: { raw_points: 0, keyframe: false, stamp: 0 },
+};
+let poseHistory = [];
 let pathNodes = [];
+let pathSegments = [];
 let poiNodes = [];
+let pendingFreePoint = null;
+let pendingPoiDraft = null;
+let pendingPoiQueue = [];
+let selectedSegmentId = null;
+let selectedPoiIds = new Set();
+let poiIdSeed = 1;
+let segmentIdSeed = 1;
 let cameraInbox = new Map();
 let cameraDisplay = new Map();
 
@@ -30,6 +44,12 @@ const scanSession = {
   voxelSize: 0.12,
 };
 
+const scanMergeConfig = {
+  maxPoseHistory: 240,
+  turnSkipWz: 0.35,
+  saveMinHits: 3,
+};
+
 const streamHealth = {
   msgTotal: 0,
   checksumErr: 0,
@@ -43,11 +63,23 @@ const streamHealth = {
   lastHealth: null,
 };
 
+const stcmInspector = {
+  file: null,
+  bundle: null,
+  points: [],
+  pgmText: "",
+  configJsonText: "",
+  summary: null,
+};
+
 const drawState = {
-  pathMode: "both",
   showPath: true,
   showPoi: true,
   showRobot: true,
+  showMotionControlCard: true,
+  showPoiCard: true,
+  showTrajectoryCard: true,
+  showStcmInspectorCard: false,
 };
 
 const viewState = {
@@ -70,9 +102,8 @@ const ctx = canvas.getContext("2d");
 const elements = {
   posePanel: document.getElementById("posePanel"),
   pathList: document.getElementById("pathList"),
+  poiList: document.getElementById("poiList"),
   cameraGrid: document.getElementById("cameraGrid"),
-  gpsPanel: document.getElementById("gpsPanel"),
-  chassisPanel: document.getElementById("chassisPanel"),
   commPanel: document.getElementById("commPanel"),
   scanPanel: document.getElementById("scanPanel"),
   status: document.getElementById("status"),
@@ -89,39 +120,99 @@ const elements = {
   cmdDurationInput: document.getElementById("cmdDurationInput"),
   repeatMsInput: document.getElementById("repeatMsInput"),
   stopOnKeyupInput: document.getElementById("stopOnKeyupInput"),
-  pathDrawMode: document.getElementById("pathDrawMode"),
+  poiNameInput: document.getElementById("poiNameInput"),
+  poiGeoInput: document.getElementById("poiGeoInput"),
+  poiBatchCreateInput: document.getElementById("poiBatchCreateInput"),
+  trajectoryToolMode: document.getElementById("trajectoryToolMode"),
   showPathToggle: document.getElementById("showPathToggle"),
   showPoiToggle: document.getElementById("showPoiToggle"),
   showRobotToggle: document.getElementById("showRobotToggle"),
   drawModeBadge: document.getElementById("drawModeBadge"),
+  poiStatus: document.getElementById("poiStatus"),
+  trajectoryStatus: document.getElementById("trajectoryStatus"),
+  motionControlCard: document.getElementById("motionControlCard"),
+  poiCard: document.getElementById("poiCard"),
+  trajectoryCard: document.getElementById("trajectoryCard"),
+  stcmInspectorCard: document.getElementById("stcmInspectorCard"),
+  showMotionControlCardToggle: document.getElementById("showMotionControlCardToggle"),
+  showPoiCardToggle: document.getElementById("showPoiCardToggle"),
+  showTrajectoryCardToggle: document.getElementById("showTrajectoryCardToggle"),
+  showStcmInspectorCardToggle: document.getElementById("showStcmInspectorCardToggle"),
+  clearPoiBtn: document.getElementById("clearPoiBtn"),
+  addPoiBtn: document.getElementById("addPoiBtn"),
+  applyPoiGeoBtn: document.getElementById("applyPoiGeoBtn"),
+  copyPoiBtn: document.getElementById("copyPoiBtn"),
+  poiCountBadge: document.getElementById("poiCountBadge"),
+  autoConnectBtn: document.getElementById("autoConnectBtn"),
+  connectSelectedPoiBtn: document.getElementById("connectSelectedPoiBtn"),
+  deleteSegmentBtn: document.getElementById("deleteSegmentBtn"),
   refreshCameraBtn: document.getElementById("refreshCameraBtn"),
   cameraRefreshStatus: document.getElementById("cameraRefreshStatus"),
   viewMetrics: document.getElementById("viewMetrics"),
   connectBtn: document.getElementById("connectBtn"),
+  savePathHint: document.getElementById("savePathHint"),
+  stcmFileInput: document.getElementById("stcmFileInput"),
+  stcmResolutionInput: document.getElementById("stcmResolutionInput"),
+  stcmPaddingInput: document.getElementById("stcmPaddingInput"),
+  inspectStcmBtn: document.getElementById("inspectStcmBtn"),
+  downloadPgmBtn: document.getElementById("downloadPgmBtn"),
+  downloadStcmJsonBtn: document.getElementById("downloadStcmJsonBtn"),
+  stcmInspectorStatus: document.getElementById("stcmInspectorStatus"),
+  stcmFileMeta: document.getElementById("stcmFileMeta"),
+  stcmGridMeta: document.getElementById("stcmGridMeta"),
+  stcmSummaryPanel: document.getElementById("stcmSummaryPanel"),
+  stcmManifestPanel: document.getElementById("stcmManifestPanel"),
 };
 
 const topicHandler = {
   "/robot/pose": (msg) => {
     lastPose = msg.payload;
-    elements.posePanel.innerText = JSON.stringify(lastPose, null, 2);
   },
   "/robot/gps": (msg) => {
     lastGps = msg.payload;
-    elements.gpsPanel.innerText = JSON.stringify(lastGps, null, 2);
   },
   "/chassis/status": (msg) => {
     lastChassis = msg.payload;
-    elements.chassisPanel.innerText = JSON.stringify(lastChassis, null, 2);
     renderScanState();
   },
-  "/chassis/odom": () => {},
+  "/chassis/odom": (msg) => {
+    lastOdom = msg.payload;
+    poseHistory.push({
+      stamp: Number(msg.stamp || Date.now() / 1000),
+      pose: { ...msg.payload },
+    });
+    if (poseHistory.length > scanMergeConfig.maxPoseHistory) {
+      poseHistory = poseHistory.slice(-scanMergeConfig.maxPoseHistory);
+    }
+    renderOdomScanPanel();
+  },
   "/lidar/front": (msg) => {
     scanSession.frontFrames += 1;
-    accumulatePoints(msg.payload.points || [], "front");
+    lastScanInfo.front = {
+      raw_points: Number(msg.payload.raw_points || (msg.payload.points || []).length || 0),
+      keyframe: Boolean(msg.payload.keyframe),
+      stamp: Number(msg.stamp || 0),
+    };
+    accumulatePoints(msg.payload.points || [], {
+      source: "front",
+      stamp: Number(msg.stamp || 0),
+      keyframe: Boolean(msg.payload.keyframe),
+    });
+    renderOdomScanPanel();
   },
   "/lidar/rear": (msg) => {
     scanSession.rearFrames += 1;
-    accumulatePoints(msg.payload.points || [], "rear");
+    lastScanInfo.rear = {
+      raw_points: Number(msg.payload.raw_points || (msg.payload.points || []).length || 0),
+      keyframe: Boolean(msg.payload.keyframe),
+      stamp: Number(msg.stamp || 0),
+    };
+    accumulatePoints(msg.payload.points || [], {
+      source: "rear",
+      stamp: Number(msg.stamp || 0),
+      keyframe: Boolean(msg.payload.keyframe),
+    });
+    renderOdomScanPanel();
   },
   "/map/grid": () => {},
 };
@@ -147,6 +238,19 @@ function stableStringify(obj) {
   }
   const keys = Object.keys(obj).sort();
   return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(obj[key])}`).join(",")}}`;
+}
+
+function renderOdomScanPanel() {
+  elements.posePanel.innerText = JSON.stringify({
+    odom: lastOdom,
+    scan: {
+      front_frames: scanSession.frontFrames,
+      rear_frames: scanSession.rearFrames,
+      raw_live_points: scanSession.totalLivePoints,
+      front: lastScanInfo.front,
+      rear: lastScanInfo.rear,
+    },
+  }, null, 2);
 }
 
 async function sha256Hex(text) {
@@ -205,6 +309,11 @@ function setKeyboardState(text, level = "") {
   elements.keyboardState.className = `kbd-state ${level}`.trim();
 }
 
+function setInspectorStatus(text, level = "") {
+  elements.stcmInspectorStatus.innerText = text;
+  elements.stcmInspectorStatus.className = `view-chip ${level}`.trim();
+}
+
 function wsToHttpBase(url) {
   return url.replace(/^ws/, "http").replace(/\/ws\/stream$/, "");
 }
@@ -243,6 +352,426 @@ async function fetchJson(path) {
     throw new Error(`HTTP ${res.status}`);
   }
   return res.json();
+}
+
+async function decompressZipEntry(entry) {
+  if (entry.compressionMethod === 0) {
+    return entry.data;
+  }
+  if (entry.compressionMethod !== 8) {
+    throw new Error(`Unsupported ZIP compression method: ${entry.compressionMethod}`);
+  }
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error("Browser does not support DecompressionStream for ZIP inflate");
+  }
+  const stream = new Blob([entry.data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function parseZipEntries(arrayBuffer) {
+  const bytes = new Uint8Array(arrayBuffer);
+  const view = new DataView(arrayBuffer);
+  let eocdOffset = -1;
+
+  for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 65557); i -= 1) {
+    if (view.getUint32(i, true) === 0x06054b50) {
+      eocdOffset = i;
+      break;
+    }
+  }
+  if (eocdOffset < 0) {
+    throw new Error("Invalid STCM/ZIP file: EOCD not found");
+  }
+
+  const centralDirectorySize = view.getUint32(eocdOffset + 12, true);
+  const centralDirectoryOffset = view.getUint32(eocdOffset + 16, true);
+  const entries = new Map();
+  let cursor = centralDirectoryOffset;
+  const centralEnd = centralDirectoryOffset + centralDirectorySize;
+
+  while (cursor < centralEnd) {
+    if (view.getUint32(cursor, true) !== 0x02014b50) {
+      throw new Error("Invalid ZIP central directory header");
+    }
+    const compressionMethod = view.getUint16(cursor + 10, true);
+    const compressedSize = view.getUint32(cursor + 20, true);
+    const uncompressedSize = view.getUint32(cursor + 24, true);
+    const fileNameLength = view.getUint16(cursor + 28, true);
+    const extraLength = view.getUint16(cursor + 30, true);
+    const commentLength = view.getUint16(cursor + 32, true);
+    const localHeaderOffset = view.getUint32(cursor + 42, true);
+    const fileNameBytes = bytes.slice(cursor + 46, cursor + 46 + fileNameLength);
+    const fileName = new TextDecoder().decode(fileNameBytes);
+
+    if (view.getUint32(localHeaderOffset, true) !== 0x04034b50) {
+      throw new Error(`Invalid ZIP local header for ${fileName}`);
+    }
+    const localNameLength = view.getUint16(localHeaderOffset + 26, true);
+    const localExtraLength = view.getUint16(localHeaderOffset + 28, true);
+    const dataOffset = localHeaderOffset + 30 + localNameLength + localExtraLength;
+    const data = bytes.slice(dataOffset, dataOffset + compressedSize);
+
+    entries.set(fileName, {
+      name: fileName,
+      compressionMethod,
+      compressedSize,
+      uncompressedSize,
+      data,
+    });
+
+    cursor += 46 + fileNameLength + extraLength + commentLength;
+  }
+
+  return entries;
+}
+
+function parseRadarPoints(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const points = [];
+  for (let offset = 0; offset + 12 <= bytes.byteLength; offset += 12) {
+    points.push([
+      view.getFloat32(offset, true),
+      view.getFloat32(offset + 4, true),
+      view.getFloat32(offset + 8, true),
+    ]);
+  }
+  return points;
+}
+
+function buildPgmFromPoints(points, resolution, paddingCells) {
+  if (!points.length) {
+    throw new Error("No radar points in STCM");
+  }
+
+  let minX = points[0][0];
+  let maxX = points[0][0];
+  let minY = points[0][1];
+  let maxY = points[0][1];
+
+  points.forEach(([x, y]) => {
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+  });
+
+  const paddedMinX = minX - paddingCells * resolution;
+  const paddedMinY = minY - paddingCells * resolution;
+  const paddedMaxX = maxX + paddingCells * resolution;
+  const paddedMaxY = maxY + paddingCells * resolution;
+  const width = Math.max(1, Math.ceil((paddedMaxX - paddedMinX) / resolution) + 1);
+  const height = Math.max(1, Math.ceil((paddedMaxY - paddedMinY) / resolution) + 1);
+  const grid = new Uint8Array(width * height).fill(205);
+  const occupiedSet = new Set();
+
+  points.forEach(([x, y]) => {
+    const ix = Math.min(width - 1, Math.max(0, Math.round((x - paddedMinX) / resolution)));
+    const iy = Math.min(height - 1, Math.max(0, Math.round((y - paddedMinY) / resolution)));
+    const flippedY = height - 1 - iy;
+    const idx = flippedY * width + ix;
+    grid[idx] = 0;
+    occupiedSet.add(`${ix}:${iy}`);
+  });
+
+  const rows = [];
+  for (let row = 0; row < height; row += 1) {
+    const start = row * width;
+    const values = [];
+    for (let col = 0; col < width; col += 1) {
+      values.push(String(grid[start + col]));
+    }
+    rows.push(values.join(" "));
+  }
+
+  const pgmText = `P2\n# Generated from STCM radar_points\n${width} ${height}\n255\n${rows.join("\n")}\n`;
+  return {
+    pgmText,
+    width,
+    height,
+    origin: [Number(paddedMinX.toFixed(4)), Number(paddedMinY.toFixed(4)), 0],
+    bounds: {
+      minX: Number(minX.toFixed(4)),
+      maxX: Number(maxX.toFixed(4)),
+      minY: Number(minY.toFixed(4)),
+      maxY: Number(maxY.toFixed(4)),
+    },
+    occupiedCells: occupiedSet.size,
+  };
+}
+
+function buildStcmConfig(fileName, manifest, points, resolution, paddingCells) {
+  const pgm = buildPgmFromPoints(points, resolution, paddingCells);
+  const config = {
+    image: fileName.replace(/\.stcm$/i, ".pgm"),
+    resolution,
+    origin: pgm.origin,
+    negate: 0,
+    occupied_thresh: 0.65,
+    free_thresh: 0.196,
+    mode: "trinary",
+    stcm_meta: {
+      source_file: fileName,
+      version: manifest.version || "unknown",
+      map_source: manifest.map_source || "unknown",
+      created_at: manifest.created_at || null,
+      radar_points: points.length,
+      occupied_cells: pgm.occupiedCells,
+      width: pgm.width,
+      height: pgm.height,
+      bounds: pgm.bounds,
+    },
+  };
+  return { pgm, configJsonText: JSON.stringify(config, null, 2) };
+}
+
+function downloadFile(fileName, content, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function updateSavePathHint(pathText = "") {
+  const localPath = pathText || "No file saved yet";
+  elements.savePathHint.innerText = `Local export: ${localPath}. Browser should open a save dialog so you can choose the destination folder and filename.`;
+}
+
+async function inspectSelectedStcm() {
+  const file = elements.stcmFileInput.files && elements.stcmFileInput.files[0];
+  if (!file) {
+    throw new Error("Please choose a .stcm file first");
+  }
+
+  setInspectorStatus("Parsing", "active");
+  elements.stcmFileMeta.innerText = `${file.name} | ${(file.size / 1024).toFixed(1)} KB`;
+  const arrayBuffer = await file.arrayBuffer();
+  const entries = parseZipEntries(arrayBuffer);
+  const manifestEntry = entries.get("manifest.json");
+  const radarEntry = entries.get("radar_points.bin");
+  if (!manifestEntry || !radarEntry) {
+    throw new Error("STCM must contain manifest.json and radar_points.bin");
+  }
+
+  const manifestBytes = await decompressZipEntry(manifestEntry);
+  const radarBytes = await decompressZipEntry(radarEntry);
+  const manifest = JSON.parse(new TextDecoder().decode(manifestBytes));
+  const points = parseRadarPoints(radarBytes);
+  const resolution = Math.max(0.02, numberFromInput(elements.stcmResolutionInput, 0.1));
+  const paddingCells = Math.max(0, Math.round(numberFromInput(elements.stcmPaddingInput, 8)));
+  const { pgm, configJsonText } = buildStcmConfig(file.name, manifest, points, resolution, paddingCells);
+
+  stcmInspector.file = file;
+  stcmInspector.bundle = manifest;
+  stcmInspector.points = points;
+  stcmInspector.pgmText = pgm.pgmText;
+  stcmInspector.configJsonText = configJsonText;
+  stcmInspector.summary = {
+    file: file.name,
+    manifestVersion: manifest.version || "unknown",
+    mapSource: manifest.map_source || "unknown",
+    radarPoints: points.length,
+    poiCount: Array.isArray(manifest.poi) ? manifest.poi.length : 0,
+    pathCount: Array.isArray(manifest.path) ? manifest.path.length : 0,
+    trajectoryCount: Array.isArray(manifest.trajectory) ? manifest.trajectory.length : 0,
+    width: pgm.width,
+    height: pgm.height,
+    resolution,
+    paddingCells,
+    occupiedCells: pgm.occupiedCells,
+    origin: pgm.origin,
+    bounds: pgm.bounds,
+  };
+
+  elements.stcmGridMeta.innerText = `${pgm.width} x ${pgm.height} | ${pgm.occupiedCells} occupied | res ${resolution.toFixed(2)} m/px`;
+  elements.stcmSummaryPanel.innerText = JSON.stringify(stcmInspector.summary, null, 2);
+  elements.stcmManifestPanel.innerText = JSON.stringify(manifest, null, 2);
+  setInspectorStatus("Ready", "active");
+}
+
+function encodeUint16LE(value) {
+  const bytes = new Uint8Array(2);
+  new DataView(bytes.buffer).setUint16(0, value, true);
+  return bytes;
+}
+
+function encodeUint32LE(value) {
+  const bytes = new Uint8Array(4);
+  new DataView(bytes.buffer).setUint32(0, value, true);
+  return bytes;
+}
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i += 1) {
+    crc ^= bytes[i];
+    for (let j = 0; j < 8; j += 1) {
+      const mask = -(crc & 1);
+      crc = (crc >>> 1) ^ (0xedb88320 & mask);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function concatUint8Arrays(chunks) {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const output = new Uint8Array(total);
+  let offset = 0;
+  chunks.forEach((chunk) => {
+    output.set(chunk, offset);
+    offset += chunk.length;
+  });
+  return output;
+}
+
+function createStoredZip(files) {
+  const encoder = new TextEncoder();
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+
+  files.forEach((file) => {
+    const nameBytes = encoder.encode(file.name);
+    const dataBytes = file.data instanceof Uint8Array ? file.data : encoder.encode(file.data);
+    const checksum = crc32(dataBytes);
+    const localHeader = concatUint8Arrays([
+      encodeUint32LE(0x04034b50),
+      encodeUint16LE(20),
+      encodeUint16LE(0),
+      encodeUint16LE(0),
+      encodeUint16LE(0),
+      encodeUint16LE(0),
+      encodeUint32LE(checksum),
+      encodeUint32LE(dataBytes.length),
+      encodeUint32LE(dataBytes.length),
+      encodeUint16LE(nameBytes.length),
+      encodeUint16LE(0),
+      nameBytes,
+      dataBytes,
+    ]);
+    localParts.push(localHeader);
+
+    const centralHeader = concatUint8Arrays([
+      encodeUint32LE(0x02014b50),
+      encodeUint16LE(20),
+      encodeUint16LE(20),
+      encodeUint16LE(0),
+      encodeUint16LE(0),
+      encodeUint16LE(0),
+      encodeUint16LE(0),
+      encodeUint32LE(checksum),
+      encodeUint32LE(dataBytes.length),
+      encodeUint32LE(dataBytes.length),
+      encodeUint16LE(nameBytes.length),
+      encodeUint16LE(0),
+      encodeUint16LE(0),
+      encodeUint16LE(0),
+      encodeUint16LE(0),
+      encodeUint32LE(0),
+      encodeUint32LE(offset),
+      nameBytes,
+    ]);
+    centralParts.push(centralHeader);
+    offset += localHeader.length;
+  });
+
+  const centralDirectory = concatUint8Arrays(centralParts);
+  const endOfCentralDirectory = concatUint8Arrays([
+    encodeUint32LE(0x06054b50),
+    encodeUint16LE(0),
+    encodeUint16LE(0),
+    encodeUint16LE(files.length),
+    encodeUint16LE(files.length),
+    encodeUint32LE(centralDirectory.length),
+    encodeUint32LE(offset),
+    encodeUint16LE(0),
+  ]);
+
+  return concatUint8Arrays([...localParts, centralDirectory, endOfCentralDirectory]);
+}
+
+function serializeRadarPoints(points) {
+  const bytes = new Uint8Array(points.length * 12);
+  const view = new DataView(bytes.buffer);
+  points.forEach((point, index) => {
+    const offset = index * 12;
+    view.setFloat32(offset, Number(point[0] || 0), true);
+    view.setFloat32(offset + 4, Number(point[1] || 0), true);
+    view.setFloat32(offset + 8, Number(point[2] || 0), true);
+  });
+  return bytes;
+}
+
+function buildClientStcmBundle() {
+  rebuildPathNodes();
+  const voxelSize = Math.max(0.02, numberFromInput(elements.voxelSizeInput, 0.12));
+  const pointsToSave = occupiedPointsForSave();
+  const notes = {
+    text: elements.mapNotesInput.value.trim(),
+    browserObstacleCells: scanSession.occupiedCells.size,
+    browserSafeCells: scanSession.freeCells.size,
+    browserRawLidarPoints: scanSession.totalLivePoints,
+    voxelSize,
+    manualCameraSnapshotAt: elements.cameraRefreshStatus.innerText,
+    clientObstaclePreview: pointsToSave.length,
+  };
+
+  return {
+    version: "stcm.v2",
+    notes: JSON.stringify(notes, null, 2),
+    created_at: Date.now() / 1000,
+    source: "browser",
+    map_source: "laser_accumulation",
+    pose: lastPose,
+    gps: lastGps,
+    chassis: lastChassis,
+    poi: poiNodes.map((poi) => sanitizePoiPayload(poi)),
+    path: pathNodes,
+    trajectory: pathSegments.map((segment) => ({
+      id: segment.id,
+      source: segment.source,
+      geometry: segment.geometry,
+      curveOffset: Number(segment.curveOffset || 0),
+      start: sanitizePathNode(segment.start),
+      end: sanitizePathNode(segment.end),
+    })),
+    gps_track: [],
+    chassis_track: [],
+    scan_summary: {
+      scanActive: scanSession.active,
+      elapsedSec: scanSession.startedAtMs ? Number(((Date.now() - scanSession.startedAtMs) / 1000).toFixed(1)) : 0,
+      obstacleCells: scanSession.occupiedCells.size,
+      safeCells: scanSession.freeCells.size,
+      rawLidarPoints: scanSession.totalLivePoints,
+      frontFrames: scanSession.frontFrames,
+      rearFrames: scanSession.rearFrames,
+      voxelSize,
+    },
+    radar_points: pointsToSave.length ? pointsToSave : [[0, 0, 1]],
+  };
+}
+
+async function saveBlobWithPicker(fileName, blob) {
+  if (window.showSaveFilePicker) {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: fileName,
+      types: [
+        {
+          description: "STCM map",
+          accept: { "application/octet-stream": [".stcm"] },
+        },
+      ],
+    });
+    const writable = await handle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+    return handle.name || fileName;
+  }
+
+  downloadFile(fileName, blob, "application/octet-stream");
+  return `${fileName} (downloaded)`;
 }
 
 function scheduleReconnect() {
@@ -608,15 +1137,43 @@ function raytraceFreeCells(startX, startY, endX, endY) {
   }
 }
 
-function accumulatePoints(points) {
+function poseForStamp(stamp) {
+  if (!poseHistory.length || !Number.isFinite(stamp) || stamp <= 0) {
+    return lastOdom;
+  }
+  let best = poseHistory[poseHistory.length - 1];
+  let bestDelta = Math.abs(best.stamp - stamp);
+  for (const item of poseHistory) {
+    const delta = Math.abs(item.stamp - stamp);
+    if (delta < bestDelta) {
+      best = item;
+      bestDelta = delta;
+    }
+  }
+  return best.pose;
+}
+
+function shouldSkipScanFrame(framePose, keyframe) {
+  if (keyframe) {
+    return false;
+  }
+  return Math.abs(Number(framePose.wz || 0)) >= scanMergeConfig.turnSkipWz;
+}
+
+function accumulatePoints(points, meta = {}) {
   if (!scanSession.active || !Array.isArray(points) || points.length === 0) {
     renderScanState();
     return;
   }
 
   scanSession.voxelSize = Math.max(0.02, numberFromInput(elements.voxelSizeInput, 0.12));
+  const framePose = poseForStamp(Number(meta.stamp || 0));
+  if (shouldSkipScanFrame(framePose, Boolean(meta.keyframe))) {
+    renderScanState();
+    return;
+  }
   scanSession.totalLivePoints += points.length;
-  const [robotIx, robotIy] = worldToCell(lastPose.x, lastPose.y);
+  const [robotIx, robotIy] = worldToCell(framePose.x, framePose.y);
 
   for (const point of points) {
     const [x, y, intensity] = point;
@@ -630,7 +1187,7 @@ function accumulatePoints(points) {
 
 function occupiedPointsForSave() {
   return Array.from(scanSession.occupiedCells.values())
-    .filter((cell) => cell.hits >= 2)
+    .filter((cell) => cell.hits >= scanMergeConfig.saveMinHits)
     .map((cell) => [
       cell.ix * scanSession.voxelSize,
       cell.iy * scanSession.voxelSize,
@@ -668,15 +1225,498 @@ function renderScanState() {
   setScanState("Idle");
 }
 
-function resetPathList() {
-  elements.pathList.innerHTML = "";
-  for (const [index, node] of pathNodes.entries()) {
-    const li = document.createElement("li");
-    const lat = Number.isFinite(node.lat) ? node.lat.toFixed(6) : "n/a";
-    const lon = Number.isFinite(node.lon) ? node.lon.toFixed(6) : "n/a";
-    li.textContent = `${index + 1}. (${node.x.toFixed(2)}, ${node.y.toFixed(2)}) lat=${lat} lon=${lon}`;
-    elements.pathList.appendChild(li);
+function makeLocalPoint(x, y, meta = {}) {
+  return {
+    x: Number(x),
+    y: Number(y),
+    lat: Number.isFinite(meta.lat) ? Number(meta.lat) : null,
+    lon: Number.isFinite(meta.lon) ? Number(meta.lon) : null,
+    poiId: meta.poiId || meta.clientId || null,
+    name: meta.name || "",
+  };
+}
+
+function sanitizePathNode(node) {
+  return {
+    x: Number(node.x),
+    y: Number(node.y),
+    lat: Number.isFinite(node.lat) ? Number(node.lat) : null,
+    lon: Number.isFinite(node.lon) ? Number(node.lon) : null,
+  };
+}
+
+function sanitizePoiPayload(poi) {
+  return {
+    name: poi.name,
+    x: Number(poi.x),
+    y: Number(poi.y),
+    yaw: Number.isFinite(poi.yaw) ? Number(poi.yaw) : 0,
+    lat: Number.isFinite(poi.lat) ? Number(poi.lat) : null,
+    lon: Number.isFinite(poi.lon) ? Number(poi.lon) : null,
+  };
+}
+
+function distanceBetween(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function createSegment(start, end, options = {}) {
+  return {
+    id: `seg-${segmentIdSeed++}`,
+    start: makeLocalPoint(start.x, start.y, start),
+    end: makeLocalPoint(end.x, end.y, end),
+    geometry: "line",
+    curveOffset: 0,
+    source: options.source || "free",
+  };
+}
+
+function sampleSegment(segment) {
+  if (!segment) {
+    return [];
   }
+  return [sanitizePathNode(segment.start), sanitizePathNode(segment.end)];
+}
+
+function rebuildPathNodes() {
+  pathNodes = pathSegments.flatMap((segment) => sampleSegment(segment));
+}
+
+function describePoint(point) {
+  return `(${Number(point.x).toFixed(2)}, ${Number(point.y).toFixed(2)})`;
+}
+
+function parseOptionalNumber(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const text = String(value).trim();
+  if (!text) {
+    return null;
+  }
+  const num = Number(text);
+  return Number.isFinite(num) ? num : null;
+}
+
+function parseLonLatText(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return { ok: true, empty: true, lon: null, lat: null };
+  }
+  const parts = text.split(",").map((item) => item.trim());
+  if (parts.length !== 2) {
+    return { ok: false, message: "Geo format must be lon,lat" };
+  }
+  const lon = Number(parts[0]);
+  const lat = Number(parts[1]);
+  if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
+    return { ok: false, message: "Geo must contain valid numbers" };
+  }
+  if (lon < -180 || lon > 180) {
+    return { ok: false, message: "Longitude must be between -180 and 180" };
+  }
+  if (lat < -90 || lat > 90) {
+    return { ok: false, message: "Latitude must be between -90 and 90" };
+  }
+  return { ok: true, empty: false, lon, lat };
+}
+
+function loadPoiQueueFromInput() {
+  const text = elements.poiBatchCreateInput.value.trim();
+  if (!text) {
+    return [];
+  }
+  const queue = [];
+  const errors = [];
+  text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).forEach((line, idx) => {
+    const parts = line.split(",").map((item) => item.trim());
+    const name = parts[0];
+    if (!name) {
+      errors.push(`line ${idx + 1}`);
+      return;
+    }
+    const lon = parts.length >= 3 ? parseOptionalNumber(parts[1]) : null;
+    const lat = parts.length >= 3 ? parseOptionalNumber(parts[2]) : null;
+    const yaw = parts.length >= 4 ? parseOptionalNumber(parts[3]) : null;
+    if (parts.length >= 3 && (lat === null || lon === null)) {
+      errors.push(`line ${idx + 1}`);
+      return;
+    }
+    if (parts.length >= 4 && yaw === null) {
+      errors.push(`line ${idx + 1}`);
+      return;
+    }
+    queue.push({ name, lat, lon, yaw });
+  });
+  if (errors.length) {
+    alert(`Invalid batch POI input: ${errors.join(", ")}`);
+    return null;
+  }
+  return queue;
+}
+
+function readManualGeoInput(requireValue = false) {
+  const parsed = parseLonLatText(elements.poiGeoInput.value);
+  if (!parsed.ok) {
+    alert(parsed.message);
+    elements.poiGeoInput.focus();
+    return null;
+  }
+  if (requireValue && parsed.empty) {
+    alert("Input geo as lon,lat");
+    elements.poiGeoInput.focus();
+    return null;
+  }
+  return parsed;
+}
+
+function startNextPoiDraft() {
+  if (pendingPoiDraft || !pendingPoiQueue.length) {
+    return false;
+  }
+  pendingPoiDraft = pendingPoiQueue.shift();
+  syncTrajectoryPanel();
+  return true;
+}
+
+function buildPoiCopyText() {
+  return poiNodes.map((poi) => [
+    poi.name,
+    Number(poi.x).toFixed(3),
+    Number(poi.y).toFixed(3),
+    Number.isFinite(poi.yaw) ? Number(poi.yaw).toFixed(3) : "0.000",
+    Number.isFinite(poi.lat) ? Number(poi.lat).toFixed(6) : "",
+    Number.isFinite(poi.lon) ? Number(poi.lon).toFixed(6) : "",
+  ].join(",")).join("\n");
+}
+
+function syncTrajectoryButtons() {
+  const selectedSegment = pathSegments.find((segment) => segment.id === selectedSegmentId) || null;
+  elements.deleteSegmentBtn.disabled = !selectedSegment;
+  elements.connectSelectedPoiBtn.disabled = selectedPoiIds.size !== 2;
+  elements.clearPoiBtn.disabled = selectedPoiIds.size === 0;
+  elements.applyPoiGeoBtn.disabled = selectedPoiIds.size === 0;
+  elements.copyPoiBtn.disabled = poiNodes.length === 0;
+  if (pendingPoiDraft) {
+    elements.addPoiBtn.innerText = "Cancel Add POI";
+  } else if (pendingPoiQueue.length) {
+    elements.addPoiBtn.innerText = `Add POI (${pendingPoiQueue.length} queued)`;
+  } else {
+    elements.addPoiBtn.innerText = "Add POI";
+  }
+}
+
+function renderPoiList() {
+  elements.poiList.innerHTML = "";
+  elements.poiCountBadge.innerText = `${poiNodes.length} POI${selectedPoiIds.size ? ` | ${selectedPoiIds.size} Selected` : ""}`;
+  if (!poiNodes.length) {
+    const li = document.createElement("li");
+    li.innerHTML = `<span class="list-main">No POI yet</span><span class="list-meta">Input name, click Add POI, then click canvas to place</span>`;
+    elements.poiList.appendChild(li);
+    return;
+  }
+  poiNodes.forEach((poi, index) => {
+    const li = document.createElement("li");
+    if (selectedPoiIds.has(poi.clientId)) {
+      li.classList.add("selected");
+    }
+    li.innerHTML = `
+      <span class="list-main">${index + 1}. ${poi.name} ${describePoint(poi)}</span>
+      <span class="list-meta">yaw=${Number.isFinite(poi.yaw) ? poi.yaw.toFixed(3) : "0.000"} | lat=${Number.isFinite(poi.lat) ? poi.lat.toFixed(6) : "n/a"} lon=${Number.isFinite(poi.lon) ? poi.lon.toFixed(6) : "n/a"}</span>
+    `;
+    li.onclick = () => {
+      togglePoiSelection(poi.clientId);
+    };
+    elements.poiList.appendChild(li);
+  });
+}
+
+function renderSegmentList() {
+  elements.pathList.innerHTML = "";
+  if (!pathSegments.length) {
+    const li = document.createElement("li");
+    if (pendingFreePoint) {
+      li.classList.add("pending");
+      li.innerHTML = `<span class="list-main">Free-point mode start saved at ${describePoint(pendingFreePoint)}</span><span class="list-meta">Click canvas again to create the segment</span>`;
+    } else {
+      li.innerHTML = `<span class="list-main">No segments yet</span><span class="list-meta">Auto-connect POI or add one with the current tool</span>`;
+    }
+    elements.pathList.appendChild(li);
+    return;
+  }
+
+  pathSegments.forEach((segment, index) => {
+    const li = document.createElement("li");
+    if (segment.id === selectedSegmentId) {
+      li.classList.add("selected");
+    }
+    li.innerHTML = `
+      <span class="list-main">${index + 1}. line | ${segment.source} | ${describePoint(segment.start)} -> ${describePoint(segment.end)}</span>
+      <span class="list-meta">Length ${distanceBetween(segment.start, segment.end).toFixed(2)} m</span>
+    `;
+    li.onclick = () => {
+      selectedSegmentId = segment.id;
+      syncTrajectoryPanel();
+    };
+    elements.pathList.appendChild(li);
+  });
+}
+
+function updateTrajectoryStatus() {
+  const toolLabel = elements.trajectoryToolMode.value === "poi" ? "Click two POI to connect" : "Click two free points to connect";
+  const pendingText = pendingFreePoint ? ` | Start ${describePoint(pendingFreePoint)}` : "";
+  elements.trajectoryStatus.innerText = `Segments ${pathSegments.length} | Nodes ${pathNodes.length} | Tool ${toolLabel}${pendingText}`;
+}
+
+function syncTrajectoryPanel() {
+  rebuildPathNodes();
+  renderPoiList();
+  renderSegmentList();
+  updateTrajectoryStatus();
+  elements.poiStatus.innerText = pendingPoiDraft
+    ? `Ready to place "${pendingPoiDraft.name}" on canvas${pendingPoiQueue.length ? ` | ${pendingPoiQueue.length} queued` : ""}`
+    : pendingPoiQueue.length
+      ? `${pendingPoiQueue.length} POI queued. Click Add POI to start`
+      : "POI idle";
+  syncTrajectoryButtons();
+}
+
+function togglePoiSelection(clientId) {
+  if (selectedPoiIds.has(clientId)) {
+    selectedPoiIds.delete(clientId);
+  } else {
+    if (selectedPoiIds.size >= 2) {
+      const first = selectedPoiIds.values().next().value;
+      selectedPoiIds.delete(first);
+    }
+    selectedPoiIds.add(clientId);
+  }
+  syncTrajectoryPanel();
+}
+
+function clearPoi() {
+  if (!selectedPoiIds.size) {
+    alert("Select POI to delete");
+    return;
+  }
+  const removedIds = new Set(selectedPoiIds);
+  poiNodes = poiNodes.filter((poi) => !removedIds.has(poi.clientId));
+  pathSegments = pathSegments.filter((segment) => !removedIds.has(segment.start.poiId) && !removedIds.has(segment.end.poiId));
+  selectedPoiIds = new Set();
+  pendingPoiDraft = null;
+  pendingPoiQueue = [];
+  if (selectedSegmentId && !pathSegments.some((segment) => segment.id === selectedSegmentId)) {
+    selectedSegmentId = null;
+  }
+  syncTrajectoryPanel();
+}
+
+function applyGeoToSelectedPoi() {
+  if (!selectedPoiIds.size) {
+    alert("Select POI first");
+    return;
+  }
+  const geo = readManualGeoInput(true);
+  if (!geo) {
+    return;
+  }
+  poiNodes.forEach((poi) => {
+    if (selectedPoiIds.has(poi.clientId)) {
+      poi.lat = geo.lat;
+      poi.lon = geo.lon;
+    }
+  });
+  syncTrajectoryPanel();
+}
+
+function togglePoiPlacement() {
+  if (pendingPoiDraft) {
+    pendingPoiDraft = null;
+    pendingPoiQueue = [];
+    syncTrajectoryPanel();
+    return;
+  }
+  const queue = loadPoiQueueFromInput();
+  if (queue === null) {
+    return;
+  }
+  if (queue.length) {
+    pendingPoiQueue = queue;
+    startNextPoiDraft();
+    return;
+  }
+  const geo = readManualGeoInput(false);
+  if (!geo) {
+    return;
+  }
+  const name = elements.poiNameInput.value.trim();
+  if (!name) {
+    alert("Input POI name first");
+    elements.poiNameInput.focus();
+    return;
+  }
+  pendingPoiDraft = {
+    name,
+    lat: geo.lat,
+    lon: geo.lon,
+    yaw: null,
+  };
+  syncTrajectoryPanel();
+}
+
+async function copyPoiData() {
+  if (!poiNodes.length) {
+    alert("No POI to copy");
+    return;
+  }
+  const text = buildPoiCopyText();
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    await navigator.clipboard.writeText(text);
+  } else {
+    const area = document.createElement("textarea");
+    area.value = text;
+    document.body.appendChild(area);
+    area.select();
+    document.execCommand("copy");
+    area.remove();
+  }
+  alert("POI data copied");
+}
+
+function addSegment(segment) {
+  pathSegments.push(segment);
+  selectedSegmentId = segment.id;
+  syncTrajectoryPanel();
+}
+
+function removeSelectedSegment() {
+  if (!selectedSegmentId) {
+    return;
+  }
+  pathSegments = pathSegments.filter((segment) => segment.id !== selectedSegmentId);
+  selectedSegmentId = null;
+  syncTrajectoryPanel();
+}
+
+function buildSegmentFromSelectedPoi() {
+  if (selectedPoiIds.size !== 2) {
+    alert("Select exactly two POI");
+    return;
+  }
+  const selected = poiNodes.filter((poi) => selectedPoiIds.has(poi.clientId));
+  if (selected.length !== 2) {
+    alert("POI selection state is invalid");
+    return;
+  }
+  addSegment(createSegment(selected[0], selected[1], {
+    source: "poi",
+  }));
+}
+
+function solveNearestLoop(points) {
+  const ordered = [...points];
+  ordered.sort((a, b) => a.x - b.x || a.y - b.y);
+  const route = [ordered[0]];
+  const remaining = ordered.slice(1);
+  while (remaining.length) {
+    const last = route[route.length - 1];
+    let bestIndex = 0;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    remaining.forEach((poi, index) => {
+      const dist = distanceBetween(last, poi);
+      if (dist < bestDistance) {
+        bestDistance = dist;
+        bestIndex = index;
+      }
+    });
+    route.push(remaining.splice(bestIndex, 1)[0]);
+  }
+  return route;
+}
+
+function totalLoopDistance(route) {
+  if (route.length < 2) {
+    return 0;
+  }
+  let total = 0;
+  for (let i = 0; i < route.length; i += 1) {
+    total += distanceBetween(route[i], route[(i + 1) % route.length]);
+  }
+  return total;
+}
+
+function optimizeLoopWithTwoOpt(route) {
+  if (route.length < 4) {
+    return route;
+  }
+  let improved = true;
+  let best = [...route];
+  while (improved) {
+    improved = false;
+    for (let i = 1; i < best.length - 2; i += 1) {
+      for (let j = i + 1; j < best.length - 1; j += 1) {
+        const candidate = [
+          ...best.slice(0, i),
+          ...best.slice(i, j + 1).reverse(),
+          ...best.slice(j + 1),
+        ];
+        if (totalLoopDistance(candidate) + 1e-6 < totalLoopDistance(best)) {
+          best = candidate;
+          improved = true;
+        }
+      }
+    }
+  }
+  return best;
+}
+
+function autoConnectPoiLoop() {
+  if (poiNodes.length < 2) {
+    alert("At least two POI are required");
+    return;
+  }
+  const route = optimizeLoopWithTwoOpt(solveNearestLoop(poiNodes));
+  pathSegments = pathSegments.filter((segment) => segment.source !== "auto");
+  for (let i = 0; i < route.length - 1; i += 1) {
+    pathSegments.push(createSegment(route[i], route[i + 1], { source: "auto", geometry: "line" }));
+  }
+  if (route.length > 2) {
+    pathSegments.push(createSegment(route[route.length - 1], route[0], { source: "auto", geometry: "line" }));
+  }
+  selectedSegmentId = pathSegments.length ? pathSegments[pathSegments.length - 1].id : null;
+  syncTrajectoryPanel();
+}
+
+function findPoiAt(worldX, worldY, thresholdPx = 12) {
+  const thresholdWorld = thresholdPx / viewState.scale;
+  return poiNodes.find((poi) => Math.hypot(poi.x - worldX, poi.y - worldY) <= thresholdWorld) || null;
+}
+
+function distancePointToSegment(point, start, end) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  if (dx === 0 && dy === 0) {
+    return Math.hypot(point.x - start.x, point.y - start.y);
+  }
+  const t = Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / (dx * dx + dy * dy)));
+  const projX = start.x + t * dx;
+  const projY = start.y + t * dy;
+  return Math.hypot(point.x - projX, point.y - projY);
+}
+
+function findSegmentAt(worldX, worldY, thresholdPx = 10) {
+  const thresholdWorld = thresholdPx / viewState.scale;
+  const hitPoint = { x: worldX, y: worldY };
+  for (let i = pathSegments.length - 1; i >= 0; i -= 1) {
+    const segment = pathSegments[i];
+    const samples = sampleSegment(segment);
+    for (let j = 0; j < samples.length - 1; j += 1) {
+      if (distancePointToSegment(hitPoint, samples[j], samples[j + 1]) <= thresholdWorld) {
+        return segment;
+      }
+    }
+  }
+  return null;
 }
 
 function formatTime(ms) {
@@ -716,36 +1756,38 @@ async function stopScan() {
 
 async function saveMap() {
   const name = elements.mapNameInput.value.trim() || "demo_map";
-  const voxelSize = Math.max(0.02, numberFromInput(elements.voxelSizeInput, 0.12));
-  const pointsToSave = occupiedPointsForSave();
-  const notes = {
-    text: elements.mapNotesInput.value.trim(),
-    browserObstacleCells: scanSession.occupiedCells.size,
-    browserSafeCells: scanSession.freeCells.size,
-    browserRawLidarPoints: scanSession.totalLivePoints,
-    voxelSize,
-    manualCameraSnapshotAt: elements.cameraRefreshStatus.innerText,
-    clientObstaclePreview: pointsToSave.length,
-  };
-  const response = await callApi("/map/save", {
-    name,
-    notes: JSON.stringify(notes, null, 2),
-    voxel_size: voxelSize,
-    reset_after_save: false,
-  });
-  scanSession.lastSavedFile = response.file || "";
-  scanSession.savedPointCount = response.contains ? response.contains.radar_points : 0;
+  const bundle = buildClientStcmBundle();
+  const manifest = { ...bundle };
+  delete manifest.radar_points;
+  const zipBytes = createStoredZip([
+    {
+      name: "manifest.json",
+      data: JSON.stringify(manifest, null, 2),
+    },
+    {
+      name: "radar_points.bin",
+      data: serializeRadarPoints(bundle.radar_points),
+    },
+  ]);
+  const savedName = await saveBlobWithPicker(`${name}.stcm`, new Blob([zipBytes], { type: "application/octet-stream" }));
+  scanSession.lastSavedFile = savedName;
+  scanSession.savedPointCount = bundle.radar_points.length;
+  updateSavePathHint(scanSession.lastSavedFile);
   renderScanState();
-  alert(`Map saved: ${response.file}`);
+  alert(`Map saved: ${savedName}`);
 }
 
 async function sendPath() {
+  rebuildPathNodes();
   await callApi("/path/plan", { nodes: pathNodes });
 }
 
 function clearPath() {
+  pathSegments = [];
   pathNodes = [];
-  resetPathList();
+  pendingFreePoint = null;
+  selectedSegmentId = null;
+  syncTrajectoryPanel();
 }
 
 function canvasToWorld(screenX, screenY) {
@@ -778,23 +1820,73 @@ function updateViewMetrics() {
   elements.viewMetrics.innerText = `Pan ${panWorldX}, ${panWorldY} | Zoom ${viewState.scale.toFixed(1)} px/m`;
 }
 
-function handleCanvasClick(clientX, clientY, shiftKey) {
+function handleCanvasClick(clientX, clientY) {
   const rect = canvas.getBoundingClientRect();
   const scaleX = canvas.width / rect.width;
   const scaleY = canvas.height / rect.height;
   const [x, y] = canvasToWorld((clientX - rect.left) * scaleX, (clientY - rect.top) * scaleY);
 
-  if (shiftKey) {
-    const poi = { name: `POI-${poiNodes.length + 1}`, x, y, lat: lastGps.lat, lon: lastGps.lon };
+  if (pendingPoiDraft) {
+    const manualGeo = readManualGeoInput(false);
+    if (!manualGeo) {
+      return;
+    }
+    const draft = pendingPoiDraft;
+    const poi = {
+      clientId: `poi-${poiIdSeed++}`,
+      name: draft.name,
+      x,
+      y,
+      yaw: Number.isFinite(draft.yaw) ? Number(draft.yaw) : Number(lastPose.yaw || 0),
+      lat: draft.lat ?? manualGeo.lat ?? lastGps.lat,
+      lon: draft.lon ?? manualGeo.lon ?? lastGps.lon,
+    };
     poiNodes.push(poi);
-    callApi("/map/poi", { poi }).catch((err) => {
+    pendingPoiDraft = null;
+    elements.poiNameInput.value = "";
+    callApi("/map/poi", {
+      poi: {
+        name: poi.name,
+        x: Number(poi.x),
+        y: Number(poi.y),
+        lat: Number.isFinite(poi.lat) ? Number(poi.lat) : null,
+        lon: Number.isFinite(poi.lon) ? Number(poi.lon) : null,
+      },
+    }).catch((err) => {
       alert(`POI failed: ${err.message}`);
     });
+    startNextPoiDraft();
+    syncTrajectoryPanel();
     return;
   }
 
-  pathNodes.push({ x, y, lat: lastGps.lat, lon: lastGps.lon });
-  resetPathList();
+  const hitSegment = findSegmentAt(x, y);
+  if (hitSegment) {
+    selectedSegmentId = hitSegment.id;
+    syncTrajectoryPanel();
+    return;
+  }
+
+  const hitPoi = findPoiAt(x, y);
+  if (hitPoi) {
+    togglePoiSelection(hitPoi.clientId);
+    return;
+  }
+
+  if (elements.trajectoryToolMode.value === "free") {
+    const point = makeLocalPoint(x, y, { lat: lastGps.lat, lon: lastGps.lon });
+    if (!pendingFreePoint) {
+      pendingFreePoint = point;
+      selectedSegmentId = null;
+      syncTrajectoryPanel();
+      return;
+    }
+    addSegment(createSegment(pendingFreePoint, point, {
+      source: "free",
+    }));
+    pendingFreePoint = null;
+    syncTrajectoryPanel();
+  }
 }
 
 function bindCanvasInteractions() {
@@ -834,7 +1926,7 @@ function bindCanvasInteractions() {
     const wasMoved = viewState.moved;
     viewState.dragging = false;
     if (!wasMoved) {
-      handleCanvasClick(event.clientX, event.clientY, event.shiftKey);
+      handleCanvasClick(event.clientX, event.clientY);
     }
   });
 
@@ -920,7 +2012,7 @@ function drawOccupancy() {
   for (const cell of scanSession.occupiedCells.values()) {
     const free = scanSession.freeCells.get(cellKey(cell.ix, cell.iy));
     const freeWeight = free ? free.hits : 0;
-    if (cell.hits < 2 || cell.hits < freeWeight * 0.9) {
+    if (cell.hits < scanMergeConfig.saveMinHits || cell.hits < freeWeight * 0.9) {
       continue;
     }
     const worldX = cell.ix * scanSession.voxelSize;
@@ -932,16 +2024,18 @@ function drawOccupancy() {
 }
 
 function drawPathOverlay() {
-  if (!drawState.showPath || !pathNodes.length) {
+  if (!drawState.showPath || (!pathSegments.length && !pendingFreePoint)) {
     return;
   }
-  const mode = drawState.pathMode;
-
-  if (mode === "both" || mode === "lines") {
-    ctx.strokeStyle = "#f3b441";
-    ctx.lineWidth = 2;
+  pathSegments.forEach((segment) => {
+    const samples = sampleSegment(segment);
+    if (!samples.length) {
+      return;
+    }
+    ctx.strokeStyle = segment.id === selectedSegmentId ? "#ff7b54" : "#f3b441";
+    ctx.lineWidth = segment.id === selectedSegmentId ? 4 : 2;
     ctx.beginPath();
-    pathNodes.forEach((node, index) => {
+    samples.forEach((node, index) => {
       const [sx, sy] = worldToCanvas(node.x, node.y);
       if (index === 0) {
         ctx.moveTo(sx, sy);
@@ -950,16 +2044,18 @@ function drawPathOverlay() {
       }
     });
     ctx.stroke();
-  }
+  });
 
-  if (mode === "both" || mode === "points") {
-    ctx.fillStyle = "#f3b441";
-    pathNodes.forEach((node) => {
-      const [sx, sy] = worldToCanvas(node.x, node.y);
-      ctx.beginPath();
-      ctx.arc(sx, sy, 4, 0, Math.PI * 2);
-      ctx.fill();
-    });
+  if (pendingFreePoint) {
+    const [sx, sy] = worldToCanvas(pendingFreePoint.x, pendingFreePoint.y);
+    ctx.save();
+    ctx.strokeStyle = "#4fd1c5";
+    ctx.setLineDash([6, 4]);
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(sx, sy, 8, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
   }
 }
 
@@ -967,12 +2063,22 @@ function drawPoiOverlay() {
   if (!drawState.showPoi) {
     return;
   }
-  ctx.fillStyle = "#d94a4a";
   poiNodes.forEach((poi) => {
     const [sx, sy] = worldToCanvas(poi.x, poi.y);
+    ctx.fillStyle = selectedPoiIds.has(poi.clientId) ? "#7c3aed" : "#d94a4a";
     ctx.beginPath();
     ctx.arc(sx, sy, 5, 0, Math.PI * 2);
     ctx.fill();
+    if (selectedPoiIds.has(poi.clientId)) {
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(sx, sy, 9, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "12px Segoe UI";
+    ctx.fillText(poi.name, sx + 8, sy - 8);
   });
 }
 
@@ -984,7 +2090,7 @@ function drawRobot() {
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(-lastPose.yaw);
-  ctx.fillStyle = "#177f7c";
+  ctx.fillStyle = "#13766e";
   ctx.fillRect(-10, -6, 20, 12);
   ctx.strokeStyle = "#ffffff";
   ctx.lineWidth = 2;
@@ -1038,16 +2144,20 @@ function renderCamera() {
 }
 
 function syncDrawControls() {
-  drawState.pathMode = elements.pathDrawMode.value;
   drawState.showPath = elements.showPathToggle.checked;
   drawState.showPoi = elements.showPoiToggle.checked;
   drawState.showRobot = elements.showRobotToggle.checked;
-  const modeLabel = {
-    points: "Only Points",
-    both: "Point + Line",
-    lines: "Only Lines",
-  }[drawState.pathMode];
-  elements.drawModeBadge.innerText = modeLabel;
+  drawState.showMotionControlCard = elements.showMotionControlCardToggle.checked;
+  drawState.showPoiCard = elements.showPoiCardToggle.checked;
+  drawState.showTrajectoryCard = elements.showTrajectoryCardToggle.checked;
+  drawState.showStcmInspectorCard = elements.showStcmInspectorCardToggle.checked;
+  elements.motionControlCard.hidden = !drawState.showMotionControlCard;
+  elements.poiCard.hidden = !drawState.showPoiCard;
+  elements.trajectoryCard.hidden = !drawState.showTrajectoryCard;
+  elements.stcmInspectorCard.hidden = !drawState.showStcmInspectorCard;
+  elements.drawModeBadge.innerText = "Line";
+  updateTrajectoryStatus();
+  syncTrajectoryButtons();
 }
 
 function draw() {
@@ -1070,14 +2180,66 @@ function bindUi() {
   document.getElementById("saveMapBtn").onclick = () => saveMap().catch((err) => alert(`Save failed: ${err.message}`));
   document.getElementById("sendPathBtn").onclick = () => sendPath().catch((err) => alert(`Send path failed: ${err.message}`));
   document.getElementById("clearPathBtn").onclick = clearPath;
+  elements.addPoiBtn.onclick = togglePoiPlacement;
+  elements.applyPoiGeoBtn.onclick = applyGeoToSelectedPoi;
+  elements.copyPoiBtn.onclick = () => copyPoiData().catch((err) => alert(`Copy failed: ${err.message}`));
+  elements.clearPoiBtn.onclick = clearPoi;
+  elements.autoConnectBtn.onclick = autoConnectPoiLoop;
+  elements.connectSelectedPoiBtn.onclick = buildSegmentFromSelectedPoi;
+  elements.deleteSegmentBtn.onclick = removeSelectedSegment;
   document.getElementById("centerViewBtn").onclick = centerViewOnRobot;
   document.getElementById("resetViewBtn").onclick = resetView;
   elements.refreshCameraBtn.onclick = refreshCameraSnapshot;
+  elements.inspectStcmBtn.onclick = () => {
+    inspectSelectedStcm().catch((err) => {
+      setInspectorStatus("Error", "error");
+      elements.stcmSummaryPanel.innerText = JSON.stringify({ error: err.message }, null, 2);
+      elements.stcmManifestPanel.innerText = "-";
+    });
+  };
+  elements.downloadPgmBtn.onclick = () => {
+    if (!stcmInspector.pgmText || !stcmInspector.file) {
+      alert("Inspect a STCM file first");
+      return;
+    }
+    downloadFile(stcmInspector.file.name.replace(/\.stcm$/i, ".pgm"), stcmInspector.pgmText, "image/x-portable-graymap");
+  };
+  elements.downloadStcmJsonBtn.onclick = () => {
+    if (!stcmInspector.configJsonText || !stcmInspector.file) {
+      alert("Inspect a STCM file first");
+      return;
+    }
+    downloadFile(stcmInspector.file.name.replace(/\.stcm$/i, ".json"), stcmInspector.configJsonText, "application/json");
+  };
+  elements.stcmFileInput.addEventListener("change", () => {
+    const file = elements.stcmFileInput.files && elements.stcmFileInput.files[0];
+    stcmInspector.file = file || null;
+    stcmInspector.bundle = null;
+    stcmInspector.points = [];
+    stcmInspector.pgmText = "";
+    stcmInspector.configJsonText = "";
+    stcmInspector.summary = null;
+    setInspectorStatus("Idle");
+    elements.stcmFileMeta.innerText = file ? `${file.name} | ${(file.size / 1024).toFixed(1)} KB` : "No file selected";
+    elements.stcmGridMeta.innerText = "No grid generated";
+    elements.stcmSummaryPanel.innerText = "-";
+    elements.stcmManifestPanel.innerText = "-";
+  });
 
-  elements.pathDrawMode.addEventListener("change", syncDrawControls);
+  elements.trajectoryToolMode.addEventListener("change", () => {
+    pendingFreePoint = null;
+    updateTrajectoryStatus();
+    syncTrajectoryButtons();
+  });
+  elements.poiBatchCreateInput.addEventListener("input", syncTrajectoryButtons);
+  elements.poiGeoInput.addEventListener("input", syncTrajectoryPanel);
   elements.showPathToggle.addEventListener("change", syncDrawControls);
   elements.showPoiToggle.addEventListener("change", syncDrawControls);
   elements.showRobotToggle.addEventListener("change", syncDrawControls);
+  elements.showMotionControlCardToggle.addEventListener("change", syncDrawControls);
+  elements.showPoiCardToggle.addEventListener("change", syncDrawControls);
+  elements.showTrajectoryCardToggle.addEventListener("change", syncDrawControls);
+  elements.showStcmInspectorCardToggle.addEventListener("change", syncDrawControls);
 
   document.querySelectorAll("[data-move]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -1115,8 +2277,12 @@ function bindUi() {
 bindUi();
 bindCanvasInteractions();
 syncDrawControls();
+syncTrajectoryPanel();
 renderCamera();
 renderScanState();
+renderOdomScanPanel();
 resetView();
 updateCameraRefreshStatus();
+updateSavePathHint();
+setInspectorStatus("Idle");
 draw();
