@@ -70,6 +70,7 @@ const stcmInspector = {
   pgmText: "",
   configJsonText: "",
   summary: null,
+  loadedFileName: "",
 };
 
 const drawState = {
@@ -79,7 +80,22 @@ const drawState = {
   showMotionControlCard: true,
   showPoiCard: true,
   showTrajectoryCard: true,
-  showStcmInspectorCard: false,
+  showStcmInspectorCard: true,
+};
+
+const editState = {
+  tool: "view",
+  pendingObstacleStart: null,
+  erasing: false,
+  loadedFromStcm: false,
+  loadedMapName: "",
+};
+
+const pathValidation = {
+  checked: false,
+  ok: null,
+  invalidSegmentIds: new Set(),
+  message: "",
 };
 
 const viewState = {
@@ -124,6 +140,8 @@ const elements = {
   poiGeoInput: document.getElementById("poiGeoInput"),
   poiBatchCreateInput: document.getElementById("poiBatchCreateInput"),
   trajectoryToolMode: document.getElementById("trajectoryToolMode"),
+  pathStartPoiInput: document.getElementById("pathStartPoiInput"),
+  pathEndPoiInput: document.getElementById("pathEndPoiInput"),
   showPathToggle: document.getElementById("showPathToggle"),
   showPoiToggle: document.getElementById("showPoiToggle"),
   showRobotToggle: document.getElementById("showRobotToggle"),
@@ -144,7 +162,8 @@ const elements = {
   copyPoiBtn: document.getElementById("copyPoiBtn"),
   poiCountBadge: document.getElementById("poiCountBadge"),
   autoConnectBtn: document.getElementById("autoConnectBtn"),
-  connectSelectedPoiBtn: document.getElementById("connectSelectedPoiBtn"),
+  connectNamedPoiBtn: document.getElementById("connectNamedPoiBtn"),
+  validatePathBtn: document.getElementById("validatePathBtn"),
   deleteSegmentBtn: document.getElementById("deleteSegmentBtn"),
   refreshCameraBtn: document.getElementById("refreshCameraBtn"),
   cameraRefreshStatus: document.getElementById("cameraRefreshStatus"),
@@ -155,8 +174,17 @@ const elements = {
   stcmResolutionInput: document.getElementById("stcmResolutionInput"),
   stcmPaddingInput: document.getElementById("stcmPaddingInput"),
   inspectStcmBtn: document.getElementById("inspectStcmBtn"),
+  loadStcmToCanvasBtn: document.getElementById("loadStcmToCanvasBtn"),
   downloadPgmBtn: document.getElementById("downloadPgmBtn"),
   downloadStcmJsonBtn: document.getElementById("downloadStcmJsonBtn"),
+  mapEditToolMode: document.getElementById("mapEditToolMode"),
+  editBrushRadiusInput: document.getElementById("editBrushRadiusInput"),
+  autoClearNoiseBtn: document.getElementById("autoClearNoiseBtn"),
+  clearEditorMapBtn: document.getElementById("clearEditorMapBtn"),
+  mapEditStatus: document.getElementById("mapEditStatus"),
+  mapLoadedBadge: document.getElementById("mapLoadedBadge"),
+  editorToolBadge: document.getElementById("editorToolBadge"),
+  editorStatsBadge: document.getElementById("editorStatsBadge"),
   stcmInspectorStatus: document.getElementById("stcmInspectorStatus"),
   stcmFileMeta: document.getElementById("stcmFileMeta"),
   stcmGridMeta: document.getElementById("stcmGridMeta"),
@@ -573,6 +601,8 @@ async function inspectSelectedStcm() {
     manifestVersion: manifest.version || "unknown",
     mapSource: manifest.map_source || "unknown",
     radarPoints: points.length,
+    hasBrowserOccupancy: Boolean(manifest.browser_occupancy),
+    restoredFreeCells: Array.isArray(manifest.browser_occupancy?.free_cells) ? manifest.browser_occupancy.free_cells.length : 0,
     poiCount: Array.isArray(manifest.poi) ? manifest.poi.length : 0,
     pathCount: Array.isArray(manifest.path) ? manifest.path.length : 0,
     trajectoryCount: Array.isArray(manifest.trajectory) ? manifest.trajectory.length : 0,
@@ -589,6 +619,237 @@ async function inspectSelectedStcm() {
   elements.stcmSummaryPanel.innerText = JSON.stringify(stcmInspector.summary, null, 2);
   elements.stcmManifestPanel.innerText = JSON.stringify(manifest, null, 2);
   setInspectorStatus("Ready", "active");
+}
+
+function resetEditorToolState(nextTool = editState.tool) {
+  editState.tool = nextTool;
+  editState.pendingObstacleStart = null;
+  editState.erasing = false;
+}
+
+function brushRadiusInMeters() {
+  return Math.max(0.05, numberFromInput(elements.editBrushRadiusInput, 0.25));
+}
+
+function setMapEditStatus(text, level = "") {
+  elements.mapEditStatus.innerText = text;
+  elements.mapEditStatus.className = `hint ${level}`.trim();
+}
+
+function updateEditorBadges() {
+  const sourceLabel = editState.loadedFromStcm
+    ? `Loaded: ${editState.loadedMapName || stcmInspector.loadedFileName || "STCM map"}`
+    : "Scan Session";
+  elements.mapLoadedBadge.innerText = sourceLabel;
+
+  const toolLabel = editState.tool === "erase"
+    ? "Tool: Erase Noise"
+    : editState.tool === "obstacle"
+      ? `Tool: Draw Obstacle${editState.pendingObstacleStart ? " | Pick end point" : ""}`
+      : "Tool: View / Select";
+  elements.editorToolBadge.innerText = toolLabel;
+  elements.editorStatsBadge.innerText = `${scanSession.occupiedCells.size} obstacle cells | ${poiNodes.length} POI | ${pathSegments.length} paths`;
+}
+
+function setOccupiedCell(ix, iy, hits = scanMergeConfig.saveMinHits, intensity = 1) {
+  scanSession.occupiedCells.set(cellKey(ix, iy), { ix, iy, hits, intensity });
+}
+
+function removeCellsInRadius(worldX, worldY, radiusMeters) {
+  const radiusCells = Math.max(1, Math.round(radiusMeters / scanSession.voxelSize));
+  const [cx, cy] = worldToCell(worldX, worldY);
+  for (let dx = -radiusCells; dx <= radiusCells; dx += 1) {
+    for (let dy = -radiusCells; dy <= radiusCells; dy += 1) {
+      const dist = Math.hypot(dx, dy) * scanSession.voxelSize;
+      if (dist > radiusMeters) {
+        continue;
+      }
+      const key = cellKey(cx + dx, cy + dy);
+      scanSession.occupiedCells.delete(key);
+      scanSession.freeCells.delete(key);
+    }
+  }
+  renderScanState();
+  updateEditorBadges();
+}
+
+function rasterizeObstacleLine(startPoint, endPoint) {
+  const [startIx, startIy] = worldToCell(startPoint.x, startPoint.y);
+  const [endIx, endIy] = worldToCell(endPoint.x, endPoint.y);
+  const steps = Math.max(Math.abs(endIx - startIx), Math.abs(endIy - startIy), 1);
+  for (let step = 0; step <= steps; step += 1) {
+    const t = step / steps;
+    const ix = Math.round(startIx + (endIx - startIx) * t);
+    const iy = Math.round(startIy + (endIy - startIy) * t);
+    setOccupiedCell(ix, iy);
+  }
+  renderScanState();
+  updateEditorBadges();
+}
+
+function autoClearNoise() {
+  const removable = [];
+  for (const cell of scanSession.occupiedCells.values()) {
+    if (cell.hits > scanMergeConfig.saveMinHits) {
+      continue;
+    }
+    let neighbors = 0;
+    for (let dx = -1; dx <= 1; dx += 1) {
+      for (let dy = -1; dy <= 1; dy += 1) {
+        if (dx === 0 && dy === 0) {
+          continue;
+        }
+        if (scanSession.occupiedCells.has(cellKey(cell.ix + dx, cell.iy + dy))) {
+          neighbors += 1;
+        }
+      }
+    }
+    if (neighbors <= 1) {
+      removable.push(cellKey(cell.ix, cell.iy));
+    }
+  }
+  removable.forEach((key) => scanSession.occupiedCells.delete(key));
+  renderScanState();
+  updateEditorBadges();
+  setMapEditStatus(removable.length ? `Auto cleared ${removable.length} noisy cells` : "No isolated noise found", removable.length ? "active" : "");
+}
+
+function rebuildSegmentsFromBundle(manifest) {
+  segmentIdSeed = 1;
+  if (Array.isArray(manifest.trajectory) && manifest.trajectory.length) {
+    pathSegments = manifest.trajectory.map((segment) => ({
+      id: segment.id || `seg-${segmentIdSeed++}`,
+      start: makeLocalPoint(segment.start?.x || 0, segment.start?.y || 0, segment.start || {}),
+      end: makeLocalPoint(segment.end?.x || 0, segment.end?.y || 0, segment.end || {}),
+      geometry: segment.geometry || "line",
+      curveOffset: Number(segment.curveOffset || 0),
+      source: segment.source || "stcm",
+    }));
+    segmentIdSeed = pathSegments.length + 1;
+    return;
+  }
+
+  const nodes = Array.isArray(manifest.path) ? manifest.path : [];
+  pathSegments = [];
+  for (let i = 0; i < nodes.length - 1; i += 1) {
+    pathSegments.push(createSegment(nodes[i], nodes[i + 1], { source: "stcm" }));
+  }
+  segmentIdSeed = pathSegments.length + 1;
+}
+
+function loadStcmIntoEditor() {
+  if (!stcmInspector.bundle || !Array.isArray(stcmInspector.points)) {
+    alert("Inspect a STCM file first");
+    return;
+  }
+
+  clearAccumulation();
+  scanSession.active = false;
+  scanSession.voxelSize = Math.max(0.02, numberFromInput(elements.voxelSizeInput, 0.12));
+  const browserOccupancy = stcmInspector.bundle.browser_occupancy;
+  if (browserOccupancy && Array.isArray(browserOccupancy.occupied_cells)) {
+    scanSession.voxelSize = Math.max(0.02, Number(browserOccupancy.voxel_size || scanSession.voxelSize));
+    browserOccupancy.occupied_cells.forEach((cell) => {
+      setOccupiedCell(
+        Number(cell.ix || 0),
+        Number(cell.iy || 0),
+        Number(cell.hits || scanMergeConfig.saveMinHits),
+        Number(cell.intensity || 1),
+      );
+    });
+    if (Array.isArray(browserOccupancy.free_cells)) {
+      browserOccupancy.free_cells.forEach((cell) => {
+        scanSession.freeCells.set(cellKey(Number(cell.ix || 0), Number(cell.iy || 0)), {
+          ix: Number(cell.ix || 0),
+          iy: Number(cell.iy || 0),
+          hits: Number(cell.hits || 1),
+        });
+      });
+    }
+  } else {
+    stcmInspector.points.forEach((point) => {
+      const [ix, iy] = worldToCell(Number(point[0] || 0), Number(point[1] || 0));
+      setOccupiedCell(ix, iy, scanMergeConfig.saveMinHits, Number(point[2] || 1));
+    });
+  }
+
+  poiIdSeed = 1;
+  poiNodes = (Array.isArray(stcmInspector.bundle.poi) ? stcmInspector.bundle.poi : []).map((poi) => ({
+    clientId: `poi-${poiIdSeed++}`,
+    name: poi.name || `POI ${poiIdSeed}`,
+    x: Number(poi.x || 0),
+    y: Number(poi.y || 0),
+    yaw: poi.yaw === null || poi.yaw === undefined || poi.yaw === "" ? 0 : Number(poi.yaw),
+    lat: poi.lat === null || poi.lat === undefined || poi.lat === "" ? null : Number(poi.lat),
+    lon: poi.lon === null || poi.lon === undefined || poi.lon === "" ? null : Number(poi.lon),
+  }));
+  selectedPoiIds = new Set();
+  pendingPoiDraft = null;
+  pendingPoiQueue = [];
+  rebuildSegmentsFromBundle(stcmInspector.bundle);
+  selectedSegmentId = null;
+
+  editState.loadedFromStcm = true;
+  editState.loadedMapName = stcmInspector.file ? stcmInspector.file.name : "stcm";
+  stcmInspector.loadedFileName = editState.loadedMapName;
+  if (elements.mapEditToolMode) {
+    elements.mapEditToolMode.value = "view";
+  }
+  resetEditorToolState("view");
+  elements.mapNameInput.value = editState.loadedMapName.replace(/\.stcm$/i, "") || elements.mapNameInput.value;
+  if (typeof stcmInspector.bundle.notes === "string" && stcmInspector.bundle.notes.trim()) {
+    elements.mapNotesInput.value = stcmInspector.bundle.notes;
+  }
+  if (stcmInspector.summary && Number.isFinite(Number(stcmInspector.summary.resolution))) {
+    elements.stcmResolutionInput.value = Number(stcmInspector.summary.resolution).toFixed(2);
+  }
+
+  syncTrajectoryPanel();
+  renderScanState();
+  centerViewOnLoadedMap();
+  updateEditorBadges();
+  setMapEditStatus(`Loaded ${editState.loadedMapName} into main map view`, "active");
+}
+
+function centerViewOnLoadedMap() {
+  const points = Array.from(scanSession.occupiedCells.values());
+  if (!points.length) {
+    centerViewOnRobot();
+    return;
+  }
+  let minX = points[0].ix * scanSession.voxelSize;
+  let maxX = minX;
+  let minY = points[0].iy * scanSession.voxelSize;
+  let maxY = minY;
+  points.forEach((cell) => {
+    const x = cell.ix * scanSession.voxelSize;
+    const y = cell.iy * scanSession.voxelSize;
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+  });
+  viewState.panX = -((minX + maxX) / 2) * viewState.scale;
+  viewState.panY = ((minY + maxY) / 2) * viewState.scale;
+  updateViewMetrics();
+}
+
+function clearEditorMap() {
+  clearAccumulation();
+  poiNodes = [];
+  pathSegments = [];
+  pathNodes = [];
+  selectedPoiIds = new Set();
+  selectedSegmentId = null;
+  editState.loadedFromStcm = false;
+  editState.loadedMapName = "";
+  if (elements.mapEditToolMode) {
+    elements.mapEditToolMode.value = "view";
+  }
+  resetEditorToolState("view");
+  syncTrajectoryPanel();
+  updateEditorBadges();
+  setMapEditStatus("Loaded map cleared", "warning");
 }
 
 function encodeUint16LE(value) {
@@ -716,6 +977,23 @@ function buildClientStcmBundle() {
     voxelSize,
     manualCameraSnapshotAt: elements.cameraRefreshStatus.innerText,
     clientObstaclePreview: pointsToSave.length,
+    loadedFromStcm: editState.loadedFromStcm,
+    loadedMapName: editState.loadedMapName || null,
+    editTool: editState.tool,
+  };
+  const browserOccupancy = {
+    voxel_size: voxelSize,
+    occupied_cells: Array.from(scanSession.occupiedCells.values()).map((cell) => ({
+      ix: Number(cell.ix),
+      iy: Number(cell.iy),
+      hits: Number(cell.hits || scanMergeConfig.saveMinHits),
+      intensity: Number(cell.intensity || 1),
+    })),
+    free_cells: Array.from(scanSession.freeCells.values()).map((cell) => ({
+      ix: Number(cell.ix),
+      iy: Number(cell.iy),
+      hits: Number(cell.hits || 1),
+    })),
   };
 
   return {
@@ -723,7 +1001,8 @@ function buildClientStcmBundle() {
     notes: JSON.stringify(notes, null, 2),
     created_at: Date.now() / 1000,
     source: "browser",
-    map_source: "laser_accumulation",
+    map_source: editState.loadedFromStcm ? "stcm_editor" : "laser_accumulation",
+    browser_occupancy: browserOccupancy,
     pose: lastPose,
     gps: lastGps,
     chassis: lastChassis,
@@ -1084,13 +1363,17 @@ function clearAccumulation() {
   scanSession.savedPointCount = 0;
   scanSession.lastSavedFile = "";
   renderScanState();
+  updateEditorBadges();
 }
 
 function startScanSession() {
   clearAccumulation();
+  editState.loadedFromStcm = false;
+  editState.loadedMapName = "";
   scanSession.active = true;
   scanSession.startedAtMs = Date.now();
   renderScanState();
+  updateEditorBadges();
 }
 
 function stopScanSession() {
@@ -1201,6 +1484,7 @@ function renderScanState() {
   const freeCount = scanSession.freeCells.size;
   const payload = {
     scanActive: scanSession.active,
+    mapSource: editState.loadedFromStcm ? "loaded_stcm" : "live_scan",
     chassisMode: lastChassis.mode || "-",
     elapsedSec: Number(elapsedSec.toFixed(1)),
     obstacleCells: occupiedCount,
@@ -1216,13 +1500,16 @@ function renderScanState() {
 
   if (scanSession.active) {
     setScanState(`Recording ${occupiedCount} obstacle cells`, "active");
+    updateEditorBadges();
     return;
   }
   if (occupiedCount > 0 || freeCount > 0) {
     setScanState(`Stopped | ${occupiedCount} obs / ${freeCount} safe`, "warning");
+    updateEditorBadges();
     return;
   }
   setScanState("Idle");
+  updateEditorBadges();
 }
 
 function makeLocalPoint(x, y, meta = {}) {
@@ -1390,10 +1677,148 @@ function buildPoiCopyText() {
   ].join(",")).join("\n");
 }
 
+function resetPathValidation() {
+  pathValidation.checked = false;
+  pathValidation.ok = null;
+  pathValidation.invalidSegmentIds = new Set();
+  pathValidation.message = "";
+}
+
+function pathNodeKey(point) {
+  return `${Number(point.x).toFixed(3)},${Number(point.y).toFixed(3)}`;
+}
+
+function normalizePoiName(name) {
+  return String(name || "").trim().toLowerCase();
+}
+
+function findPoiByName(name) {
+  const target = normalizePoiName(name);
+  if (!target) {
+    return { poi: null, error: "Input both POI names first" };
+  }
+  const matches = poiNodes.filter((poi) => normalizePoiName(poi.name) === target);
+  if (!matches.length) {
+    return { poi: null, error: `POI "${name}" not found` };
+  }
+  if (matches.length > 1) {
+    return { poi: null, error: `POI name "${name}" is duplicated` };
+  }
+  return { poi: matches[0], error: "" };
+}
+
+function computePathClosedLoopValidation() {
+  resetPathValidation();
+  pathValidation.checked = true;
+
+  if (pathSegments.length < 3) {
+    pathValidation.ok = false;
+    pathValidation.invalidSegmentIds = new Set(pathSegments.map((segment) => segment.id));
+    pathValidation.message = "Closed-loop check failed: at least 3 path segments are required.";
+    return false;
+  }
+
+  const endpointMap = new Map();
+  const adjacency = new Map();
+
+  pathSegments.forEach((segment) => {
+    const startKey = pathNodeKey(segment.start);
+    const endKey = pathNodeKey(segment.end);
+    if (!endpointMap.has(startKey)) {
+      endpointMap.set(startKey, []);
+    }
+    if (!endpointMap.has(endKey)) {
+      endpointMap.set(endKey, []);
+    }
+    endpointMap.get(startKey).push(segment.id);
+    endpointMap.get(endKey).push(segment.id);
+
+    if (!adjacency.has(startKey)) {
+      adjacency.set(startKey, new Set());
+    }
+    if (!adjacency.has(endKey)) {
+      adjacency.set(endKey, new Set());
+    }
+    adjacency.get(startKey).add(endKey);
+    adjacency.get(endKey).add(startKey);
+  });
+
+  const invalidSegmentIds = new Set();
+  const badNodes = [];
+  endpointMap.forEach((segmentIds, key) => {
+    if (segmentIds.length !== 2) {
+      badNodes.push(key);
+      segmentIds.forEach((id) => invalidSegmentIds.add(id));
+    }
+  });
+
+  const keys = Array.from(adjacency.keys());
+  const visited = new Set();
+  const components = [];
+  keys.forEach((startKey) => {
+    if (visited.has(startKey)) {
+      return;
+    }
+    const stack = [startKey];
+    const component = new Set();
+    while (stack.length) {
+      const node = stack.pop();
+      if (visited.has(node)) {
+        continue;
+      }
+      visited.add(node);
+      component.add(node);
+      (adjacency.get(node) || []).forEach((nextNode) => {
+        if (!visited.has(nextNode)) {
+          stack.push(nextNode);
+        }
+      });
+    }
+    components.push(component);
+  });
+
+  if (components.length !== 1) {
+    pathSegments.forEach((segment) => invalidSegmentIds.add(segment.id));
+  }
+
+  pathValidation.ok = invalidSegmentIds.size === 0;
+  pathValidation.invalidSegmentIds = invalidSegmentIds;
+
+  if (pathValidation.ok) {
+    pathValidation.message = "Closed-loop check passed.";
+  } else {
+    const reasonParts = [];
+    if (badNodes.length) {
+      reasonParts.push(`${badNodes.length} endpoint(s) do not have degree 2`);
+    }
+    if (components.length !== 1) {
+      reasonParts.push(`path is split into ${components.length} disconnected component(s)`);
+    }
+    pathValidation.message = `Closed-loop check failed: ${reasonParts.join("; ")}.`;
+  }
+
+  return pathValidation.ok;
+}
+
+function validatePathClosedLoop(showAlert = true) {
+  computePathClosedLoopValidation();
+
+  syncTrajectoryPanel();
+  if (showAlert) {
+    alert(pathValidation.message);
+  }
+  return pathValidation.ok;
+}
+
 function syncTrajectoryButtons() {
   const selectedSegment = pathSegments.find((segment) => segment.id === selectedSegmentId) || null;
+  const nameMode = elements.trajectoryToolMode.value === "poi";
+  const hasNamedPoiPair = elements.pathStartPoiInput.value.trim() && elements.pathEndPoiInput.value.trim();
+  elements.pathStartPoiInput.disabled = !nameMode;
+  elements.pathEndPoiInput.disabled = !nameMode;
   elements.deleteSegmentBtn.disabled = !selectedSegment;
-  elements.connectSelectedPoiBtn.disabled = selectedPoiIds.size !== 2;
+  elements.connectNamedPoiBtn.disabled = !nameMode || !hasNamedPoiPair;
+  elements.validatePathBtn.disabled = pathSegments.length === 0;
   elements.clearPoiBtn.disabled = selectedPoiIds.size === 0;
   elements.applyPoiGeoBtn.disabled = selectedPoiIds.size === 0;
   elements.copyPoiBtn.disabled = poiNodes.length === 0;
@@ -1439,7 +1864,7 @@ function renderSegmentList() {
       li.classList.add("pending");
       li.innerHTML = `<span class="list-main">Free-point mode start saved at ${describePoint(pendingFreePoint)}</span><span class="list-meta">Click canvas again to create the segment</span>`;
     } else {
-      li.innerHTML = `<span class="list-main">No segments yet</span><span class="list-meta">Auto-connect POI or add one with the current tool</span>`;
+      li.innerHTML = `<span class="list-main">No path segments yet</span><span class="list-meta">Auto-connect POI or add one with the current tool</span>`;
     }
     elements.pathList.appendChild(li);
     return;
@@ -1450,9 +1875,12 @@ function renderSegmentList() {
     if (segment.id === selectedSegmentId) {
       li.classList.add("selected");
     }
+    if (pathValidation.invalidSegmentIds.has(segment.id)) {
+      li.classList.add("invalid");
+    }
     li.innerHTML = `
       <span class="list-main">${index + 1}. line | ${segment.source} | ${describePoint(segment.start)} -> ${describePoint(segment.end)}</span>
-      <span class="list-meta">Length ${distanceBetween(segment.start, segment.end).toFixed(2)} m</span>
+      <span class="list-meta">Length ${distanceBetween(segment.start, segment.end).toFixed(2)} m${pathValidation.invalidSegmentIds.has(segment.id) ? " | closed-loop error" : ""}</span>
     `;
     li.onclick = () => {
       selectedSegmentId = segment.id;
@@ -1463,13 +1891,23 @@ function renderSegmentList() {
 }
 
 function updateTrajectoryStatus() {
-  const toolLabel = elements.trajectoryToolMode.value === "poi" ? "Click two POI to connect" : "Click two free points to connect";
+  const toolLabel = elements.trajectoryToolMode.value === "poi"
+    ? `Input POI names to connect${elements.pathStartPoiInput.value.trim() || elements.pathEndPoiInput.value.trim() ? ` (${elements.pathStartPoiInput.value.trim() || "?"} -> ${elements.pathEndPoiInput.value.trim() || "?"})` : ""}`
+    : "Click any two points to connect";
   const pendingText = pendingFreePoint ? ` | Start ${describePoint(pendingFreePoint)}` : "";
-  elements.trajectoryStatus.innerText = `Segments ${pathSegments.length} | Nodes ${pathNodes.length} | Tool ${toolLabel}${pendingText}`;
+  const validationText = !pathValidation.checked
+    ? " | Loop unchecked"
+    : pathValidation.ok
+      ? " | Loop OK"
+      : ` | Loop error ${pathValidation.invalidSegmentIds.size} segment(s)`;
+  elements.trajectoryStatus.innerText = `Path segments ${pathSegments.length} | Nodes ${pathNodes.length} | Tool ${toolLabel}${pendingText}${validationText}`;
 }
 
 function syncTrajectoryPanel() {
   rebuildPathNodes();
+  if (pathValidation.checked) {
+    computePathClosedLoopValidation();
+  }
   renderPoiList();
   renderSegmentList();
   updateTrajectoryStatus();
@@ -1479,6 +1917,7 @@ function syncTrajectoryPanel() {
       ? `${pendingPoiQueue.length} POI queued. Click Add POI to start`
       : "POI idle";
   syncTrajectoryButtons();
+  updateEditorBadges();
 }
 
 function togglePoiSelection(clientId) {
@@ -1598,18 +2037,29 @@ function removeSelectedSegment() {
   syncTrajectoryPanel();
 }
 
-function buildSegmentFromSelectedPoi() {
-  if (selectedPoiIds.size !== 2) {
-    alert("Select exactly two POI");
+function connectNamedPoi() {
+  const startName = elements.pathStartPoiInput.value.trim();
+  const endName = elements.pathEndPoiInput.value.trim();
+  if (!startName || !endName) {
+    alert("Input both POI names first");
     return;
   }
-  const selected = poiNodes.filter((poi) => selectedPoiIds.has(poi.clientId));
-  if (selected.length !== 2) {
-    alert("POI selection state is invalid");
+  const startResult = findPoiByName(startName);
+  if (!startResult.poi) {
+    alert(startResult.error);
     return;
   }
-  addSegment(createSegment(selected[0], selected[1], {
-    source: "poi",
+  const endResult = findPoiByName(endName);
+  if (!endResult.poi) {
+    alert(endResult.error);
+    return;
+  }
+  if (startResult.poi.clientId === endResult.poi.clientId) {
+    alert("Start and end POI cannot be the same");
+    return;
+  }
+  addSegment(createSegment(startResult.poi, endResult.poi, {
+    source: "poi-name",
   }));
 }
 
@@ -1777,19 +2227,6 @@ async function saveMap() {
   alert(`Map saved: ${savedName}`);
 }
 
-async function sendPath() {
-  rebuildPathNodes();
-  await callApi("/path/plan", { nodes: pathNodes });
-}
-
-function clearPath() {
-  pathSegments = [];
-  pathNodes = [];
-  pendingFreePoint = null;
-  selectedSegmentId = null;
-  syncTrajectoryPanel();
-}
-
 function canvasToWorld(screenX, screenY) {
   const x = (screenX - canvas.width / 2 - viewState.panX) / viewState.scale;
   const y = (canvas.height / 2 + viewState.panY - screenY) / viewState.scale;
@@ -1820,11 +2257,15 @@ function updateViewMetrics() {
   elements.viewMetrics.innerText = `Pan ${panWorldX}, ${panWorldY} | Zoom ${viewState.scale.toFixed(1)} px/m`;
 }
 
-function handleCanvasClick(clientX, clientY) {
+function clientToWorld(clientX, clientY) {
   const rect = canvas.getBoundingClientRect();
   const scaleX = canvas.width / rect.width;
   const scaleY = canvas.height / rect.height;
-  const [x, y] = canvasToWorld((clientX - rect.left) * scaleX, (clientY - rect.top) * scaleY);
+  return canvasToWorld((clientX - rect.left) * scaleX, (clientY - rect.top) * scaleY);
+}
+
+function handleCanvasClick(clientX, clientY) {
+  const [x, y] = clientToWorld(clientX, clientY);
 
   if (pendingPoiDraft) {
     const manualGeo = readManualGeoInput(false);
@@ -1844,19 +2285,41 @@ function handleCanvasClick(clientX, clientY) {
     poiNodes.push(poi);
     pendingPoiDraft = null;
     elements.poiNameInput.value = "";
-    callApi("/map/poi", {
-      poi: {
-        name: poi.name,
-        x: Number(poi.x),
-        y: Number(poi.y),
-        lat: Number.isFinite(poi.lat) ? Number(poi.lat) : null,
-        lon: Number.isFinite(poi.lon) ? Number(poi.lon) : null,
-      },
-    }).catch((err) => {
-      alert(`POI failed: ${err.message}`);
-    });
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      callApi("/map/poi", {
+        poi: {
+          name: poi.name,
+          x: Number(poi.x),
+          y: Number(poi.y),
+          lat: Number.isFinite(poi.lat) ? Number(poi.lat) : null,
+          lon: Number.isFinite(poi.lon) ? Number(poi.lon) : null,
+        },
+      }).catch((err) => {
+        alert(`POI failed: ${err.message}`);
+      });
+    }
     startNextPoiDraft();
     syncTrajectoryPanel();
+    return;
+  }
+
+  if (editState.tool === "erase") {
+    removeCellsInRadius(x, y, brushRadiusInMeters());
+    setMapEditStatus(`Erased map cells near (${x.toFixed(2)}, ${y.toFixed(2)})`, "active");
+    return;
+  }
+
+  if (editState.tool === "obstacle") {
+    if (!editState.pendingObstacleStart) {
+      editState.pendingObstacleStart = { x, y };
+      updateEditorBadges();
+      setMapEditStatus(`Obstacle start fixed at (${x.toFixed(2)}, ${y.toFixed(2)}). Click end point next.`, "active");
+      return;
+    }
+    rasterizeObstacleLine(editState.pendingObstacleStart, { x, y });
+    setMapEditStatus(`Added obstacle line from (${editState.pendingObstacleStart.x.toFixed(2)}, ${editState.pendingObstacleStart.y.toFixed(2)}) to (${x.toFixed(2)}, ${y.toFixed(2)})`, "active");
+    editState.pendingObstacleStart = null;
+    updateEditorBadges();
     return;
   }
 
@@ -1891,6 +2354,23 @@ function handleCanvasClick(clientX, clientY) {
 
 function bindCanvasInteractions() {
   canvas.addEventListener("pointerdown", (event) => {
+    if (editState.tool === "erase") {
+      canvas.setPointerCapture(event.pointerId);
+      viewState.dragging = false;
+      editState.erasing = true;
+      const [x, y] = clientToWorld(event.clientX, event.clientY);
+      removeCellsInRadius(x, y, brushRadiusInMeters());
+      canvas.classList.remove("dragging");
+      return;
+    }
+
+    if (editState.tool !== "view") {
+      canvas.setPointerCapture(event.pointerId);
+      viewState.dragging = true;
+      viewState.moved = false;
+      return;
+    }
+
     const rect = canvas.getBoundingClientRect();
     canvas.setPointerCapture(event.pointerId);
     viewState.dragging = true;
@@ -1903,6 +2383,14 @@ function bindCanvasInteractions() {
   });
 
   canvas.addEventListener("pointermove", (event) => {
+    if (editState.erasing) {
+      const [x, y] = clientToWorld(event.clientX, event.clientY);
+      removeCellsInRadius(x, y, brushRadiusInMeters());
+      return;
+    }
+    if (editState.tool !== "view") {
+      return;
+    }
     if (!viewState.dragging) {
       return;
     }
@@ -1918,6 +2406,12 @@ function bindCanvasInteractions() {
   });
 
   canvas.addEventListener("pointerup", (event) => {
+    if (editState.erasing) {
+      editState.erasing = false;
+      canvas.releasePointerCapture(event.pointerId);
+      setMapEditStatus("Noise eraser finished", "active");
+      return;
+    }
     if (!viewState.dragging) {
       return;
     }
@@ -1931,6 +2425,9 @@ function bindCanvasInteractions() {
   });
 
   canvas.addEventListener("pointerleave", () => {
+    if (editState.erasing) {
+      editState.erasing = false;
+    }
     if (!viewState.dragging) {
       canvas.classList.remove("dragging");
     }
@@ -2023,6 +2520,25 @@ function drawOccupancy() {
   }
 }
 
+function drawEditorOverlay() {
+  if (editState.tool !== "obstacle" || !editState.pendingObstacleStart) {
+    return;
+  }
+  const [sx, sy] = worldToCanvas(editState.pendingObstacleStart.x, editState.pendingObstacleStart.y);
+  ctx.save();
+  ctx.strokeStyle = "#101214";
+  ctx.fillStyle = "#101214";
+  ctx.lineWidth = 3;
+  ctx.setLineDash([8, 6]);
+  ctx.beginPath();
+  ctx.arc(sx, sy, 9, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(sx, sy, 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
 function drawPathOverlay() {
   if (!drawState.showPath || (!pathSegments.length && !pendingFreePoint)) {
     return;
@@ -2032,8 +2548,9 @@ function drawPathOverlay() {
     if (!samples.length) {
       return;
     }
-    ctx.strokeStyle = segment.id === selectedSegmentId ? "#ff7b54" : "#f3b441";
-    ctx.lineWidth = segment.id === selectedSegmentId ? 4 : 2;
+    const isInvalid = pathValidation.invalidSegmentIds.has(segment.id);
+    ctx.strokeStyle = isInvalid ? "#cc4b37" : segment.id === selectedSegmentId ? "#ff7b54" : "#f3b441";
+    ctx.lineWidth = isInvalid ? 4 : segment.id === selectedSegmentId ? 4 : 2;
     ctx.beginPath();
     samples.forEach((node, index) => {
       const [sx, sy] = worldToCanvas(node.x, node.y);
@@ -2076,8 +2593,11 @@ function drawPoiOverlay() {
       ctx.arc(sx, sy, 9, 0, Math.PI * 2);
       ctx.stroke();
     }
-    ctx.fillStyle = "#ffffff";
-    ctx.font = "12px Segoe UI";
+    ctx.font = "15px Segoe UI";
+    const textWidth = ctx.measureText(poi.name).width;
+    ctx.fillStyle = "rgba(255, 245, 214, 0.92)";
+    ctx.fillRect(sx + 5, sy - 24, textWidth + 12, 20);
+    ctx.fillStyle = "#182833";
     ctx.fillText(poi.name, sx + 8, sy - 8);
   });
 }
@@ -2155,9 +2675,10 @@ function syncDrawControls() {
   elements.poiCard.hidden = !drawState.showPoiCard;
   elements.trajectoryCard.hidden = !drawState.showTrajectoryCard;
   elements.stcmInspectorCard.hidden = !drawState.showStcmInspectorCard;
-  elements.drawModeBadge.innerText = "Line";
+  elements.drawModeBadge.innerText = "Path Line";
   updateTrajectoryStatus();
   syncTrajectoryButtons();
+  updateEditorBadges();
 }
 
 function draw() {
@@ -2165,6 +2686,7 @@ function draw() {
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   drawGrid();
   drawOccupancy();
+  drawEditorOverlay();
   drawPathOverlay();
   drawPoiOverlay();
   drawRobot();
@@ -2178,14 +2700,13 @@ function bindUi() {
   document.getElementById("stopScanBtn").onclick = () => stopScan().catch((err) => alert(err.message));
   document.getElementById("clearAccumBtn").onclick = clearAccumulation;
   document.getElementById("saveMapBtn").onclick = () => saveMap().catch((err) => alert(`Save failed: ${err.message}`));
-  document.getElementById("sendPathBtn").onclick = () => sendPath().catch((err) => alert(`Send path failed: ${err.message}`));
-  document.getElementById("clearPathBtn").onclick = clearPath;
   elements.addPoiBtn.onclick = togglePoiPlacement;
   elements.applyPoiGeoBtn.onclick = applyGeoToSelectedPoi;
   elements.copyPoiBtn.onclick = () => copyPoiData().catch((err) => alert(`Copy failed: ${err.message}`));
   elements.clearPoiBtn.onclick = clearPoi;
   elements.autoConnectBtn.onclick = autoConnectPoiLoop;
-  elements.connectSelectedPoiBtn.onclick = buildSegmentFromSelectedPoi;
+  elements.connectNamedPoiBtn.onclick = connectNamedPoi;
+  elements.validatePathBtn.onclick = () => validatePathClosedLoop(true);
   elements.deleteSegmentBtn.onclick = removeSelectedSegment;
   document.getElementById("centerViewBtn").onclick = centerViewOnRobot;
   document.getElementById("resetViewBtn").onclick = resetView;
@@ -2197,6 +2718,9 @@ function bindUi() {
       elements.stcmManifestPanel.innerText = "-";
     });
   };
+  elements.loadStcmToCanvasBtn.onclick = loadStcmIntoEditor;
+  elements.autoClearNoiseBtn.onclick = autoClearNoise;
+  elements.clearEditorMapBtn.onclick = clearEditorMap;
   elements.downloadPgmBtn.onclick = () => {
     if (!stcmInspector.pgmText || !stcmInspector.file) {
       alert("Inspect a STCM file first");
@@ -2219,18 +2743,36 @@ function bindUi() {
     stcmInspector.pgmText = "";
     stcmInspector.configJsonText = "";
     stcmInspector.summary = null;
+    stcmInspector.loadedFileName = "";
     setInspectorStatus("Idle");
     elements.stcmFileMeta.innerText = file ? `${file.name} | ${(file.size / 1024).toFixed(1)} KB` : "No file selected";
     elements.stcmGridMeta.innerText = "No grid generated";
     elements.stcmSummaryPanel.innerText = "-";
     elements.stcmManifestPanel.innerText = "-";
   });
+  elements.mapEditToolMode.addEventListener("change", () => {
+    resetEditorToolState(elements.mapEditToolMode.value);
+    updateEditorBadges();
+    if (editState.tool === "erase") {
+      setMapEditStatus(`Erase Noise mode active. Brush radius ${brushRadiusInMeters().toFixed(2)} m`, "active");
+    } else if (editState.tool === "obstacle") {
+      setMapEditStatus("Draw Obstacle Line mode active. Click two points on the map.", "active");
+    } else {
+      setMapEditStatus("View / Select mode active. You can pan, zoom, and select POI or path.", "active");
+    }
+  });
+  elements.editBrushRadiusInput.addEventListener("input", () => {
+    if (editState.tool === "erase") {
+      setMapEditStatus(`Erase Noise brush radius ${brushRadiusInMeters().toFixed(2)} m`, "active");
+    }
+  });
 
   elements.trajectoryToolMode.addEventListener("change", () => {
     pendingFreePoint = null;
-    updateTrajectoryStatus();
-    syncTrajectoryButtons();
+    syncTrajectoryPanel();
   });
+  elements.pathStartPoiInput.addEventListener("input", syncTrajectoryPanel);
+  elements.pathEndPoiInput.addEventListener("input", syncTrajectoryPanel);
   elements.poiBatchCreateInput.addEventListener("input", syncTrajectoryButtons);
   elements.poiGeoInput.addEventListener("input", syncTrajectoryPanel);
   elements.showPathToggle.addEventListener("change", syncDrawControls);
@@ -2285,4 +2827,7 @@ resetView();
 updateCameraRefreshStatus();
 updateSavePathHint();
 setInspectorStatus("Idle");
+resetEditorToolState(elements.mapEditToolMode ? elements.mapEditToolMode.value : "view");
+updateEditorBadges();
+setMapEditStatus("View / Select mode active. Load a STCM file to start second-stage map editing.");
 draw();

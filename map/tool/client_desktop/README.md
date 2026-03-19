@@ -1,24 +1,32 @@
-# Windows Desktop Client (主功能端)
+# Desktop Client Rewrite
 
-这是面向 Windows 的主客户端，支持打包为独立 `exe`。
+`client_desktop` now includes rewritten desktop-client source copies in:
 
-## 功能
-- 连接机器人 server（WS + HTTP）
-- 两种画轨迹方式：
-  1) 选择两个 POI 自动连线
-  2) 点击任意两点连线
-- POI 配置经纬度（lat/lon）并下发 server
-- 键盘近场控制（W/A/S/D，Space急停）
+- `app.py.txt`
+- `run_client.py.txt`
 
-## 运行
+This follows the workspace rule for this task: Python changes are provided as full `.txt` copies and do not modify the original `.py` files directly.
 
-```bash
-cd map/tool/client_desktop
-pip install -r requirements.txt
-python run_client.py
-```
+## Coverage
 
-## 打包 EXE（Windows）
-运行 `build_windows.bat`。
+The rewritten desktop client copy includes the main browser-side capabilities:
 
-产物在 `dist/AutoDriveClient.exe`。
+- websocket + HTTP server connection
+- scan accumulation and map canvas rendering
+- local STCM save / load
+- second-stage map editing
+- erase noise
+- draw obstacle line
+- POI add / delete / geo apply
+- Path connect by POI name
+- Path connect by any two points
+- closed-loop validation with invalid path highlight
+- move controls
+- status / camera / communication panels
+
+## How To Use
+
+1. Review `app.py.txt`.
+2. When you are ready to adopt it, replace `app.py` with the contents of `app.py.txt`.
+3. If needed, replace `run_client.py` with `run_client.py.txt`.
+4. Run the desktop client as before.
