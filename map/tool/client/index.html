@@ -64,16 +64,16 @@
             <h2>Panel Visibility</h2>
           </div>
           <div class="action-row">
-            <label class="toggle"><input id="showMotionControlCardToggle" type="checkbox" checked />Motion Control</label>
+            <label class="toggle"><input id="showMotionControlCardToggle" type="checkbox" checked />Move</label>
             <label class="toggle"><input id="showPoiCardToggle" type="checkbox" checked />POI</label>
-            <label class="toggle"><input id="showTrajectoryCardToggle" type="checkbox" checked />Trajectory</label>
-            <label class="toggle"><input id="showStcmInspectorCardToggle" type="checkbox" />STCM Inspector</label>
+            <label class="toggle"><input id="showTrajectoryCardToggle" type="checkbox" checked />Path</label>
+            <label class="toggle"><input id="showStcmInspectorCardToggle" type="checkbox" checked />Map</label>
           </div>
         </section>
 
         <section class="card" id="motionControlCard">
           <div class="section-head">
-            <h2>Motion Control</h2>
+            <h2>Move</h2>
             <div class="kbd-state" id="keyboardState">Keyboard inactive</div>
           </div>
           <div class="field-grid">
@@ -156,48 +156,52 @@
 
         <section class="card" id="trajectoryCard">
           <div class="section-head">
-            <h2>Trajectory</h2>
+            <h2>Path</h2>
             <div class="view-chip" id="drawModeBadge">Line</div>
           </div>
           <div class="hint">
-            Trajectory only draws line paths. It supports auto loop, POI-to-POI connect, free-point connect, delete, send, and clear.
+            Path supports auto loop, POI-name connect, any-point connect, delete, and closed-loop validation.
           </div>
           <div class="field-grid">
             <label class="field">
-              <span>Trajectory Tool</span>
+              <span>Path Tool</span>
               <select id="trajectoryToolMode">
+                <option value="poi" selected>Connect By POI Name</option>
                 <option value="free">Connect Any Two Points</option>
-                <option value="poi" selected>Connect Two POIs</option>
               </select>
+            </label>
+            <label class="field">
+              <span>Start POI Name</span>
+              <input id="pathStartPoiInput" placeholder="a" />
+            </label>
+            <label class="field">
+              <span>End POI Name</span>
+              <input id="pathEndPoiInput" placeholder="b" />
             </label>
           </div>
           <div class="hint" id="trajectoryStatus">No segments yet</div>
           <div class="action-row">
-            <label class="toggle"><input id="showPathToggle" type="checkbox" checked />Show Trajectory</label>
+            <label class="toggle"><input id="showPathToggle" type="checkbox" checked />Show Path</label>
           </div>
           <div class="action-row">
             <button id="autoConnectBtn" class="primary">Auto Loop</button>
-            <button id="connectSelectedPoiBtn">Connect Selected POI</button>
+            <button id="connectNamedPoiBtn">Connect Named POI</button>
+            <button id="validatePathBtn">Closed-Loop Check</button>
             <button id="deleteSegmentBtn" class="danger">Delete Segment</button>
           </div>
-          <div class="action-row">
-            <button id="sendPathBtn">Send Path</button>
-            <button id="clearPathBtn">Clear Path</button>
-          </div>
           <div>
-            <div class="list-title">Segment List</div>
+            <div class="list-title">Path Segment List</div>
             <ul id="pathList" class="data-list"></ul>
           </div>
         </section>
 
         <section class="card" id="stcmInspectorCard" hidden>
           <div class="section-head">
-            <h2>STCM Inspector</h2>
+            <h2>Map</h2>
             <div class="view-chip" id="stcmInspectorStatus">Idle</div>
           </div>
           <div class="hint">
-            Load a local <code>.stcm</code> file to inspect <code>manifest.json</code>, convert radar points to a preview
-            <code>.pgm</code>, and export a matching config <code>.json</code>.
+            Load a local <code>.stcm</code> file into the main map canvas for second-stage editing. After loading, you can keep editing POI, path, remove unwanted noise, and draw black obstacle lines directly on the map.
           </div>
           <div class="field-grid">
             <label class="field">
@@ -215,12 +219,34 @@
           </div>
           <div class="action-row">
             <button id="inspectStcmBtn">Inspect STCM</button>
+            <button id="loadStcmToCanvasBtn" class="primary">Load To Main View</button>
             <button id="downloadPgmBtn">Download PGM</button>
             <button id="downloadStcmJsonBtn">Download JSON</button>
           </div>
           <div class="camera-meta">
             <span id="stcmFileMeta">No file selected</span>
             <span id="stcmGridMeta">No grid generated</span>
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>Edit Tool</span>
+              <select id="mapEditToolMode">
+                <option value="view" selected>View / Select</option>
+                <option value="erase">Erase Noise</option>
+                <option value="obstacle">Draw Obstacle Line</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Brush Radius (m)</span>
+              <input id="editBrushRadiusInput" type="number" min="0.05" max="3" step="0.05" value="0.25" />
+            </label>
+          </div>
+          <div class="action-row">
+            <button id="autoClearNoiseBtn">Auto Clear Noise</button>
+            <button id="clearEditorMapBtn" class="danger">Clear Loaded Map</button>
+          </div>
+          <div class="hint" id="mapEditStatus">
+            Tool ready. Use View / Select to pan and choose path or POI. Use Erase Noise to drag-clear cells. Use Draw Obstacle Line to click two points and add a black wall.
           </div>
           <pre id="stcmSummaryPanel">-</pre>
           <pre id="stcmManifestPanel">-</pre>
@@ -245,9 +271,14 @@
             </div>
             <div class="view-metrics" id="viewMetrics">Pan 0,0 | Zoom 25 px/m</div>
           </div>
+          <div class="editor-toolbar">
+            <div class="view-chip" id="mapLoadedBadge">Scan Session</div>
+            <div class="view-chip" id="editorToolBadge">Tool: View / Select</div>
+            <div class="view-chip" id="editorStatsBadge">0 obstacle cells</div>
+          </div>
           <canvas id="lidarCanvas" width="1040" height="720"></canvas>
           <div class="hint">
-            Drag canvas to pan. Use mouse wheel to zoom. Occupancy view: black = obstacle, white = safe, gray = unknown.
+            View / Select mode supports pan and selection. Erase Noise mode clears unwanted points by click or drag. Draw Obstacle Line mode adds black obstacles with two clicks.
           </div>
         </div>
       </section>
