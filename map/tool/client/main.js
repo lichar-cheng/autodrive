@@ -68,7 +68,8 @@ const stcmInspector = {
   bundle: null,
   points: [],
   pgmText: "",
-  configJsonText: "",
+  yamlText: "",
+  exportJsonText: "",
   summary: null,
   loadedFileName: "",
 };
@@ -140,8 +141,14 @@ const elements = {
   poiGeoInput: document.getElementById("poiGeoInput"),
   poiBatchCreateInput: document.getElementById("poiBatchCreateInput"),
   trajectoryToolMode: document.getElementById("trajectoryToolMode"),
+  pathSafetyMarginInput: document.getElementById("pathSafetyMarginInput"),
+  pathStartPoiField: document.getElementById("pathStartPoiField"),
+  pathEndPoiField: document.getElementById("pathEndPoiField"),
+  pathApplyField: document.getElementById("pathApplyField"),
   pathStartPoiInput: document.getElementById("pathStartPoiInput"),
   pathEndPoiInput: document.getElementById("pathEndPoiInput"),
+  freeConnectHint: document.getElementById("freeConnectHint"),
+  clearSelectionBtn: document.getElementById("clearSelectionBtn"),
   showPathToggle: document.getElementById("showPathToggle"),
   showPoiToggle: document.getElementById("showPoiToggle"),
   showRobotToggle: document.getElementById("showRobotToggle"),
@@ -176,6 +183,7 @@ const elements = {
   inspectStcmBtn: document.getElementById("inspectStcmBtn"),
   loadStcmToCanvasBtn: document.getElementById("loadStcmToCanvasBtn"),
   downloadPgmBtn: document.getElementById("downloadPgmBtn"),
+  downloadYamlBtn: document.getElementById("downloadYamlBtn"),
   downloadStcmJsonBtn: document.getElementById("downloadStcmJsonBtn"),
   mapEditToolMode: document.getElementById("mapEditToolMode"),
   editBrushRadiusInput: document.getElementById("editBrushRadiusInput"),
@@ -408,7 +416,7 @@ function parseZipEntries(arrayBuffer) {
     }
   }
   if (eocdOffset < 0) {
-    throw new Error("Invalid STCM/ZIP file: EOCD not found");
+    throw new Error("Invalid SLAM/ZIP file: EOCD not found");
   }
 
   const centralDirectorySize = view.getUint32(eocdOffset + 12, true);
@@ -466,39 +474,56 @@ function parseRadarPoints(bytes) {
   return points;
 }
 
-function buildPgmFromPoints(points, resolution, paddingCells) {
-  if (!points.length) {
-    throw new Error("No radar points in STCM");
-  }
+function buildPgmFromData(manifest, points, resolution, paddingCells) {
+  const browserOccupancy = manifest.browser_occupancy;
+  const occupancyVoxel = Math.max(0.02, Number(browserOccupancy?.voxel_size || resolution));
+  const occupiedCells = Array.isArray(browserOccupancy?.occupied_cells) ? browserOccupancy.occupied_cells : null;
 
-  let minX = points[0][0];
-  let maxX = points[0][0];
-  let minY = points[0][1];
-  let maxY = points[0][1];
-
-  points.forEach(([x, y]) => {
-    minX = Math.min(minX, x);
-    maxX = Math.max(maxX, x);
-    minY = Math.min(minY, y);
-    maxY = Math.max(maxY, y);
-  });
-
-  const paddedMinX = minX - paddingCells * resolution;
-  const paddedMinY = minY - paddingCells * resolution;
-  const paddedMaxX = maxX + paddingCells * resolution;
-  const paddedMaxY = maxY + paddingCells * resolution;
-  const width = Math.max(1, Math.ceil((paddedMaxX - paddedMinX) / resolution) + 1);
-  const height = Math.max(1, Math.ceil((paddedMaxY - paddedMinY) / resolution) + 1);
-  const grid = new Uint8Array(width * height).fill(205);
+  let minCellX = Number.POSITIVE_INFINITY;
+  let maxCellX = Number.NEGATIVE_INFINITY;
+  let minCellY = Number.POSITIVE_INFINITY;
+  let maxCellY = Number.NEGATIVE_INFINITY;
   const occupiedSet = new Set();
 
-  points.forEach(([x, y]) => {
-    const ix = Math.min(width - 1, Math.max(0, Math.round((x - paddedMinX) / resolution)));
-    const iy = Math.min(height - 1, Math.max(0, Math.round((y - paddedMinY) / resolution)));
+  if (occupiedCells && occupiedCells.length) {
+    occupiedCells.forEach((cell) => {
+      const ix = Math.round(Number(cell.ix || 0));
+      const iy = Math.round(Number(cell.iy || 0));
+      minCellX = Math.min(minCellX, ix);
+      maxCellX = Math.max(maxCellX, ix);
+      minCellY = Math.min(minCellY, iy);
+      maxCellY = Math.max(maxCellY, iy);
+      occupiedSet.add(`${ix}:${iy}`);
+    });
+  } else {
+    if (!points.length) {
+      throw new Error("No radar points in SLAM");
+    }
+    points.forEach(([x, y]) => {
+      const ix = Math.round(Number(x) / resolution);
+      const iy = Math.round(Number(y) / resolution);
+      minCellX = Math.min(minCellX, ix);
+      maxCellX = Math.max(maxCellX, ix);
+      minCellY = Math.min(minCellY, iy);
+      maxCellY = Math.max(maxCellY, iy);
+      occupiedSet.add(`${ix}:${iy}`);
+    });
+  }
+
+  const paddedMinCellX = minCellX - paddingCells;
+  const paddedMinCellY = minCellY - paddingCells;
+  const paddedMaxCellX = maxCellX + paddingCells;
+  const paddedMaxCellY = maxCellY + paddingCells;
+  const width = Math.max(1, paddedMaxCellX - paddedMinCellX + 1);
+  const height = Math.max(1, paddedMaxCellY - paddedMinCellY + 1);
+  const grid = new Uint8Array(width * height).fill(205);
+
+  occupiedSet.forEach((key) => {
+    const [cellXText, cellYText] = key.split(":");
+    const ix = Number(cellXText) - paddedMinCellX;
+    const iy = Number(cellYText) - paddedMinCellY;
     const flippedY = height - 1 - iy;
-    const idx = flippedY * width + ix;
-    grid[idx] = 0;
-    occupiedSet.add(`${ix}:${iy}`);
+    grid[flippedY * width + ix] = 0;
   });
 
   const rows = [];
@@ -511,45 +536,68 @@ function buildPgmFromPoints(points, resolution, paddingCells) {
     rows.push(values.join(" "));
   }
 
-  const pgmText = `P2\n# Generated from STCM radar_points\n${width} ${height}\n255\n${rows.join("\n")}\n`;
+  const origin = [
+    Number((paddedMinCellX * occupancyVoxel).toFixed(3)),
+    Number((paddedMinCellY * occupancyVoxel).toFixed(3)),
+    0,
+  ];
   return {
-    pgmText,
+    pgmText: `P2\n# Generated from SLAM occupancy\n${width} ${height}\n255\n${rows.join("\n")}\n`,
     width,
     height,
-    origin: [Number(paddedMinX.toFixed(4)), Number(paddedMinY.toFixed(4)), 0],
-    bounds: {
-      minX: Number(minX.toFixed(4)),
-      maxX: Number(maxX.toFixed(4)),
-      minY: Number(minY.toFixed(4)),
-      maxY: Number(maxY.toFixed(4)),
-    },
+    origin,
     occupiedCells: occupiedSet.size,
+    bounds: {
+      minX: Number((minCellX * occupancyVoxel).toFixed(3)),
+      maxX: Number((maxCellX * occupancyVoxel).toFixed(3)),
+      minY: Number((minCellY * occupancyVoxel).toFixed(3)),
+      maxY: Number((maxCellY * occupancyVoxel).toFixed(3)),
+    },
   };
 }
 
-function buildStcmConfig(fileName, manifest, points, resolution, paddingCells) {
-  const pgm = buildPgmFromPoints(points, resolution, paddingCells);
-  const config = {
-    image: fileName.replace(/\.stcm$/i, ".pgm"),
-    resolution,
-    origin: pgm.origin,
-    negate: 0,
-    occupied_thresh: 0.65,
-    free_thresh: 0.196,
-    mode: "trinary",
-    stcm_meta: {
-      source_file: fileName,
-      version: manifest.version || "unknown",
-      map_source: manifest.map_source || "unknown",
-      created_at: manifest.created_at || null,
-      radar_points: points.length,
-      occupied_cells: pgm.occupiedCells,
+function buildYamlText(fileName, resolution, origin) {
+  return [
+    `image: ${fileName.replace(/\.slam$/i, ".pgm")}`,
+    "mode: trinary",
+    `resolution: ${resolution.toFixed(3)}`,
+    `origin: [${origin[0].toFixed(3)}, ${origin[1].toFixed(3)}, ${Number(origin[2] || 0).toFixed(0)}]`,
+    "negate: 0",
+    "occupied_thresh: 0.65",
+    "free_thresh: 0.196",
+  ].join("\n");
+}
+
+function buildStcmExports(fileName, manifest, points, resolution, paddingCells) {
+  const pgm = buildPgmFromData(manifest, points, resolution, paddingCells);
+  const yamlText = buildYamlText(fileName, resolution, pgm.origin);
+  const exportManifest = { ...manifest };
+  delete exportManifest.browser_occupancy;
+  delete exportManifest.trajectory;
+  const exportJson = {
+    source_file: fileName,
+    map_yaml: {
+      image: fileName.replace(/\.slam$/i, ".pgm"),
+      mode: "trinary",
+      resolution,
+      origin: pgm.origin,
+      negate: 0,
+      occupied_thresh: 0.65,
+      free_thresh: 0.196,
+    },
+    pgm_meta: {
       width: pgm.width,
       height: pgm.height,
+      occupied_cells: pgm.occupiedCells,
       bounds: pgm.bounds,
     },
+    manifest: exportManifest,
   };
-  return { pgm, configJsonText: JSON.stringify(config, null, 2) };
+  return {
+    pgm,
+    yamlText,
+    exportJsonText: JSON.stringify(exportJson, null, 2),
+  };
 }
 
 function downloadFile(fileName, content, mimeType) {
@@ -567,37 +615,19 @@ function updateSavePathHint(pathText = "") {
   elements.savePathHint.innerText = `Local export: ${localPath}. Browser should open a save dialog so you can choose the destination folder and filename.`;
 }
 
-async function inspectSelectedStcm() {
-  const file = elements.stcmFileInput.files && elements.stcmFileInput.files[0];
-  if (!file) {
-    throw new Error("Please choose a .stcm file first");
-  }
-
-  setInspectorStatus("Parsing", "active");
-  elements.stcmFileMeta.innerText = `${file.name} | ${(file.size / 1024).toFixed(1)} KB`;
-  const arrayBuffer = await file.arrayBuffer();
-  const entries = parseZipEntries(arrayBuffer);
-  const manifestEntry = entries.get("manifest.json");
-  const radarEntry = entries.get("radar_points.bin");
-  if (!manifestEntry || !radarEntry) {
-    throw new Error("STCM must contain manifest.json and radar_points.bin");
-  }
-
-  const manifestBytes = await decompressZipEntry(manifestEntry);
-  const radarBytes = await decompressZipEntry(radarEntry);
-  const manifest = JSON.parse(new TextDecoder().decode(manifestBytes));
-  const points = parseRadarPoints(radarBytes);
+function setInspectorBundleState(fileName, manifest, points, summary = {}) {
   const resolution = Math.max(0.02, numberFromInput(elements.stcmResolutionInput, 0.1));
   const paddingCells = Math.max(0, Math.round(numberFromInput(elements.stcmPaddingInput, 8)));
-  const { pgm, configJsonText } = buildStcmConfig(file.name, manifest, points, resolution, paddingCells);
+  const { pgm, yamlText, exportJsonText } = buildStcmExports(fileName, manifest, points, resolution, paddingCells);
 
-  stcmInspector.file = file;
+  stcmInspector.file = { name: fileName };
   stcmInspector.bundle = manifest;
   stcmInspector.points = points;
   stcmInspector.pgmText = pgm.pgmText;
-  stcmInspector.configJsonText = configJsonText;
+  stcmInspector.yamlText = yamlText;
+  stcmInspector.exportJsonText = exportJsonText;
   stcmInspector.summary = {
-    file: file.name,
+    file: fileName,
     manifestVersion: manifest.version || "unknown",
     mapSource: manifest.map_source || "unknown",
     radarPoints: points.length,
@@ -613,12 +643,36 @@ async function inspectSelectedStcm() {
     occupiedCells: pgm.occupiedCells,
     origin: pgm.origin,
     bounds: pgm.bounds,
+    ...summary,
   };
-
+  elements.stcmFileMeta.innerText = fileName;
   elements.stcmGridMeta.innerText = `${pgm.width} x ${pgm.height} | ${pgm.occupiedCells} occupied | res ${resolution.toFixed(2)} m/px`;
   elements.stcmSummaryPanel.innerText = JSON.stringify(stcmInspector.summary, null, 2);
   elements.stcmManifestPanel.innerText = JSON.stringify(manifest, null, 2);
   setInspectorStatus("Ready", "active");
+}
+
+async function inspectSelectedStcm() {
+  const file = elements.stcmFileInput.files && elements.stcmFileInput.files[0];
+  if (!file) {
+    throw new Error("Please choose a .slam file first");
+  }
+
+  setInspectorStatus("Parsing", "active");
+  elements.stcmFileMeta.innerText = `${file.name} | ${(file.size / 1024).toFixed(1)} KB`;
+  const arrayBuffer = await file.arrayBuffer();
+  const entries = parseZipEntries(arrayBuffer);
+  const manifestEntry = entries.get("manifest.json");
+  const radarEntry = entries.get("radar_points.bin");
+  if (!manifestEntry || !radarEntry) {
+    throw new Error("SLAM must contain manifest.json and radar_points.bin");
+  }
+
+  const manifestBytes = await decompressZipEntry(manifestEntry);
+  const radarBytes = await decompressZipEntry(radarEntry);
+  const manifest = JSON.parse(new TextDecoder().decode(manifestBytes));
+  const points = parseRadarPoints(radarBytes);
+  setInspectorBundleState(file.name, manifest, points);
 }
 
 function resetEditorToolState(nextTool = editState.tool) {
@@ -638,7 +692,7 @@ function setMapEditStatus(text, level = "") {
 
 function updateEditorBadges() {
   const sourceLabel = editState.loadedFromStcm
-    ? `Loaded: ${editState.loadedMapName || stcmInspector.loadedFileName || "STCM map"}`
+    ? `Loaded: ${editState.loadedMapName || stcmInspector.loadedFileName || "SLAM map"}`
     : "Scan Session";
   elements.mapLoadedBadge.innerText = sourceLabel;
 
@@ -676,13 +730,10 @@ function removeCellsInRadius(worldX, worldY, radiusMeters) {
 function rasterizeObstacleLine(startPoint, endPoint) {
   const [startIx, startIy] = worldToCell(startPoint.x, startPoint.y);
   const [endIx, endIy] = worldToCell(endPoint.x, endPoint.y);
-  const steps = Math.max(Math.abs(endIx - startIx), Math.abs(endIy - startIy), 1);
-  for (let step = 0; step <= steps; step += 1) {
-    const t = step / steps;
-    const ix = Math.round(startIx + (endIx - startIx) * t);
-    const iy = Math.round(startIy + (endIy - startIy) * t);
+  const cells = rasterizeLineCells(startIx, startIy, endIx, endIy);
+  cells.forEach(({ ix, iy }) => {
     setOccupiedCell(ix, iy);
-  }
+  });
   renderScanState();
   updateEditorBadges();
 }
@@ -716,30 +767,33 @@ function autoClearNoise() {
 
 function rebuildSegmentsFromBundle(manifest) {
   segmentIdSeed = 1;
-  if (Array.isArray(manifest.trajectory) && manifest.trajectory.length) {
-    pathSegments = manifest.trajectory.map((segment) => ({
-      id: segment.id || `seg-${segmentIdSeed++}`,
-      start: makeLocalPoint(segment.start?.x || 0, segment.start?.y || 0, segment.start || {}),
-      end: makeLocalPoint(segment.end?.x || 0, segment.end?.y || 0, segment.end || {}),
-      geometry: segment.geometry || "line",
-      curveOffset: Number(segment.curveOffset || 0),
-      source: segment.source || "stcm",
-    }));
-    segmentIdSeed = pathSegments.length + 1;
-    return;
-  }
-
-  const nodes = Array.isArray(manifest.path) ? manifest.path : [];
   pathSegments = [];
-  for (let i = 0; i < nodes.length - 1; i += 1) {
-    pathSegments.push(createSegment(nodes[i], nodes[i + 1], { source: "stcm" }));
+  const paths = Array.isArray(manifest.path) ? manifest.path : [];
+  paths.forEach((item) => {
+    const points = Array.isArray(item.points) ? item.points : [];
+    const start = item.start || points[0];
+    const end = item.end || points[points.length - 1];
+    if (!start || !end) {
+      return;
+    }
+    pathSegments.push(createSegment(start, end, {
+      source: item.source || "slam",
+      clearance: Number(item.clearance || 0),
+      points: points.length ? points : [start, end],
+    }));
+  });
+  if (!pathSegments.length) {
+    const nodes = Array.isArray(manifest.path) ? manifest.path : [];
+    for (let i = 0; i < nodes.length - 1; i += 1) {
+      pathSegments.push(createSegment(nodes[i], nodes[i + 1], { source: "slam" }));
+    }
   }
   segmentIdSeed = pathSegments.length + 1;
 }
 
 function loadStcmIntoEditor() {
   if (!stcmInspector.bundle || !Array.isArray(stcmInspector.points)) {
-    alert("Inspect a STCM file first");
+    alert("Inspect a SLAM file first");
     return;
   }
 
@@ -790,13 +844,13 @@ function loadStcmIntoEditor() {
   selectedSegmentId = null;
 
   editState.loadedFromStcm = true;
-  editState.loadedMapName = stcmInspector.file ? stcmInspector.file.name : "stcm";
+  editState.loadedMapName = stcmInspector.file ? stcmInspector.file.name : "slam";
   stcmInspector.loadedFileName = editState.loadedMapName;
   if (elements.mapEditToolMode) {
     elements.mapEditToolMode.value = "view";
   }
   resetEditorToolState("view");
-  elements.mapNameInput.value = editState.loadedMapName.replace(/\.stcm$/i, "") || elements.mapNameInput.value;
+  elements.mapNameInput.value = editState.loadedMapName.replace(/\.slam$/i, "") || elements.mapNameInput.value;
   if (typeof stcmInspector.bundle.notes === "string" && stcmInspector.bundle.notes.trim()) {
     elements.mapNotesInput.value = stcmInspector.bundle.notes;
   }
@@ -1007,14 +1061,13 @@ function buildClientStcmBundle() {
     gps: lastGps,
     chassis: lastChassis,
     poi: poiNodes.map((poi) => sanitizePoiPayload(poi)),
-    path: pathNodes,
-    trajectory: pathSegments.map((segment) => ({
+    path: pathSegments.map((segment) => ({
       id: segment.id,
       source: segment.source,
-      geometry: segment.geometry,
-      curveOffset: Number(segment.curveOffset || 0),
+      clearance: Number(segment.clearance || 0),
       start: sanitizePathNode(segment.start),
       end: sanitizePathNode(segment.end),
+      points: sampleSegment(segment),
     })),
     gps_track: [],
     chassis_track: [],
@@ -1038,8 +1091,8 @@ async function saveBlobWithPicker(fileName, blob) {
       suggestedName: fileName,
       types: [
         {
-          description: "STCM map",
-          accept: { "application/octet-stream": [".stcm"] },
+          description: "SLAM map",
+          accept: { "application/octet-stream": [".slam"] },
         },
       ],
     });
@@ -1470,7 +1523,6 @@ function accumulatePoints(points, meta = {}) {
 
 function occupiedPointsForSave() {
   return Array.from(scanSession.occupiedCells.values())
-    .filter((cell) => cell.hits >= scanMergeConfig.saveMinHits)
     .map((cell) => [
       cell.ix * scanSession.voxelSize,
       cell.iy * scanSession.voxelSize,
@@ -1529,6 +1581,8 @@ function sanitizePathNode(node) {
     y: Number(node.y),
     lat: Number.isFinite(node.lat) ? Number(node.lat) : null,
     lon: Number.isFinite(node.lon) ? Number(node.lon) : null,
+    poiId: node.poiId || null,
+    name: node.name || "",
   };
 }
 
@@ -1547,7 +1601,235 @@ function distanceBetween(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
+function polylineLength(points) {
+  let total = 0;
+  for (let i = 0; i < points.length - 1; i += 1) {
+    total += distanceBetween(points[i], points[i + 1]);
+  }
+  return total;
+}
+
+function readPathSafetyMargin() {
+  return Math.max(0, numberFromInput(elements.pathSafetyMarginInput, 0.3));
+}
+
+function simplifyCellPath(path) {
+  if (path.length <= 2) {
+    return path;
+  }
+  const simplified = [path[0]];
+  let prevDx = path[1].ix - path[0].ix;
+  let prevDy = path[1].iy - path[0].iy;
+  for (let i = 1; i < path.length - 1; i += 1) {
+    const dx = path[i + 1].ix - path[i].ix;
+    const dy = path[i + 1].iy - path[i].iy;
+    if (dx !== prevDx || dy !== prevDy) {
+      simplified.push(path[i]);
+      prevDx = dx;
+      prevDy = dy;
+    }
+  }
+  simplified.push(path[path.length - 1]);
+  return simplified;
+}
+
+function isCellBlocked(ix, iy, clearanceCells = 0, allowStartKey = "", allowEndKey = "") {
+  for (let dx = -clearanceCells; dx <= clearanceCells; dx += 1) {
+    for (let dy = -clearanceCells; dy <= clearanceCells; dy += 1) {
+      if (Math.hypot(dx, dy) > clearanceCells + 1e-6) {
+        continue;
+      }
+      const key = cellKey(ix + dx, iy + dy);
+      if (key === allowStartKey || key === allowEndKey) {
+        continue;
+      }
+      if (scanSession.occupiedCells.has(key)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function planPathCells(start, end, clearanceMeters) {
+  const [startIx, startIy] = worldToCell(start.x, start.y);
+  const [endIx, endIy] = worldToCell(end.x, end.y);
+  const startKey = cellKey(startIx, startIy);
+  const endKey = cellKey(endIx, endIy);
+  const clearanceCells = Math.max(0, Math.ceil(clearanceMeters / scanSession.voxelSize));
+  const occupiedCells = Array.from(scanSession.occupiedCells.values());
+  const occupiedMinX = occupiedCells.length ? Math.min(...occupiedCells.map((cell) => cell.ix)) : Math.min(startIx, endIx);
+  const occupiedMaxX = occupiedCells.length ? Math.max(...occupiedCells.map((cell) => cell.ix)) : Math.max(startIx, endIx);
+  const occupiedMinY = occupiedCells.length ? Math.min(...occupiedCells.map((cell) => cell.iy)) : Math.min(startIy, endIy);
+  const occupiedMaxY = occupiedCells.length ? Math.max(...occupiedCells.map((cell) => cell.iy)) : Math.max(startIy, endIy);
+
+  if (!isCellBlocked(startIx, startIy, clearanceCells, startKey, endKey)
+    && !isCellBlocked(endIx, endIy, clearanceCells, startKey, endKey)) {
+    const linePath = rasterizeLineCells(startIx, startIy, endIx, endIy);
+    const lineBlocked = linePath.some((cell) => isCellBlocked(cell.ix, cell.iy, clearanceCells, startKey, endKey));
+    if (!lineBlocked) {
+      return simplifyCellPath(linePath);
+    }
+  }
+
+  const minX = Math.min(startIx, endIx, occupiedMinX) - clearanceCells - 20;
+  const maxX = Math.max(startIx, endIx, occupiedMaxX) + clearanceCells + 20;
+  const minY = Math.min(startIy, endIy, occupiedMinY) - clearanceCells - 20;
+  const maxY = Math.max(startIy, endIy, occupiedMaxY) + clearanceCells + 20;
+  const open = [{ ix: startIx, iy: startIy, key: startKey, g: 0, f: Math.hypot(endIx - startIx, endIy - startIy) }];
+  const best = new Map([[startKey, open[0]]]);
+  const cameFrom = new Map();
+  const closed = new Set();
+  const neighbors = [
+    { dx: 1, dy: 0, cost: 1 },
+    { dx: -1, dy: 0, cost: 1 },
+    { dx: 0, dy: 1, cost: 1 },
+    { dx: 0, dy: -1, cost: 1 },
+    { dx: 1, dy: 1, cost: Math.SQRT2 },
+    { dx: 1, dy: -1, cost: Math.SQRT2 },
+    { dx: -1, dy: 1, cost: Math.SQRT2 },
+    { dx: -1, dy: -1, cost: Math.SQRT2 },
+  ];
+
+  while (open.length) {
+    open.sort((a, b) => a.f - b.f);
+    const current = open.shift();
+    if (!current || closed.has(current.key)) {
+      continue;
+    }
+    if (current.key === endKey) {
+      const path = [{ ix: endIx, iy: endIy }];
+      let cursor = endKey;
+      while (cameFrom.has(cursor)) {
+        cursor = cameFrom.get(cursor);
+        const [ixText, iyText] = cursor.split(":");
+        path.push({ ix: Number(ixText), iy: Number(iyText) });
+      }
+      path.reverse();
+      return simplifyCellPath(path);
+    }
+    closed.add(current.key);
+
+    neighbors.forEach((step) => {
+      const nextIx = current.ix + step.dx;
+      const nextIy = current.iy + step.dy;
+      if (nextIx < minX || nextIx > maxX || nextIy < minY || nextIy > maxY) {
+        return;
+      }
+      const nextKey = cellKey(nextIx, nextIy);
+      if (closed.has(nextKey)) {
+        return;
+      }
+      if (isCellBlocked(nextIx, nextIy, clearanceCells, startKey, endKey)) {
+        return;
+      }
+      if (step.dx !== 0 && step.dy !== 0) {
+        if (isCellBlocked(current.ix + step.dx, current.iy, clearanceCells, startKey, endKey)
+          || isCellBlocked(current.ix, current.iy + step.dy, clearanceCells, startKey, endKey)) {
+          return;
+        }
+      }
+      const g = current.g + step.cost;
+      const prev = best.get(nextKey);
+      if (prev && g >= prev.g) {
+        return;
+      }
+      const node = {
+        ix: nextIx,
+        iy: nextIy,
+        key: nextKey,
+        g,
+        f: g + Math.hypot(endIx - nextIx, endIy - nextIy),
+      };
+      cameFrom.set(nextKey, current.key);
+      best.set(nextKey, node);
+      open.push(node);
+    });
+  }
+  return null;
+}
+
+function cellPathToWorldPoints(pathCells, start, end) {
+  if (!pathCells || !pathCells.length) {
+    return [makeLocalPoint(start.x, start.y, start), makeLocalPoint(end.x, end.y, end)];
+  }
+  return pathCells.map((cell, index) => {
+    if (index === 0) {
+      return makeLocalPoint(start.x, start.y, start);
+    }
+    if (index === pathCells.length - 1) {
+      return makeLocalPoint(end.x, end.y, end);
+    }
+    return makeLocalPoint(cell.ix * scanSession.voxelSize, cell.iy * scanSession.voxelSize);
+  });
+}
+
+function rasterizeLineCells(startIx, startIy, endIx, endIy) {
+  const points = [];
+  const pushCell = (ix, iy) => {
+    const prev = points[points.length - 1];
+    if (!prev || prev.ix !== ix || prev.iy !== iy) {
+      points.push({ ix, iy });
+    }
+  };
+
+  let x = startIx;
+  let y = startIy;
+  const dx = endIx - startIx;
+  const dy = endIy - startIy;
+  const nx = Math.abs(dx);
+  const ny = Math.abs(dy);
+  const signX = Math.sign(dx);
+  const signY = Math.sign(dy);
+  let ix = 0;
+  let iy = 0;
+
+  pushCell(x, y);
+  while (ix < nx || iy < ny) {
+    const nextHorizontal = (0.5 + ix) / Math.max(nx, 1);
+    const nextVertical = (0.5 + iy) / Math.max(ny, 1);
+    if (nextHorizontal < nextVertical) {
+      x += signX;
+      ix += 1;
+    } else if (nextVertical < nextHorizontal) {
+      y += signY;
+      iy += 1;
+    } else {
+      x += signX;
+      y += signY;
+      ix += 1;
+      iy += 1;
+    }
+    pushCell(x, y);
+  }
+  return points;
+}
+
+function buildPlannedSegment(start, end, options = {}) {
+  const clearance = options.clearance ?? readPathSafetyMargin();
+  const cellPath = planPathCells(start, end, clearance);
+  if (!cellPath) {
+    throw new Error(`No obstacle-free path found from ${describePoint(start)} to ${describePoint(end)} with clearance ${clearance.toFixed(2)} m`);
+  }
+  return createSegment(start, end, {
+    ...options,
+    points: cellPathToWorldPoints(cellPath, start, end),
+    clearance,
+  });
+}
+
 function createSegment(start, end, options = {}) {
+  const points = Array.isArray(options.points) && options.points.length
+    ? options.points.map((point, index) => {
+      if (index === 0) {
+        return makeLocalPoint(start.x, start.y, { ...start, ...point });
+      }
+      if (index === options.points.length - 1) {
+        return makeLocalPoint(end.x, end.y, { ...end, ...point });
+      }
+      return makeLocalPoint(point.x, point.y, point);
+    })
+    : [makeLocalPoint(start.x, start.y, start), makeLocalPoint(end.x, end.y, end)];
   return {
     id: `seg-${segmentIdSeed++}`,
     start: makeLocalPoint(start.x, start.y, start),
@@ -1555,6 +1837,8 @@ function createSegment(start, end, options = {}) {
     geometry: "line",
     curveOffset: 0,
     source: options.source || "free",
+    clearance: Number(options.clearance || 0),
+    points,
   };
 }
 
@@ -1562,11 +1846,24 @@ function sampleSegment(segment) {
   if (!segment) {
     return [];
   }
-  return [sanitizePathNode(segment.start), sanitizePathNode(segment.end)];
+  const points = Array.isArray(segment.points) && segment.points.length
+    ? segment.points
+    : [segment.start, segment.end];
+  return points.map((point) => sanitizePathNode(point));
 }
 
 function rebuildPathNodes() {
-  pathNodes = pathSegments.flatMap((segment) => sampleSegment(segment));
+  pathNodes = [];
+  pathSegments.forEach((segment) => {
+    const samples = sampleSegment(segment);
+    samples.forEach((point, index) => {
+      const prev = pathNodes[pathNodes.length - 1];
+      if (index > 0 && prev && pathNodeKey(prev) === pathNodeKey(point)) {
+        return;
+      }
+      pathNodes.push(point);
+    });
+  });
 }
 
 function describePoint(point) {
@@ -1666,6 +1963,22 @@ function startNextPoiDraft() {
   return true;
 }
 
+function clearPendingPoiPlacement() {
+  pendingPoiDraft = null;
+  pendingPoiQueue = [];
+}
+
+function startManualPoiDraft(name, geo) {
+  clearPendingPoiPlacement();
+  pendingPoiDraft = {
+    name,
+    lat: geo.lat,
+    lon: geo.lon,
+    yaw: null,
+  };
+  syncTrajectoryPanel();
+}
+
 function buildPoiCopyText() {
   return poiNodes.map((poi) => [
     poi.name,
@@ -1686,6 +1999,48 @@ function resetPathValidation() {
 
 function pathNodeKey(point) {
   return `${Number(point.x).toFixed(3)},${Number(point.y).toFixed(3)}`;
+}
+
+function pathValidationTolerance() {
+  return Math.max(0.15, scanSession.voxelSize * 1.5);
+}
+
+function describeValidationPoint(point) {
+  if (point.name) {
+    return `${point.name} ${describePoint(point)}`;
+  }
+  return describePoint(point);
+}
+
+function resolveValidationNode(point, clusters) {
+  const poiKey = point.poiId ? `poi:${point.poiId}` : "";
+  if (poiKey) {
+    const match = clusters.find((cluster) => cluster.poiKey === poiKey);
+    if (match) {
+      return match;
+    }
+  }
+
+  const tolerance = pathValidationTolerance();
+  const match = clusters.find((cluster) => {
+    if (poiKey || cluster.poiKey) {
+      return false;
+    }
+    return Math.hypot(cluster.x - point.x, cluster.y - point.y) <= tolerance;
+  });
+  if (match) {
+    return match;
+  }
+
+  const cluster = {
+    id: poiKey || `node:${clusters.length + 1}`,
+    poiKey,
+    x: Number(point.x),
+    y: Number(point.y),
+    labels: new Set(),
+  };
+  clusters.push(cluster);
+  return cluster;
 }
 
 function normalizePoiName(name) {
@@ -1718,12 +2073,17 @@ function computePathClosedLoopValidation() {
     return false;
   }
 
+  const clusters = [];
   const endpointMap = new Map();
   const adjacency = new Map();
 
   pathSegments.forEach((segment) => {
-    const startKey = pathNodeKey(segment.start);
-    const endKey = pathNodeKey(segment.end);
+    const startNode = resolveValidationNode(segment.start, clusters);
+    const endNode = resolveValidationNode(segment.end, clusters);
+    startNode.labels.add(describeValidationPoint(segment.start));
+    endNode.labels.add(describeValidationPoint(segment.end));
+    const startKey = startNode.id;
+    const endKey = endNode.id;
     if (!endpointMap.has(startKey)) {
       endpointMap.set(startKey, []);
     }
@@ -1747,7 +2107,12 @@ function computePathClosedLoopValidation() {
   const badNodes = [];
   endpointMap.forEach((segmentIds, key) => {
     if (segmentIds.length !== 2) {
-      badNodes.push(key);
+      const node = clusters.find((item) => item.id === key);
+      badNodes.push({
+        key,
+        degree: segmentIds.length,
+        labels: node ? Array.from(node.labels) : [key],
+      });
       segmentIds.forEach((id) => invalidSegmentIds.add(id));
     }
   });
@@ -1789,7 +2154,11 @@ function computePathClosedLoopValidation() {
   } else {
     const reasonParts = [];
     if (badNodes.length) {
-      reasonParts.push(`${badNodes.length} endpoint(s) do not have degree 2`);
+      const details = badNodes
+        .slice(0, 8)
+        .map((node) => `${node.labels[0]} degree=${node.degree}`)
+        .join("; ");
+      reasonParts.push(`${badNodes.length} endpoint(s) do not have degree 2: ${details}`);
     }
     if (components.length !== 1) {
       reasonParts.push(`path is split into ${components.length} disconnected component(s)`);
@@ -1802,22 +2171,39 @@ function computePathClosedLoopValidation() {
 
 function validatePathClosedLoop(showAlert = true) {
   computePathClosedLoopValidation();
+  selectedSegmentId = null;
+  selectedPoiIds = new Set();
 
-  syncTrajectoryPanel();
   if (showAlert) {
     alert(pathValidation.message);
   }
+  resetPathValidation();
+  syncTrajectoryPanel();
   return pathValidation.ok;
+}
+
+function clearSelections() {
+  selectedSegmentId = null;
+  selectedPoiIds = new Set();
+  pendingFreePoint = null;
+  resetPathValidation();
+  syncTrajectoryPanel();
 }
 
 function syncTrajectoryButtons() {
   const selectedSegment = pathSegments.find((segment) => segment.id === selectedSegmentId) || null;
+  const idleMode = elements.trajectoryToolMode.value === "idle";
   const nameMode = elements.trajectoryToolMode.value === "poi";
   const hasNamedPoiPair = elements.pathStartPoiInput.value.trim() && elements.pathEndPoiInput.value.trim();
+  elements.pathStartPoiField.hidden = !nameMode;
+  elements.pathEndPoiField.hidden = !nameMode;
+  elements.pathApplyField.hidden = !nameMode;
   elements.pathStartPoiInput.disabled = !nameMode;
   elements.pathEndPoiInput.disabled = !nameMode;
   elements.deleteSegmentBtn.disabled = !selectedSegment;
   elements.connectNamedPoiBtn.disabled = !nameMode || !hasNamedPoiPair;
+  elements.connectNamedPoiBtn.hidden = !nameMode;
+  elements.clearSelectionBtn.disabled = !selectedSegment && selectedPoiIds.size === 0 && !pendingFreePoint;
   elements.validatePathBtn.disabled = pathSegments.length === 0;
   elements.clearPoiBtn.disabled = selectedPoiIds.size === 0;
   elements.applyPoiGeoBtn.disabled = selectedPoiIds.size === 0;
@@ -1872,6 +2258,7 @@ function renderSegmentList() {
 
   pathSegments.forEach((segment, index) => {
     const li = document.createElement("li");
+    const samples = sampleSegment(segment);
     if (segment.id === selectedSegmentId) {
       li.classList.add("selected");
     }
@@ -1880,7 +2267,7 @@ function renderSegmentList() {
     }
     li.innerHTML = `
       <span class="list-main">${index + 1}. line | ${segment.source} | ${describePoint(segment.start)} -> ${describePoint(segment.end)}</span>
-      <span class="list-meta">Length ${distanceBetween(segment.start, segment.end).toFixed(2)} m${pathValidation.invalidSegmentIds.has(segment.id) ? " | closed-loop error" : ""}</span>
+      <span class="list-meta">Length ${polylineLength(samples).toFixed(2)} m | key points ${samples.length}${segment.clearance ? ` | clearance ${segment.clearance.toFixed(2)} m` : ""}${pathValidation.invalidSegmentIds.has(segment.id) ? " | closed-loop error" : ""}</span>
     `;
     li.onclick = () => {
       selectedSegmentId = segment.id;
@@ -1891,16 +2278,19 @@ function renderSegmentList() {
 }
 
 function updateTrajectoryStatus() {
-  const toolLabel = elements.trajectoryToolMode.value === "poi"
-    ? `Input POI names to connect${elements.pathStartPoiInput.value.trim() || elements.pathEndPoiInput.value.trim() ? ` (${elements.pathStartPoiInput.value.trim() || "?"} -> ${elements.pathEndPoiInput.value.trim() || "?"})` : ""}`
-    : "Click any two points to connect";
+  const toolLabel = elements.trajectoryToolMode.value === "idle"
+    ? "Browse only"
+    : elements.trajectoryToolMode.value === "poi"
+    ? `Use POI${elements.pathStartPoiInput.value.trim() || elements.pathEndPoiInput.value.trim() ? ` (${elements.pathStartPoiInput.value.trim() || "?"} -> ${elements.pathEndPoiInput.value.trim() || "?"})` : ""}`
+    : "Free points on canvas";
   const pendingText = pendingFreePoint ? ` | Start ${describePoint(pendingFreePoint)}` : "";
+  const safetyText = ` | Clearance ${readPathSafetyMargin().toFixed(2)} m`;
   const validationText = !pathValidation.checked
     ? " | Loop unchecked"
     : pathValidation.ok
       ? " | Loop OK"
       : ` | Loop error ${pathValidation.invalidSegmentIds.size} segment(s)`;
-  elements.trajectoryStatus.innerText = `Path segments ${pathSegments.length} | Nodes ${pathNodes.length} | Tool ${toolLabel}${pendingText}${validationText}`;
+  elements.trajectoryStatus.innerText = `Path segments ${pathSegments.length} | Nodes ${pathNodes.length} | Tool ${toolLabel}${safetyText}${pendingText}${validationText}`;
 }
 
 function syncTrajectoryPanel() {
@@ -1911,6 +2301,13 @@ function syncTrajectoryPanel() {
   renderPoiList();
   renderSegmentList();
   updateTrajectoryStatus();
+  elements.freeConnectHint.innerText = elements.trajectoryToolMode.value === "idle"
+    ? "Browse only mode: clicking the map will only select or clear selection."
+    : elements.trajectoryToolMode.value === "free"
+    ? pendingFreePoint
+      ? `Free points mode: second click will apply the path. Start point ${describePoint(pendingFreePoint)}.`
+      : "Free points mode: click any two map points to apply a path."
+    : "Use POI mode: input start/end POI then click Apply Path.";
   elements.poiStatus.innerText = pendingPoiDraft
     ? `Ready to place "${pendingPoiDraft.name}" on canvas${pendingPoiQueue.length ? ` | ${pendingPoiQueue.length} queued` : ""}`
     : pendingPoiQueue.length
@@ -1969,12 +2366,29 @@ function applyGeoToSelectedPoi() {
 }
 
 function togglePoiPlacement() {
-  if (pendingPoiDraft) {
-    pendingPoiDraft = null;
-    pendingPoiQueue = [];
+  const name = elements.poiNameInput.value.trim();
+  if (pendingPoiDraft || pendingPoiQueue.length) {
+    if (name) {
+      const geo = readManualGeoInput(false);
+      if (!geo) {
+        return;
+      }
+      startManualPoiDraft(name, geo);
+      return;
+    }
+    clearPendingPoiPlacement();
     syncTrajectoryPanel();
     return;
   }
+  if (name) {
+    const geo = readManualGeoInput(false);
+    if (!geo) {
+      return;
+    }
+    startManualPoiDraft(name, geo);
+    return;
+  }
+
   const queue = loadPoiQueueFromInput();
   if (queue === null) {
     return;
@@ -1984,23 +2398,8 @@ function togglePoiPlacement() {
     startNextPoiDraft();
     return;
   }
-  const geo = readManualGeoInput(false);
-  if (!geo) {
-    return;
-  }
-  const name = elements.poiNameInput.value.trim();
-  if (!name) {
-    alert("Input POI name first");
-    elements.poiNameInput.focus();
-    return;
-  }
-  pendingPoiDraft = {
-    name,
-    lat: geo.lat,
-    lon: geo.lon,
-    yaw: null,
-  };
-  syncTrajectoryPanel();
+  alert("Input POI name first, or provide batch POI input.");
+  elements.poiNameInput.focus();
 }
 
 async function copyPoiData() {
@@ -2058,9 +2457,13 @@ function connectNamedPoi() {
     alert("Start and end POI cannot be the same");
     return;
   }
-  addSegment(createSegment(startResult.poi, endResult.poi, {
-    source: "poi-name",
-  }));
+  try {
+    addSegment(buildPlannedSegment(startResult.poi, endResult.poi, {
+      source: "poi-name",
+    }));
+  } catch (err) {
+    alert(err.message);
+  }
 }
 
 function solveNearestLoop(points) {
@@ -2126,13 +2529,20 @@ function autoConnectPoiLoop() {
     return;
   }
   const route = optimizeLoopWithTwoOpt(solveNearestLoop(poiNodes));
-  pathSegments = pathSegments.filter((segment) => segment.source !== "auto");
-  for (let i = 0; i < route.length - 1; i += 1) {
-    pathSegments.push(createSegment(route[i], route[i + 1], { source: "auto", geometry: "line" }));
+  const preserved = pathSegments.filter((segment) => segment.source !== "auto");
+  const nextAutoSegments = [];
+  try {
+    for (let i = 0; i < route.length - 1; i += 1) {
+      nextAutoSegments.push(buildPlannedSegment(route[i], route[i + 1], { source: "auto", geometry: "line" }));
+    }
+    if (route.length > 2) {
+      nextAutoSegments.push(buildPlannedSegment(route[route.length - 1], route[0], { source: "auto", geometry: "line" }));
+    }
+  } catch (err) {
+    alert(err.message);
+    return;
   }
-  if (route.length > 2) {
-    pathSegments.push(createSegment(route[route.length - 1], route[0], { source: "auto", geometry: "line" }));
-  }
+  pathSegments = [...preserved, ...nextAutoSegments];
   selectedSegmentId = pathSegments.length ? pathSegments[pathSegments.length - 1].id : null;
   syncTrajectoryPanel();
 }
@@ -2219,9 +2629,12 @@ async function saveMap() {
       data: serializeRadarPoints(bundle.radar_points),
     },
   ]);
-  const savedName = await saveBlobWithPicker(`${name}.stcm`, new Blob([zipBytes], { type: "application/octet-stream" }));
+  const savedName = await saveBlobWithPicker(`${name}.slam`, new Blob([zipBytes], { type: "application/octet-stream" }));
   scanSession.lastSavedFile = savedName;
   scanSession.savedPointCount = bundle.radar_points.length;
+  setInspectorBundleState(savedName.endsWith(".slam") ? savedName : `${name}.slam`, manifest, bundle.radar_points, {
+    source: "current_map_save",
+  });
   updateSavePathHint(scanSession.lastSavedFile);
   renderScanState();
   alert(`Map saved: ${savedName}`);
@@ -2323,6 +2736,26 @@ function handleCanvasClick(clientX, clientY) {
     return;
   }
 
+  if (elements.trajectoryToolMode.value === "free") {
+    const point = makeLocalPoint(x, y, { lat: lastGps.lat, lon: lastGps.lon });
+    if (!pendingFreePoint) {
+      pendingFreePoint = point;
+      selectedSegmentId = null;
+      syncTrajectoryPanel();
+      return;
+    }
+    try {
+      addSegment(buildPlannedSegment(pendingFreePoint, point, {
+        source: "free",
+      }));
+      pendingFreePoint = null;
+      syncTrajectoryPanel();
+    } catch (err) {
+      alert(err.message);
+    }
+    return;
+  }
+
   const hitSegment = findSegmentAt(x, y);
   if (hitSegment) {
     selectedSegmentId = hitSegment.id;
@@ -2336,19 +2769,8 @@ function handleCanvasClick(clientX, clientY) {
     return;
   }
 
-  if (elements.trajectoryToolMode.value === "free") {
-    const point = makeLocalPoint(x, y, { lat: lastGps.lat, lon: lastGps.lon });
-    if (!pendingFreePoint) {
-      pendingFreePoint = point;
-      selectedSegmentId = null;
-      syncTrajectoryPanel();
-      return;
-    }
-    addSegment(createSegment(pendingFreePoint, point, {
-      source: "free",
-    }));
-    pendingFreePoint = null;
-    syncTrajectoryPanel();
+  if (selectedSegmentId || selectedPoiIds.size || pendingFreePoint) {
+    clearSelections();
   }
 }
 
@@ -2493,10 +2915,7 @@ function drawOccupancy() {
   const sizePx = Math.max(2, scanSession.voxelSize * viewState.scale);
 
   for (const cell of scanSession.freeCells.values()) {
-    const occ = scanSession.occupiedCells.get(cellKey(cell.ix, cell.iy));
-    const freeWeight = cell.hits;
-    const occWeight = occ ? occ.hits : 0;
-    if (freeWeight <= occWeight * 0.8) {
+    if (scanSession.occupiedCells.has(cellKey(cell.ix, cell.iy))) {
       continue;
     }
     const worldX = cell.ix * scanSession.voxelSize;
@@ -2507,11 +2926,6 @@ function drawOccupancy() {
   }
 
   for (const cell of scanSession.occupiedCells.values()) {
-    const free = scanSession.freeCells.get(cellKey(cell.ix, cell.iy));
-    const freeWeight = free ? free.hits : 0;
-    if (cell.hits < scanMergeConfig.saveMinHits || cell.hits < freeWeight * 0.9) {
-      continue;
-    }
     const worldX = cell.ix * scanSession.voxelSize;
     const worldY = cell.iy * scanSession.voxelSize;
     const [sx, sy] = worldToCanvas(worldX, worldY);
@@ -2707,6 +3121,7 @@ function bindUi() {
   elements.autoConnectBtn.onclick = autoConnectPoiLoop;
   elements.connectNamedPoiBtn.onclick = connectNamedPoi;
   elements.validatePathBtn.onclick = () => validatePathClosedLoop(true);
+  elements.clearSelectionBtn.onclick = clearSelections;
   elements.deleteSegmentBtn.onclick = removeSelectedSegment;
   document.getElementById("centerViewBtn").onclick = centerViewOnRobot;
   document.getElementById("resetViewBtn").onclick = resetView;
@@ -2723,17 +3138,24 @@ function bindUi() {
   elements.clearEditorMapBtn.onclick = clearEditorMap;
   elements.downloadPgmBtn.onclick = () => {
     if (!stcmInspector.pgmText || !stcmInspector.file) {
-      alert("Inspect a STCM file first");
+      alert("Inspect a SLAM file first");
       return;
     }
-    downloadFile(stcmInspector.file.name.replace(/\.stcm$/i, ".pgm"), stcmInspector.pgmText, "image/x-portable-graymap");
+    downloadFile(stcmInspector.file.name.replace(/\.slam$/i, ".pgm"), stcmInspector.pgmText, "image/x-portable-graymap");
+  };
+  elements.downloadYamlBtn.onclick = () => {
+    if (!stcmInspector.yamlText || !stcmInspector.file) {
+      alert("Inspect a SLAM file first");
+      return;
+    }
+    downloadFile(stcmInspector.file.name.replace(/\.slam$/i, ".yaml"), stcmInspector.yamlText, "application/x-yaml");
   };
   elements.downloadStcmJsonBtn.onclick = () => {
-    if (!stcmInspector.configJsonText || !stcmInspector.file) {
-      alert("Inspect a STCM file first");
+    if (!stcmInspector.exportJsonText || !stcmInspector.file) {
+      alert("Inspect a SLAM file first");
       return;
     }
-    downloadFile(stcmInspector.file.name.replace(/\.stcm$/i, ".json"), stcmInspector.configJsonText, "application/json");
+    downloadFile(stcmInspector.file.name.replace(/\.slam$/i, ".json"), stcmInspector.exportJsonText, "application/json");
   };
   elements.stcmFileInput.addEventListener("change", () => {
     const file = elements.stcmFileInput.files && elements.stcmFileInput.files[0];
@@ -2741,7 +3163,8 @@ function bindUi() {
     stcmInspector.bundle = null;
     stcmInspector.points = [];
     stcmInspector.pgmText = "";
-    stcmInspector.configJsonText = "";
+    stcmInspector.yamlText = "";
+    stcmInspector.exportJsonText = "";
     stcmInspector.summary = null;
     stcmInspector.loadedFileName = "";
     setInspectorStatus("Idle");
@@ -2769,10 +3192,13 @@ function bindUi() {
 
   elements.trajectoryToolMode.addEventListener("change", () => {
     pendingFreePoint = null;
+    selectedSegmentId = null;
+    resetPathValidation();
     syncTrajectoryPanel();
   });
   elements.pathStartPoiInput.addEventListener("input", syncTrajectoryPanel);
   elements.pathEndPoiInput.addEventListener("input", syncTrajectoryPanel);
+  elements.pathSafetyMarginInput.addEventListener("input", syncTrajectoryPanel);
   elements.poiBatchCreateInput.addEventListener("input", syncTrajectoryButtons);
   elements.poiGeoInput.addEventListener("input", syncTrajectoryPanel);
   elements.showPathToggle.addEventListener("change", syncDrawControls);
@@ -2803,6 +3229,12 @@ function bindUi() {
 
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("keyup", onKeyUp);
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      resetPathValidation();
+      clearSelections();
+    }
+  });
   window.addEventListener("blur", () => {
     keyState.clear();
     if (driveTimer) {
@@ -2829,5 +3261,5 @@ updateSavePathHint();
 setInspectorStatus("Idle");
 resetEditorToolState(elements.mapEditToolMode ? elements.mapEditToolMode.value : "view");
 updateEditorBadges();
-setMapEditStatus("View / Select mode active. Load a STCM file to start second-stage map editing.");
+setMapEditStatus("View / Select mode active. Load a SLAM file to start second-stage map editing.");
 draw();

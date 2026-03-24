@@ -379,7 +379,7 @@ async def save_map(req: SaveMapRequest) -> dict:
     }
     gps = ros.bridge.latest_gps() if ros.enabled and ros.bridge is not None else {}
     imu = ros.bridge.latest_imu() if ros.enabled and ros.bridge is not None else {}
-    filename = f"{req.name}_{int(time.time())}.stcm"
+    filename = f"{req.name}_{int(time.time())}.slam"
     target = map_dir / filename
     bundle = {
         "version": "stcm.v2",
@@ -454,7 +454,7 @@ async def load_map(req: LoadMapRequest) -> dict:
 
 @app.get("/map/list")
 async def list_map() -> dict:
-    files = sorted([path.name for path in map_dir.glob("*.stcm")])
+    files = sorted([path.name for path in map_dir.glob("*.slam")])
     return {"ok": True, "files": files}
 
 

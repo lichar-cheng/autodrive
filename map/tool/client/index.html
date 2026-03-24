@@ -50,12 +50,6 @@
             <span>Notes</span>
             <textarea id="mapNotesInput" rows="4">Browser scan session</textarea>
           </label>
-          <div class="action-row">
-            <button id="saveMapBtn">Save Map</button>
-          </div>
-          <div class="hint" id="savePathHint">
-            Map export uses the local browser save dialog. You choose the destination folder and filename.
-          </div>
           <pre id="scanPanel">-</pre>
         </section>
 
@@ -64,10 +58,10 @@
             <h2>Panel Visibility</h2>
           </div>
           <div class="action-row">
-            <label class="toggle"><input id="showMotionControlCardToggle" type="checkbox" checked />Move</label>
-            <label class="toggle"><input id="showPoiCardToggle" type="checkbox" checked />POI</label>
-            <label class="toggle"><input id="showTrajectoryCardToggle" type="checkbox" checked />Path</label>
-            <label class="toggle"><input id="showStcmInspectorCardToggle" type="checkbox" checked />Map</label>
+            <label class="toggle"><input id="showMotionControlCardToggle" type="checkbox" />Move</label>
+            <label class="toggle"><input id="showPoiCardToggle" type="checkbox" />POI</label>
+            <label class="toggle"><input id="showTrajectoryCardToggle" type="checkbox" />Path</label>
+            <label class="toggle"><input id="showStcmInspectorCardToggle" type="checkbox" />Map</label>
           </div>
         </section>
 
@@ -160,33 +154,45 @@
             <div class="view-chip" id="drawModeBadge">Line</div>
           </div>
           <div class="hint">
-            Path supports auto loop, POI-name connect, any-point connect, delete, and closed-loop validation.
+            Build paths by POI name or by clicking any two map points. New segments keep obstacle clearance and save turning key points.
           </div>
           <div class="field-grid">
             <label class="field">
               <span>Path Tool</span>
               <select id="trajectoryToolMode">
-                <option value="poi" selected>Connect By POI Name</option>
-                <option value="free">Connect Any Two Points</option>
+                <option value="idle" selected>Browse Only</option>
+                <option value="poi">Use POI</option>
+                <option value="free">Free Points</option>
               </select>
             </label>
             <label class="field">
+              <span>Safe Clearance (m)</span>
+              <input id="pathSafetyMarginInput" type="number" min="0" max="5" step="0.05" value="0.30" />
+            </label>
+          </div>
+          <div class="field-grid">
+            <label class="field" id="pathStartPoiField">
               <span>Start POI Name</span>
               <input id="pathStartPoiInput" placeholder="a" />
             </label>
-            <label class="field">
+            <label class="field" id="pathEndPoiField">
               <span>End POI Name</span>
               <input id="pathEndPoiInput" placeholder="b" />
             </label>
+            <label class="field" id="pathApplyField">
+              <span>Path Apply</span>
+              <button id="connectNamedPoiBtn" type="button">Apply Path</button>
+            </label>
           </div>
+          <div class="hint" id="freeConnectHint">Use POI mode: input start/end POI then click Apply Path. Free Points mode: click two points on the map.</div>
           <div class="hint" id="trajectoryStatus">No segments yet</div>
           <div class="action-row">
             <label class="toggle"><input id="showPathToggle" type="checkbox" checked />Show Path</label>
           </div>
           <div class="action-row">
             <button id="autoConnectBtn" class="primary">Auto Loop</button>
-            <button id="connectNamedPoiBtn">Connect Named POI</button>
             <button id="validatePathBtn">Closed-Loop Check</button>
+            <button id="clearSelectionBtn">Clear Selection</button>
             <button id="deleteSegmentBtn" class="danger">Delete Segment</button>
           </div>
           <div>
@@ -201,12 +207,12 @@
             <div class="view-chip" id="stcmInspectorStatus">Idle</div>
           </div>
           <div class="hint">
-            Load a local <code>.stcm</code> file into the main map canvas for second-stage editing. After loading, you can keep editing POI, path, remove unwanted noise, and draw black obstacle lines directly on the map.
+            Load a local <code>.slam</code> file into the main map canvas for second-stage editing. After loading, you can keep editing POI, path, remove unwanted noise, and draw black obstacle lines directly on the map.
           </div>
           <div class="field-grid">
             <label class="field">
-              <span>STCM File</span>
-              <input id="stcmFileInput" type="file" accept=".stcm,.zip" />
+              <span>SLAM File</span>
+              <input id="stcmFileInput" type="file" accept=".slam,.zip" />
             </label>
             <label class="field">
               <span>Resolution (m/pixel)</span>
@@ -218,10 +224,15 @@
             </label>
           </div>
           <div class="action-row">
-            <button id="inspectStcmBtn">Inspect STCM</button>
+            <button id="inspectStcmBtn">Inspect SLAM</button>
             <button id="loadStcmToCanvasBtn" class="primary">Load To Main View</button>
+            <button id="saveMapBtn">Save Map</button>
             <button id="downloadPgmBtn">Download PGM</button>
+            <button id="downloadYamlBtn">Download YAML</button>
             <button id="downloadStcmJsonBtn">Download JSON</button>
+          </div>
+          <div class="hint" id="savePathHint">
+            Map save/export uses the local browser save dialog. You choose the destination folder and filename.
           </div>
           <div class="camera-meta">
             <span id="stcmFileMeta">No file selected</span>
@@ -307,6 +318,6 @@
     </main>
   </div>
 
-  <script src="main.js"></script>
+  <script src="main.js?v=20260324-10"></script>
 </body>
 </html>
