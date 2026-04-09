@@ -1,19 +1,50 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import math
+import os
 import queue
 import struct
+import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
 import zipfile
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from urllib.parse import urlparse
+from logging.handlers import RotatingFileHandler
 
 import requests
 import websocket
+
+try:
+    from .logic import (
+        Point,
+        build_poi_copy_text,
+        compute_path_closed_loop_validation,
+        infer_missing_geo_points,
+        optimize_loop_with_two_opt,
+        parse_batch_poi_text,
+        plan_path_points,
+        solve_nearest_loop,
+    )
+except ImportError:
+    from logic import (  # type: ignore
+        Point,
+        build_poi_copy_text,
+        compute_path_closed_loop_validation,
+        infer_missing_geo_points,
+        optimize_loop_with_two_opt,
+        parse_batch_poi_text,
+        plan_path_points,
+        solve_nearest_loop,
+    )
 
 
 @dataclass
@@ -27,43 +58,199 @@ class Poi:
     lon: float | None = None
 
 
+def normalize_server_ws_url(raw: str) -> str:
+    text = raw.strip()
+    if not text:
+        return ""
+    if "://" not in text:
+        text = f"ws://{text}"
+    if text.startswith("http://"):
+        text = "ws://" + text[len("http://") :]
+    elif text.startswith("https://"):
+        text = "wss://" + text[len("https://") :]
+    parsed = urlparse(text)
+    path = parsed.path or ""
+    if not path or path == "/":
+        path = "/ws/stream"
+    elif path.endswith("/"):
+        path = f"{path}ws/stream"
+    elif path != "/ws/stream":
+        path = f"{path}/ws/stream" if not path.endswith("/ws/stream") else path
+    return parsed._replace(path=path).geturl()
+
+
+def resolve_log_file_path(
+    candidates: list[Path],
+    mkdir_fn=None,
+) -> Path:
+    mkdir_fn = mkdir_fn or (lambda path: path.mkdir(parents=True, exist_ok=True))
+    last_err: Exception | None = None
+    for candidate in candidates:
+        try:
+            mkdir_fn(candidate.parent)
+            with candidate.open("a", encoding="utf-8") as handle:
+                handle.write("")
+            return candidate
+        except Exception as exc:
+            last_err = exc
+    raise OSError(f"unable to create log file in any candidate path: {last_err}")
+
+
+def bootstrap_log_write(path: Path, message: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {message}\n")
+    except Exception:
+        pass
+
+
+def build_camera_refresh_text(camera_inbox: dict[int, dict]) -> str:
+    newest = max((item.get("meta", {}).get("received_at_ms", 0) for item in camera_inbox.values()), default=0)
+    if not newest:
+        return "No buffered frame"
+    return f"Buffered latest {time.strftime('%H:%M:%S', time.localtime(newest / 1000))}"
+
+
+def parse_camera_topic_id(topic: str) -> int | None:
+    parts = topic.split("/")
+    if len(parts) < 3:
+        return None
+    try:
+        return int(parts[2])
+    except (TypeError, ValueError):
+        return None
+
+
+def safe_mode_translation_key(value: str, mapping: dict[str, str], default_key: str) -> str:
+    return mapping.get(value, default_key)
+
+
+def safe_focus_widget(root: tk.Tk) -> tk.Misc | None:
+    try:
+        return root.focus_get()
+    except (KeyError, tk.TclError):
+        return None
+
+
+def can_zoom_from_widget(widget: object, canvas: tk.Canvas) -> bool:
+    current = widget
+    while current is not None:
+        if current is canvas:
+            return True
+        current = getattr(current, "master", None)
+    return False
+
+
+def should_clear_focus_on_click(widget: object) -> bool:
+    return not isinstance(widget, (tk.Entry, tk.Text, tk.Listbox, ttk.Entry, ttk.Combobox, ttk.Button, ttk.Checkbutton))
+
+
+def zoom_scale_factor(event: object) -> float:
+    delta = getattr(event, "delta", 0)
+    if delta > 0:
+        return 1.08
+    if delta < 0:
+        return 0.92
+    num = getattr(event, "num", None)
+    if num == 4:
+        return 1.08
+    if num == 5:
+        return 0.92
+    return 1.0
+
+
+def strip_legacy_trajectory(manifest: dict) -> dict:
+    cleaned = dict(manifest)
+    cleaned.pop("trajectory", None)
+    return cleaned
+
+
+def runtime_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def compute_log_candidates(
+    platform_name: str,
+    env: dict[str, str],
+    home_dir: Path,
+    runtime_dir: Path,
+    temp_dir: Path,
+    cwd: Path,
+) -> list[Path]:
+    candidates = [runtime_dir / "logs" / "client_desktop.log"]
+    if platform_name.startswith("win"):
+        local_appdata = env.get("LOCALAPPDATA", "").strip()
+        if local_appdata:
+            candidates.append(Path(local_appdata) / "AutoDriveClient" / "logs" / "client_desktop.log")
+        candidates.append(home_dir / "AppData" / "Local" / "AutoDriveClient" / "logs" / "client_desktop.log")
+    elif platform_name == "darwin":
+        candidates.append(home_dir / "Library" / "Logs" / "AutoDriveClient" / "logs" / "client_desktop.log")
+        candidates.append(home_dir / ".local" / "state" / "AutoDriveClient" / "logs" / "client_desktop.log")
+    else:
+        xdg_state = env.get("XDG_STATE_HOME", "").strip()
+        if xdg_state:
+            candidates.append(Path(xdg_state) / "AutoDriveClient" / "logs" / "client_desktop.log")
+        candidates.append(home_dir / ".local" / "state" / "AutoDriveClient" / "logs" / "client_desktop.log")
+        candidates.append(home_dir / ".cache" / "AutoDriveClient" / "logs" / "client_desktop.log")
+    candidates.append(temp_dir / "AutoDriveClient" / "logs" / "client_desktop.log")
+    candidates.append(cwd / "logs" / "client_desktop.log")
+    return candidates
+
+
 class ServerBridge:
-    def __init__(self, ws_url: str) -> None:
-        self.ws_url = ws_url.strip()
+    def __init__(self, ws_url: str, logger: logging.Logger | None = None) -> None:
+        self.ws_url = normalize_server_ws_url(ws_url)
         self.http_base = self.ws_url.replace("ws://", "http://").replace("wss://", "https://").replace("/ws/stream", "")
+        self.ws_host = urlparse(self.ws_url).hostname or ""
+        self.logger = logger or logging.getLogger("autodrive.client_desktop")
         self.queue: queue.Queue[dict] = queue.Queue()
         self.connected = False
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.ws: websocket.WebSocketApp | None = None
+        self.session = requests.Session()
+        self.session.trust_env = False
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
             return
         self.stop_event.clear()
+        self.logger.info("bridge start ws_url=%s http_base=%s", self.ws_url, self.http_base)
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
     def stop(self) -> None:
         self.stop_event.set()
         self.connected = False
+        self.logger.info("bridge stop")
         if self.ws is not None:
             try:
                 self.ws.close()
             except Exception:
-                pass
+                self.logger.exception("bridge ws close failed")
 
     def post(self, path: str, body: dict, retries: int = 3) -> dict:
-        last_err = None
+        last_err: Exception | None = None
         for index in range(retries + 1):
             try:
-                res = requests.post(f"{self.http_base}{path}", json=body, timeout=4)
+                self.logger.info("http post path=%s try=%s", path, index + 1)
+                res = self.session.post(f"{self.http_base}{path}", json=body, timeout=4)
                 res.raise_for_status()
                 return res.json()
             except Exception as exc:
                 last_err = exc
+                self.logger.warning("http post failed path=%s try=%s err=%s", path, index + 1, exc)
                 time.sleep(0.2 * (2**index))
         raise RuntimeError(str(last_err))
+
+    def get(self, path: str) -> dict:
+        self.logger.info("http get path=%s", path)
+        res = self.session.get(f"{self.http_base}{path}", timeout=2)
+        res.raise_for_status()
+        return res.json()
 
     def _loop(self) -> None:
         retry = 0
@@ -74,18 +261,21 @@ class ServerBridge:
             try:
                 self.queue.put(json.loads(msg))
             except Exception:
-                pass
+                self.logger.exception("ws message parse failed")
 
         def on_open(_ws) -> None:
             nonlocal retry
             retry = 0
             self.connected = True
+            self.logger.info("ws opened host=%s", self.ws_host)
 
         def on_close(_ws, _code, _msg) -> None:
             self.connected = False
+            self.logger.warning("ws closed code=%s msg=%s", _code, _msg)
 
         def on_error(_ws, _err) -> None:
             self.connected = False
+            self.logger.error("ws error err=%s", _err)
 
         while not self.stop_event.is_set():
             self.ws = websocket.WebSocketApp(
@@ -95,20 +285,333 @@ class ServerBridge:
                 on_close=on_close,
                 on_error=on_error,
             )
-            self.ws.run_forever(ping_interval=5, ping_timeout=3)
+            no_proxy_hosts = [self.ws_host, "127.0.0.1", "localhost"]
+            self.ws.run_forever(
+                ping_interval=5,
+                ping_timeout=3,
+                http_proxy_host=None,
+                http_proxy_port=None,
+                http_no_proxy=no_proxy_hosts,
+            )
             self.connected = False
             if self.stop_event.is_set():
                 break
             retry += 1
+            self.logger.warning("ws reconnect scheduled retry=%s", retry)
             time.sleep(min(10.0, 0.3 * (2 ** min(retry, 5))))
 
 
 class DesktopClient:
     def __init__(self) -> None:
+        self.i18n = {
+            "en": {
+                "title": "AutoDrive Desktop Map Tool",
+                "server_ws": "Server WS",
+                "connect": "Connect",
+                "disconnect": "Disconnect",
+                "refresh_cameras": "Refresh Cameras",
+                "language": "Language",
+                "english": "English",
+                "chinese": "中文",
+                "panel_visibility": "Panel Visibility",
+                "move": "Move",
+                "poi": "POI",
+                "path": "Path",
+                "map": "Map",
+                "scan": "Scan",
+                "start_scan": "Start Scan",
+                "stop_scan": "Stop Scan",
+                "clear": "Clear",
+                "map_name": "Map Name",
+                "voxel": "Voxel",
+                "notes": "Notes",
+                "keyboard_inactive": "Keyboard inactive",
+                "forward_speed": "Forward Speed",
+                "reverse_speed": "Reverse Speed",
+                "turn_rate": "Turn Rate",
+                "cmd_duration": "Cmd Duration",
+                "repeat_ms": "Repeat (ms)",
+                "stop_on_keyup": "Stop on keyup",
+                "forward": "Forward",
+                "left": "Left",
+                "stop": "Stop",
+                "right": "Right",
+                "reverse": "Reverse",
+                "mode": "Mode",
+                "batch": "Batch",
+                "single": "Single",
+                "edit": "Edit Existing",
+                "free_points": "Free Points",
+                "batch_input_hint": "Batch POI Input (name or name,lon,lat or name,lon,lat,yaw)",
+                "batch_examples": "Examples:\nA\nB,120.123456,30.123456\nC,120.223456,30.223456,1.570",
+                "start_batch_add": "Start Batch Add",
+                "cancel_batch": "Cancel Batch ({count})",
+                "name": "Name",
+                "x": "X",
+                "y": "Y",
+                "yaw": "Yaw",
+                "geo": "Geo (lon,lat)",
+                "add_single_poi": "Add Single POI",
+                "edit_hint": "Select exactly one POI in the list before editing.",
+                "apply_edit": "Apply Edit",
+                "delete_selected": "Delete Selected",
+                "copy_poi": "Copy POI",
+                "show_poi": "Show POI",
+                "poi_list": "POI List",
+                "path_hint": "Obstacle-aware route planning, free-point draw, named POI connect, delete, and closed-loop validation.",
+                "path_tool": "Path Tool",
+                "safe_clearance": "Safe Clearance",
+                "start_poi_name": "Start POI Name",
+                "end_poi_name": "End POI Name",
+                "auto_loop": "Auto Loop",
+                "connect_named_poi": "Connect Named POI",
+                "clear_selection": "Clear Selection",
+                "closed_loop_check": "Closed-Loop Check",
+                "delete_segment": "Delete Segment",
+                "show_path": "Show Path",
+                "map_tool": "Map Tool",
+                "brush_radius": "Brush Radius",
+                "auto_clear_noise": "Auto Clear Noise",
+                "clear_loaded_map": "Clear Loaded Map",
+                "save_map": "Save Map",
+                "load_map": "Load Map",
+                "export_pgm": "Export PGM",
+                "export_yaml": "Export YAML",
+                "export_json": "Export JSON",
+                "map_view": "Map View",
+                "center_robot": "Center Robot",
+                "center_loaded_map": "Center Loaded Map",
+                "reset_view": "Reset View",
+                "show_robot": "Show Robot",
+                "odom_scan": "Odom And Scan",
+                "cameras": "Cameras",
+                "comm_map": "Communication / Map",
+                "disconnected": "Disconnected",
+                "no_health": "No health yet",
+                "idle": "Idle",
+                "poi_idle": "POI idle",
+                "scan_session": "Scan Session",
+                "tool_view": "Tool: View / Select",
+                "left_notice": "Not enough space. Close some left-side panels or enlarge the window.",
+                "loaded_map_edit": "View / Select mode active. Load a map file to start second-stage map editing.",
+                "ws_offline": "WS offline",
+                "connecting": "Connecting",
+                "connected": "Connected",
+                "status_line": "WS {ws} | scan {scan} | poi {poi} | path {path}",
+                "status_detail": "WS ok | clients {clients} | scan {scan} | ros {ros}",
+                "recording_obstacles": "Recording {count} obstacle cells",
+                "stopped_summary": "Stopped | {obs} obs / {free} safe",
+                "loaded_badge": "Loaded: {name}",
+                "tool_badge": "Tool: {name}{suffix}",
+                "tool_view_select": "View / Select",
+                "tool_erase_noise": "Erase Noise",
+                "tool_draw_obstacle": "Draw Obstacle",
+                "stats_badge": "{occ} obstacle cells | {poi} POI | {path} paths",
+                "warning_disconnected": "Connect to the server first.",
+                "api_error": "API Error",
+                "poi_geo_format": "{label} format must be lon,lat.",
+                "poi_geo_min3": "When any POI geo is provided, at least 3 POI must have lon,lat.",
+                "poi_batch_requires_input": "Batch mode requires input rows.",
+                "poi_ready_place": "Ready to place \"{name}\" on canvas",
+                "poi_copied": "POI data copied to clipboard.",
+                "poi_no_copy": "No POI to copy.",
+                "poi_select_delete": "Select POI to delete.",
+                "poi_select_first": "Select POI first.",
+                "poi_single_requires_name": "Single mode requires a name.",
+                "poi_edit_requires_one": "Edit mode requires exactly one selected POI.",
+                "poi_added": "Added \"{name}\"",
+                "poi_updated": "Updated \"{name}\"",
+                "path_need_names": "Input both POI names first.",
+                "path_poi_not_found": "POI \"{name}\" not found.",
+                "path_poi_duplicate": "POI name \"{name}\" is duplicated.",
+                "path_same_poi": "Start and end POI cannot be the same.",
+                "path_need_two_poi": "At least two POI are required.",
+                "path_browse_only": "Browse only",
+                "path_tool_named": "Input POI names to connect ({start} -> {end})",
+                "path_tool_free": "Click any two points to connect",
+                "path_status": "Path segments {segments} | Nodes {nodes} | Tool {tool}{pending}{validation}",
+                "loop_unchecked": " | Loop unchecked",
+                "loop_ok": " | Loop OK",
+                "loop_error": " | Loop error {count} segment(s)",
+                "keyboard_cmd": "Keyboard {cmd}",
+                "keyboard_stop_keyup": "Keyboard stop on keyup",
+                "map_edit_erase": "Erase Noise mode active. Brush radius {radius:.2f} m",
+                "map_edit_obstacle": "Draw Obstacle Line mode active. Click two points on the map.",
+                "map_edit_view": "View / Select mode active. You can pan, zoom, and select POI or path.",
+                "obstacle_start": "Obstacle start fixed at ({x:.2f}, {y:.2f}). Click end point next.",
+                "obstacle_added": "Added obstacle line.",
+                "noise_cleared": "Auto cleared {count} noisy cells",
+                "noise_none": "No isolated noise found",
+                "map_cleared": "Loaded map cleared",
+                "save_title": "Saved",
+                "save_done": "Map saved:\n{path}",
+                "load_title": "Loaded",
+                "load_done": "Loaded map:\n{name}",
+                "export_need_map": "Load or save a map file first.",
+                "export_title": "Export",
+                "export_done": "Exported {kind}:\n{path}",
+                "path_validation_title": "Path Validation",
+                "map_loaded_view": "Loaded {name} into main map view",
+            },
+            "zh": {
+                "title": "AutoDrive 桌面扫图工具",
+                "server_ws": "服务端 WS",
+                "connect": "连接",
+                "disconnect": "断开",
+                "refresh_cameras": "刷新相机",
+                "language": "语言",
+                "english": "English",
+                "chinese": "中文",
+                "panel_visibility": "面板显示",
+                "move": "移动",
+                "poi": "POI 点",
+                "path": "路径",
+                "map": "地图",
+                "scan": "扫描",
+                "start_scan": "开始扫描",
+                "stop_scan": "停止扫描",
+                "clear": "清空",
+                "map_name": "地图名",
+                "voxel": "体素大小",
+                "notes": "备注",
+                "keyboard_inactive": "键盘未激活",
+                "forward_speed": "前进速度",
+                "reverse_speed": "后退速度",
+                "turn_rate": "转向角速度",
+                "cmd_duration": "指令时长",
+                "repeat_ms": "重复间隔(ms)",
+                "stop_on_keyup": "松键即停",
+                "forward": "前进",
+                "left": "左转",
+                "stop": "停止",
+                "right": "右转",
+                "reverse": "后退",
+                "mode": "模式",
+                "batch": "批量添加",
+                "single": "单点添加",
+                "edit": "编辑已有",
+                "free_points": "任意两点",
+                "batch_input_hint": "批量 POI 输入（name 或 name,lon,lat 或 name,lon,lat,yaw）",
+                "batch_examples": "示例：\nA\nB,120.123456,30.123456\nC,120.223456,30.223456,1.570",
+                "start_batch_add": "开始批量添加",
+                "cancel_batch": "取消批量添加（剩余 {count}）",
+                "name": "名称",
+                "x": "X",
+                "y": "Y",
+                "yaw": "Yaw",
+                "geo": "经纬度(lon,lat)",
+                "add_single_poi": "添加单点",
+                "edit_hint": "先在列表中选中且只选中一个 POI，再进行编辑。",
+                "apply_edit": "应用修改",
+                "delete_selected": "删除选中",
+                "copy_poi": "复制 POI",
+                "show_poi": "显示 POI",
+                "poi_list": "POI 列表",
+                "path_hint": "支持避障路径规划、任意两点画线、按 POI 名称连线、删除和闭环校验。",
+                "path_tool": "路径工具",
+                "safe_clearance": "安全距离",
+                "start_poi_name": "起点 POI 名称",
+                "end_poi_name": "终点 POI 名称",
+                "auto_loop": "自动闭环",
+                "connect_named_poi": "按名称连线",
+                "clear_selection": "清空选择",
+                "closed_loop_check": "闭环检查",
+                "delete_segment": "删除线段",
+                "show_path": "显示路径",
+                "map_tool": "地图工具",
+                "brush_radius": "画刷半径",
+                "auto_clear_noise": "自动清噪",
+                "clear_loaded_map": "清空已加载地图",
+                "save_map": "保存地图",
+                "load_map": "加载地图",
+                "export_pgm": "导出 PGM",
+                "export_yaml": "导出 YAML",
+                "export_json": "导出 JSON",
+                "map_view": "地图视图",
+                "center_robot": "居中机器人",
+                "center_loaded_map": "居中已加载地图",
+                "reset_view": "重置视图",
+                "show_robot": "显示机器人",
+                "odom_scan": "里程计和扫描",
+                "cameras": "相机",
+                "comm_map": "通信 / 地图",
+                "disconnected": "未连接",
+                "no_health": "暂无健康状态",
+                "idle": "空闲",
+                "poi_idle": "POI 空闲",
+                "scan_session": "扫描会话",
+                "tool_view": "工具：查看 / 选择",
+                "left_notice": "空间不足，请关闭部分左侧窗口或增大窗口。",
+                "loaded_map_edit": "当前为查看 / 选择模式。先加载地图文件再进行二次编辑。",
+                "ws_offline": "WS 离线",
+                "connecting": "连接中",
+                "connected": "已连接",
+                "status_line": "WS {ws} | 扫描 {scan} | POI {poi} | 路径 {path}",
+                "status_detail": "WS 正常 | 客户端 {clients} | 扫描 {scan} | ROS {ros}",
+                "recording_obstacles": "正在记录 {count} 个障碍栅格",
+                "stopped_summary": "已停止 | 障碍 {obs} / 空闲 {free}",
+                "loaded_badge": "已加载：{name}",
+                "tool_badge": "工具：{name}{suffix}",
+                "tool_view_select": "查看 / 选择",
+                "tool_erase_noise": "擦除噪点",
+                "tool_draw_obstacle": "绘制障碍",
+                "stats_badge": "{occ} 个障碍栅格 | {poi} 个 POI | {path} 条路径",
+                "warning_disconnected": "请先连接服务端。",
+                "api_error": "接口错误",
+                "poi_geo_format": "{label} 格式必须是 lon,lat。",
+                "poi_geo_min3": "只要填写了经纬度，就至少需要 3 个 POI 带 lon,lat。",
+                "poi_batch_requires_input": "批量模式需要输入内容。",
+                "poi_ready_place": "准备在画布上放置“{name}”",
+                "poi_copied": "POI 数据已复制到剪贴板。",
+                "poi_no_copy": "没有可复制的 POI。",
+                "poi_select_delete": "请选择要删除的 POI。",
+                "poi_select_first": "请先选择 POI。",
+                "poi_single_requires_name": "单点模式必须填写名称。",
+                "poi_edit_requires_one": "编辑模式要求且仅要求选中一个 POI。",
+                "poi_added": "已添加“{name}”",
+                "poi_updated": "已更新“{name}”",
+                "path_need_names": "请先填写起点和终点 POI 名称。",
+                "path_poi_not_found": "未找到 POI “{name}”。",
+                "path_poi_duplicate": "POI 名称“{name}”重复。",
+                "path_same_poi": "起点和终点不能是同一个 POI。",
+                "path_need_two_poi": "至少需要两个 POI。",
+                "path_browse_only": "仅浏览",
+                "path_tool_named": "按 POI 名称连线（{start} -> {end}）",
+                "path_tool_free": "在地图上点击任意两点连线",
+                "path_status": "路径 {segments} 条 | 节点 {nodes} 个 | 工具 {tool}{pending}{validation}",
+                "loop_unchecked": " | 未检查闭环",
+                "loop_ok": " | 闭环正常",
+                "loop_error": " | 闭环错误 {count} 段",
+                "keyboard_cmd": "键盘控制 {cmd}",
+                "keyboard_stop_keyup": "松键即停",
+                "map_edit_erase": "当前为擦除噪点模式。画刷半径 {radius:.2f} 米",
+                "map_edit_obstacle": "当前为绘制障碍线模式。请在地图上点击两个点。",
+                "map_edit_view": "当前为查看 / 选择模式。可平移、缩放并选择 POI 或路径。",
+                "obstacle_start": "障碍线起点已固定在 ({x:.2f}, {y:.2f})，请点击终点。",
+                "obstacle_added": "已添加障碍线。",
+                "noise_cleared": "已自动清理 {count} 个噪点",
+                "noise_none": "未发现孤立噪点",
+                "map_cleared": "已清空已加载地图",
+                "save_title": "已保存",
+                "save_done": "地图已保存：\n{path}",
+                "load_title": "已加载",
+                "load_done": "已加载地图：\n{name}",
+                "export_need_map": "请先加载或保存一个地图文件。",
+                "export_title": "导出",
+                "export_done": "已导出 {kind}：\n{path}",
+                "path_validation_title": "路径校验",
+                "map_loaded_view": "已将 {name} 加载到主地图视图",
+            },
+        }
         self.root = tk.Tk()
-        self.root.title("AutoDrive Desktop Map Tool")
-        self.root.geometry("1680x980")
-        self.root.minsize(1420, 860)
+        self.current_lang = "en"
+        self.lang_choice_var = tk.StringVar(value=self.i18n["en"]["english"])
+        self.root.title(self.tr("title"))
+        self.root.geometry("1760x980")
+        self.root.minsize(1380, 860)
+        self.log_path = self.setup_logging()
+        self.logger = logging.getLogger("autodrive.client_desktop")
+        self.root.report_callback_exception = self.report_callback_exception
 
         self.bridge: ServerBridge | None = None
         self.pose = {"x": 0.0, "y": 0.0, "yaw": 0.0, "vx": 0.0, "wz": 0.0}
@@ -116,22 +619,23 @@ class DesktopClient:
         self.odom = {"x": 0.0, "y": 0.0, "yaw": 0.0, "vx": 0.0, "wz": 0.0}
         self.chassis = {"mode": "-", "battery": 0.0}
         self.pose_history: list[dict] = []
-        self.camera_data: dict[int, dict] = {i: {"objects": [], "meta": {}} for i in range(1, 5)}
+        self.camera_inbox: dict[int, dict] = {i: {"objects": [], "meta": {}} for i in range(1, 5)}
+        self.camera_display: dict[int, dict] = {i: {"objects": [], "meta": {}} for i in range(1, 5)}
         self.last_scan = {
             "front": {"raw_points": 0, "keyframe": False, "stamp": 0},
             "rear": {"raw_points": 0, "keyframe": False, "stamp": 0},
         }
-
+        self.pending_poi: dict | None = None
+        self.pending_poi_queue: list[dict] = []
         self.poi_nodes: list[Poi] = []
         self.poi_seed = 1
         self.selected_poi_ids: set[str] = set()
-        self.pending_poi: dict | None = None
 
         self.path_segments: list[dict] = []
         self.path_nodes: list[dict] = []
         self.segment_seed = 1
         self.selected_segment_id: str | None = None
-        self.pending_free_point: tuple[float, float] | None = None
+        self.pending_free_point: dict | None = None
         self.path_validation = {"checked": False, "ok": None, "invalid_ids": set(), "message": ""}
 
         self.scan = {
@@ -146,52 +650,193 @@ class DesktopClient:
             "last_saved_file": "",
             "saved_point_count": 0,
         }
-
-        self.edit = {"tool": "view", "pending_obstacle_start": None, "erasing": False, "loaded_from_stcm": False, "loaded_map_name": ""}
-        self.view = {"scale": 25.0, "pan_x": 0.0, "pan_y": 0.0, "dragging": False, "last_xy": (0, 0)}
+        self.edit = {
+            "tool": "view",
+            "pending_obstacle_start": None,
+            "erasing": False,
+            "loaded_from_stcm": False,
+            "loaded_map_name": "",
+        }
+        self.view = {"scale": 25.0, "pan_x": 0.0, "pan_y": 0.0, "dragging": False, "moved": False, "last_xy": (0, 0)}
+        self.keys_down: set[str] = set()
+        self.drive_loop_scheduled = False
+        self.last_message_at_ms = 0
+        self.last_health_poll_at = 0.0
+        self.health: dict = {}
         self.stcm_summary: dict = {}
+        self.inspector = {"file": "", "manifest": None, "points": [], "pgm": "", "yaml": "", "json": "", "meta": {}}
+        self.text_cache: dict[int, str] = {}
+        self.responsive_rows: list[dict] = []
 
         self.server_var = tk.StringVar(value="ws://127.0.0.1:8080/ws/stream")
         self.conn_var = tk.StringVar(value="Disconnected")
-        self.status_var = tk.StringVar(value="WS offline")
-        self.scan_state_var = tk.StringVar(value="Idle")
-        self.keyboard_var = tk.StringVar(value="Keyboard inactive")
+        self.status_var = tk.StringVar(value=self.tr("ws_offline"))
+        self.status_detail_var = tk.StringVar(value=self.tr("no_health"))
+        self.scan_state_var = tk.StringVar(value=self.tr("idle"))
+        self.keyboard_var = tk.StringVar(value=self.tr("keyboard_inactive"))
+        self.camera_refresh_var = tk.StringVar(value="No buffered frame")
         self.map_name_var = tk.StringVar(value="desktop_map")
+        self.map_notes_var = tk.StringVar(value="Desktop scan session")
         self.voxel_var = tk.StringVar(value="0.12")
         self.poi_name_var = tk.StringVar()
         self.poi_geo_var = tk.StringVar()
-        self.path_mode_var = tk.StringVar(value="poi")
+        self.poi_mode_var = tk.StringVar(value="batch")
+        self.poi_mode_display_var = tk.StringVar()
+        self.single_poi_name_var = tk.StringVar()
+        self.single_poi_x_var = tk.StringVar(value="0.0")
+        self.single_poi_y_var = tk.StringVar(value="0.0")
+        self.single_poi_yaw_var = tk.StringVar(value="0.0")
+        self.single_poi_geo_var = tk.StringVar()
+        self.edit_poi_name_var = tk.StringVar()
+        self.edit_poi_x_var = tk.StringVar()
+        self.edit_poi_y_var = tk.StringVar()
+        self.edit_poi_yaw_var = tk.StringVar()
+        self.edit_poi_geo_var = tk.StringVar()
+        self.path_mode_var = tk.StringVar(value="idle")
+        self.path_mode_display_var = tk.StringVar()
         self.path_start_var = tk.StringVar()
         self.path_end_var = tk.StringVar()
+        self.path_clearance_var = tk.StringVar(value="0.30")
         self.edit_tool_var = tk.StringVar(value="view")
+        self.edit_tool_display_var = tk.StringVar()
         self.brush_var = tk.StringVar(value="0.25")
         self.path_status_var = tk.StringVar(value="No path segments yet")
-        self.poi_status_var = tk.StringVar(value="POI idle")
-        self.map_badge_var = tk.StringVar(value="Scan Session")
-        self.tool_badge_var = tk.StringVar(value="Tool: View / Select")
+        self.poi_status_var = tk.StringVar(value=self.tr("poi_idle"))
+        self.map_badge_var = tk.StringVar(value=self.tr("scan_session"))
+        self.tool_badge_var = tk.StringVar(value=self.tr("tool_view"))
         self.stats_badge_var = tk.StringVar(value="0 obstacle cells")
-        self.map_edit_status_var = tk.StringVar(value="View / Select mode active. Load a STCM file to start second-stage map editing.")
+        self.map_edit_status_var = tk.StringVar(value=self.tr("loaded_map_edit"))
+        self.left_layout_notice_var = tk.StringVar(value="")
         self.view_metrics_var = tk.StringVar(value="Pan 0.00, 0.00 | Zoom 25.0 px/m")
         self.show_path_var = tk.BooleanVar(value=True)
         self.show_poi_var = tk.BooleanVar(value=True)
         self.show_robot_var = tk.BooleanVar(value=True)
+        self.show_move_card_var = tk.BooleanVar(value=True)
+        self.show_poi_card_var = tk.BooleanVar(value=True)
+        self.show_path_card_var = tk.BooleanVar(value=True)
+        self.show_map_card_var = tk.BooleanVar(value=True)
         self.forward_var = tk.StringVar(value="0.8")
         self.reverse_var = tk.StringVar(value="0.5")
         self.turn_var = tk.StringVar(value="1.0")
         self.duration_var = tk.StringVar(value="0.15")
+        self.repeat_ms_var = tk.StringVar(value="120")
+        self.stop_on_keyup_var = tk.BooleanVar(value=True)
+
+        self.stream_health = {
+            "msg_total": 0,
+            "checksum_err": 0,
+            "checksum_skipped": 0,
+            "stale_ts_err": 0,
+            "gap_err": 0,
+            "retries_http": 0,
+            "last_lag_ms": 0,
+            "last_api_error": "",
+            "last_seq": {},
+        }
 
         self._style()
         self._ui()
+        self.refresh_language_state()
         self.root.bind("<KeyPress>", self.on_key_press)
+        self.root.bind("<KeyRelease>", self.on_key_release)
         self.root.bind("<MouseWheel>", self.on_mousewheel)
+        self.root.bind("<Button-4>", self.on_mousewheel)
+        self.root.bind("<Button-5>", self.on_mousewheel)
+        self.root.bind("<Button-1>", self.on_root_click, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.tick()
+
+    def setup_logging(self) -> str:
+        log_candidates = compute_log_candidates(
+            platform_name=sys.platform,
+            env=dict(os.environ),
+            home_dir=Path.home(),
+            runtime_dir=runtime_base_dir(),
+            temp_dir=Path(tempfile.gettempdir()),
+            cwd=Path.cwd(),
+        )
+        log_path = resolve_log_file_path(log_candidates)
+        bootstrap_log_write(log_path, "desktop client startup")
+        logger = logging.getLogger("autodrive.client_desktop")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        existing_paths = {
+            getattr(handler, "baseFilename", "")
+            for handler in logger.handlers
+            if isinstance(handler, RotatingFileHandler)
+        }
+        if str(log_path) not in existing_paths:
+            handler = RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+            logger.addHandler(handler)
+        logger.info("desktop client startup")
+        return str(log_path)
+
+    def report_callback_exception(self, exc_type, exc_value, exc_traceback) -> None:
+        details = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        bootstrap_log_write(Path(self.log_path), f"tk callback exception\n{details}")
+        self.logger.error("tk callback exception\n%s", details)
+        try:
+            messagebox.showerror("Runtime Error", f"{exc_value}\n\nSee log:\n{self.log_path}")
+        except Exception:
+            pass
+
+    def tr(self, key: str, **kwargs) -> str:
+        text = self.i18n[self.current_lang].get(key, key)
+        return text.format(**kwargs) if kwargs else text
+
+    def on_language_change(self, _event=None) -> None:
+        selection = self.lang_choice_var.get()
+        self.current_lang = "zh" if selection == self.i18n["en"]["chinese"] else "en"
+        self.logger.info("language changed lang=%s", self.current_lang)
+        self.rebuild_ui()
+
+    def rebuild_ui(self) -> None:
+        for child in self.root.winfo_children():
+            child.destroy()
+        self.responsive_rows = []
+        self.root.title(self.tr("title"))
+        self._ui()
+        self.refresh_language_state()
+
+    def refresh_language_state(self) -> None:
+        self.poi_mode_display_var.set(self.tr(self.poi_mode_var.get()))
+        self.path_mode_display_var.set(self.tr(self.path_mode_var.get()))
+        self.edit_tool_display_var.set(
+            self.tr(
+                safe_mode_translation_key(
+                    self.edit_tool_var.get(),
+                    {"view": "tool_view_select", "erase": "tool_erase_noise", "obstacle": "tool_draw_obstacle"},
+                    "tool_view_select",
+                )
+            )
+        )
+        self.status_var.set(self.tr("ws_offline") if not (self.bridge and self.bridge.connected) else self.status_var.get())
+        if not self.poi_status_var.get():
+            self.poi_status_var.set(self.tr("poi_idle"))
+        self.sync_scan_badges()
+        self.sync_path_panel()
+        self.update_left_panel_notice()
+
+    def sync_mode_from_display(self, kind: str) -> None:
+        if kind == "poi":
+            reverse = {self.tr("batch"): "batch", self.tr("single"): "single", self.tr("edit"): "edit"}
+            self.poi_mode_var.set(reverse.get(self.poi_mode_display_var.get(), "batch"))
+            self.sync_poi_mode_ui()
+        elif kind == "path":
+            reverse = {self.tr("path_browse_only"): "idle", self.tr("poi"): "poi", self.tr("free_points"): "free"}
+            self.path_mode_var.set(reverse.get(self.path_mode_display_var.get(), "idle"))
+            self.sync_path_panel()
+        elif kind == "edit":
+            reverse = {self.tr("tool_view_select"): "view", self.tr("tool_erase_noise"): "erase", self.tr("tool_draw_obstacle"): "obstacle"}
+            self.edit_tool_var.set(reverse.get(self.edit_tool_display_var.get(), "view"))
+            self.edit_tool_changed()
 
     def _style(self) -> None:
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("TLabel", font=("Segoe UI", 11))
-        style.configure("TButton", font=("Segoe UI", 11))
+        style.configure("TButton", font=("Segoe UI", 10))
         style.configure("Header.TLabel", font=("Segoe UI", 24, "bold"))
         style.configure("Muted.TLabel", foreground="#5c6f7a", font=("Segoe UI", 10))
 
@@ -201,118 +846,238 @@ class DesktopClient:
 
         header = ttk.Frame(shell)
         header.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(header, text="AutoDrive Desktop Map Tool", style="Header.TLabel").pack(side=tk.LEFT)
-        ttk.Label(header, text="Native desktop rewrite of the browser client", style="Muted.TLabel").pack(side=tk.LEFT, padx=12, pady=8)
+        ttk.Label(header, text=self.tr("title"), style="Header.TLabel").pack(side=tk.LEFT)
 
         top = ttk.Frame(shell, padding=8)
         top.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(top, text="Server WS").pack(side=tk.LEFT)
+        ttk.Label(top, text=self.tr("server_ws")).pack(side=tk.LEFT)
         ttk.Entry(top, textvariable=self.server_var, width=42).pack(side=tk.LEFT, padx=6)
-        ttk.Button(top, text="Connect", command=self.connect).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="Disconnect", command=self.disconnect).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text=self.tr("connect"), command=self.connect).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text=self.tr("disconnect"), command=self.disconnect).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text=self.tr("refresh_cameras"), command=self.refresh_camera_snapshot).pack(side=tk.LEFT, padx=4)
+        ttk.Label(top, text=self.tr("language")).pack(side=tk.LEFT, padx=(12, 4))
+        lang_box = ttk.Combobox(top, textvariable=self.lang_choice_var, state="readonly", width=10, values=[self.tr("english"), self.tr("chinese")])
+        lang_box.pack(side=tk.LEFT, padx=(0, 8))
+        lang_box.bind("<<ComboboxSelected>>", self.on_language_change)
         ttk.Label(top, textvariable=self.conn_var).pack(side=tk.LEFT, padx=(14, 4))
-        ttk.Label(top, textvariable=self.status_var, style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Label(top, textvariable=self.status_var, style="Muted.TLabel").pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(top, textvariable=self.status_detail_var, style="Muted.TLabel").pack(side=tk.LEFT)
 
         paned = ttk.Panedwindow(shell, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
         left = ttk.Frame(paned)
         center = ttk.Frame(paned)
         right = ttk.Frame(paned)
-        paned.add(left, weight=2)
-        paned.add(center, weight=5)
+        paned.add(left, weight=1)
+        paned.add(center, weight=9)
         paned.add(right, weight=2)
 
         self._left(left)
         self._center(center)
         self._right(right)
+        self.sync_visibility_cards()
 
     def _left(self, parent: ttk.Frame) -> None:
-        self.scan_text = self._card_text(parent, "Odom And Scan", 16)
-        self._scan_controls(parent)
-        self._move_controls(parent)
-        self._poi_controls(parent)
-        self._path_controls(parent)
+        shell = ttk.Frame(parent)
+        shell.pack(fill=tk.BOTH, expand=True)
+        self.left_canvas = tk.Canvas(shell, highlightthickness=0, borderwidth=0)
+        self.left_scrollbar = ttk.Scrollbar(shell, orient=tk.VERTICAL, command=self.left_canvas.yview)
+        self.left_canvas.configure(yscrollcommand=self.left_scrollbar.set)
+        self.left_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-    def _scan_controls(self, parent: ttk.Frame) -> None:
-        card = ttk.LabelFrame(parent, text="Scan", padding=8)
+        self.left_panel = ttk.Frame(self.left_canvas)
+        self.left_window_id = self.left_canvas.create_window((0, 0), window=self.left_panel, anchor="nw")
+        self.left_panel.bind("<Configure>", self.on_left_panel_configure)
+        self.left_canvas.bind("<Configure>", self.on_left_canvas_configure)
+        self.left_canvas.bind_all("<MouseWheel>", self.on_left_mousewheel)
+
+        self._visibility_controls(self.left_panel)
+        ttk.Label(self.left_panel, textvariable=self.left_layout_notice_var, style="Muted.TLabel", wraplength=320).pack(fill=tk.X, pady=(0, 8))
+        self.scan_card = self._scan_controls(self.left_panel)
+        self.move_card = self._move_controls(self.left_panel)
+        self.poi_card = self._poi_controls(self.left_panel)
+        self.path_card = self._path_controls(self.left_panel)
+        self.map_card = self._map_controls(self.left_panel)
+        parent.bind("<Configure>", lambda _e: self.root.after_idle(self.update_left_panel_notice))
+
+    def _visibility_controls(self, parent: ttk.Frame) -> None:
+        card = ttk.LabelFrame(parent, text=self.tr("panel_visibility"), padding=8)
+        card.pack(fill=tk.X, pady=(0, 10))
+        for index, (text, var) in enumerate([
+            (self.tr("move"), self.show_move_card_var),
+            (self.tr("poi"), self.show_poi_card_var),
+            (self.tr("path"), self.show_path_card_var),
+            (self.tr("map"), self.show_map_card_var),
+        ]):
+            ttk.Checkbutton(card, text=text, variable=var, command=self.sync_visibility_cards).grid(row=index // 2, column=index % 2, sticky="w", padx=6, pady=2)
+
+    def _scan_controls(self, parent: ttk.Frame) -> ttk.LabelFrame:
+        card = ttk.LabelFrame(parent, text=self.tr("scan"), padding=8)
         card.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(card, textvariable=self.scan_state_var).pack(anchor=tk.W, pady=(0, 6))
-        row = ttk.Frame(card)
-        row.pack(fill=tk.X, pady=(0, 6))
-        ttk.Button(row, text="Start Scan", command=self.start_scan).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(row, text="Stop Scan", command=self.stop_scan).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row, text="Clear", command=self.clear_scan).pack(side=tk.LEFT, padx=4)
-        self._entry(card, "Map Name", self.map_name_var)
-        self._entry(card, "Voxel", self.voxel_var)
-        row2 = ttk.Frame(card)
-        row2.pack(fill=tk.X, pady=(6, 0))
-        ttk.Button(row2, text="Save STCM", command=self.save_stcm).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(row2, text="Load STCM", command=self.load_stcm).pack(side=tk.LEFT, padx=4)
+        scan_row, _ = self._responsive_button_row(
+            card,
+            [
+                (self.tr("start_scan"), self.start_scan),
+                (self.tr("stop_scan"), self.stop_scan),
+                (self.tr("clear"), self.clear_scan),
+            ],
+        )
+        scan_row.pack(fill=tk.X, pady=(0, 6))
+        self._entry(card, self.tr("map_name"), self.map_name_var)
+        self._entry(card, self.tr("voxel"), self.voxel_var)
+        self._entry(card, self.tr("notes"), self.map_notes_var)
+        return card
 
-    def _move_controls(self, parent: ttk.Frame) -> None:
-        card = ttk.LabelFrame(parent, text="Move", padding=8)
+    def _move_controls(self, parent: ttk.Frame) -> ttk.LabelFrame:
+        card = ttk.LabelFrame(parent, text=self.tr("move"), padding=8)
         card.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(card, textvariable=self.keyboard_var).pack(anchor=tk.W, pady=(0, 6))
-        self._entry(card, "Forward Speed", self.forward_var)
-        self._entry(card, "Reverse Speed", self.reverse_var)
-        self._entry(card, "Turn Rate", self.turn_var)
-        self._entry(card, "Cmd Duration", self.duration_var)
-        row = ttk.Frame(card)
-        row.pack(fill=tk.X, pady=(6, 0))
-        for name in ("Forward", "Left", "Stop", "Right", "Reverse"):
-            ttk.Button(row, text=name, command=lambda n=name: self.move_click(n.lower())).pack(side=tk.LEFT, padx=3)
+        self._entry(card, self.tr("forward_speed"), self.forward_var)
+        self._entry(card, self.tr("reverse_speed"), self.reverse_var)
+        self._entry(card, self.tr("turn_rate"), self.turn_var)
+        self._entry(card, self.tr("cmd_duration"), self.duration_var)
+        self._entry(card, self.tr("repeat_ms"), self.repeat_ms_var)
+        ttk.Checkbutton(card, text=self.tr("stop_on_keyup"), variable=self.stop_on_keyup_var).pack(anchor=tk.W, pady=(4, 6))
+        move_row, _ = self._responsive_button_row(
+            card,
+            [(self.tr(name.lower()), lambda n=name: self.move_click(n.lower())) for name in ("Forward", "Left", "Stop", "Right", "Reverse")],
+        )
+        move_row.pack(fill=tk.X, pady=(6, 0))
+        return card
 
-    def _poi_controls(self, parent: ttk.Frame) -> None:
-        card = ttk.LabelFrame(parent, text="POI", padding=8)
+    def _poi_controls(self, parent: ttk.Frame) -> ttk.LabelFrame:
+        card = ttk.LabelFrame(parent, text=self.tr("poi"), padding=8)
         card.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        self._entry(card, "POI Name", self.poi_name_var)
-        self._entry(card, "Manual Geo (lon,lat)", self.poi_geo_var)
-        ttk.Label(card, textvariable=self.poi_status_var, style="Muted.TLabel", wraplength=320).pack(anchor=tk.W, pady=(0, 6))
+        mode_row = ttk.Frame(card)
+        mode_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(mode_row, text=self.tr("mode")).pack(side=tk.LEFT)
+        mode_box = ttk.Combobox(mode_row, textvariable=self.poi_mode_display_var, state="readonly", width=18, values=[self.tr("batch"), self.tr("single"), self.tr("edit")])
+        mode_box.pack(side=tk.LEFT, padx=6)
+        mode_box.bind("<<ComboboxSelected>>", lambda _e: self.sync_mode_from_display("poi"))
+        ttk.Label(card, textvariable=self.poi_status_var, style="Muted.TLabel", wraplength=340).pack(anchor=tk.W, pady=(0, 6))
+        self.poi_inputs_frame = ttk.Frame(card)
+        self.poi_inputs_frame.pack(fill=tk.X, pady=(0, 8))
+        self.batch_poi_frame = ttk.Frame(self.poi_inputs_frame)
+        self.batch_poi_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(self.batch_poi_frame, text=self.tr("batch_input_hint"), style="Muted.TLabel", wraplength=340, justify=tk.LEFT).pack(anchor=tk.W)
+        ttk.Label(self.batch_poi_frame, text=self.tr("batch_examples"), style="Muted.TLabel", wraplength=340, justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 4))
+        self.poi_batch_text = tk.Text(self.batch_poi_frame, height=4, bg="#ffffff", fg="#14232d", relief=tk.FLAT, font=("Consolas", 10))
+        self.poi_batch_text.pack(fill=tk.X, pady=(0, 6))
+        self.batch_action_btn = ttk.Button(self.batch_poi_frame, text=self.tr("start_batch_add"), command=self.toggle_add_poi)
+        self.batch_action_btn.pack(anchor=tk.W)
+
+        self.single_poi_frame = ttk.Frame(self.poi_inputs_frame)
+        self._entry(self.single_poi_frame, self.tr("name"), self.single_poi_name_var)
+        self._entry(self.single_poi_frame, self.tr("x"), self.single_poi_x_var)
+        self._entry(self.single_poi_frame, self.tr("y"), self.single_poi_y_var)
+        self._entry(self.single_poi_frame, self.tr("yaw"), self.single_poi_yaw_var)
+        self._entry(self.single_poi_frame, self.tr("geo"), self.single_poi_geo_var)
+        ttk.Button(self.single_poi_frame, text=self.tr("add_single_poi"), command=self.add_single_poi).pack(anchor=tk.W)
+
+        self.edit_poi_frame = ttk.Frame(self.poi_inputs_frame)
+        ttk.Label(self.edit_poi_frame, text=self.tr("edit_hint"), style="Muted.TLabel", wraplength=320).pack(anchor=tk.W, pady=(0, 4))
+        self._entry(self.edit_poi_frame, self.tr("name"), self.edit_poi_name_var)
+        self._entry(self.edit_poi_frame, self.tr("x"), self.edit_poi_x_var)
+        self._entry(self.edit_poi_frame, self.tr("y"), self.edit_poi_y_var)
+        self._entry(self.edit_poi_frame, self.tr("yaw"), self.edit_poi_yaw_var)
+        self._entry(self.edit_poi_frame, self.tr("geo"), self.edit_poi_geo_var)
+        ttk.Button(self.edit_poi_frame, text=self.tr("apply_edit"), command=self.apply_poi_edit).pack(anchor=tk.W)
+
         row = ttk.Frame(card)
         row.pack(fill=tk.X, pady=(0, 6))
-        ttk.Button(row, text="Add POI", command=self.toggle_add_poi).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(row, text="Delete Selected", command=self.delete_selected_poi).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row, text="Apply Geo", command=self.apply_selected_geo).pack(side=tk.LEFT, padx=4)
-        self.poi_box = tk.Listbox(card, height=10, bg="#ffffff", fg="#14232d", selectbackground="#0c7c78", font=("Segoe UI", 11))
+        _, poi_buttons = self._responsive_button_row(
+            row,
+            [
+                (self.tr("delete_selected"), self.delete_selected_poi),
+                (self.tr("copy_poi"), self.copy_poi_text),
+            ],
+            min_button_width=140,
+        )
+        _.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Checkbutton(row, text=self.tr("show_poi"), variable=self.show_poi_var).pack(side=tk.RIGHT, padx=4)
+        ttk.Label(card, text=self.tr("poi_list"), style="Muted.TLabel").pack(anchor=tk.W, pady=(2, 4))
+        self.poi_box = tk.Listbox(card, height=10, bg="#ffffff", fg="#14232d", selectbackground="#0c7c78", font=("Segoe UI", 11), selectmode=tk.EXTENDED, exportselection=False)
         self.poi_box.pack(fill=tk.BOTH, expand=True)
         self.poi_box.bind("<<ListboxSelect>>", lambda _e: self.sync_selected_poi())
+        self.sync_poi_mode_ui()
+        return card
 
-    def _path_controls(self, parent: ttk.Frame) -> None:
-        card = ttk.LabelFrame(parent, text="Path", padding=8)
+    def _path_controls(self, parent: ttk.Frame) -> ttk.LabelFrame:
+        card = ttk.LabelFrame(parent, text=self.tr("path"), padding=8)
         card.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(card, text="Path supports auto loop, POI-name connect, any-point connect, delete, and closed-loop validation.", style="Muted.TLabel", wraplength=320).pack(anchor=tk.W, pady=(0, 6))
+        ttk.Label(card, text=self.tr("path_hint"), style="Muted.TLabel", wraplength=340).pack(anchor=tk.W, pady=(0, 6))
         row = ttk.Frame(card)
         row.pack(fill=tk.X)
-        ttk.Label(row, text="Path Tool").pack(side=tk.LEFT)
-        mode_box = ttk.Combobox(row, textvariable=self.path_mode_var, state="readonly", width=18, values=["poi", "free"])
+        ttk.Label(row, text=self.tr("path_tool")).pack(side=tk.LEFT)
+        mode_box = ttk.Combobox(row, textvariable=self.path_mode_display_var, state="readonly", width=18, values=[self.tr("path_browse_only"), self.tr("poi"), self.tr("free_points")])
         mode_box.pack(side=tk.LEFT, padx=6)
-        mode_box.bind("<<ComboboxSelected>>", lambda _e: self.sync_path_panel())
-        self._entry(card, "Start POI Name", self.path_start_var)
-        self._entry(card, "End POI Name", self.path_end_var)
-        ttk.Label(card, textvariable=self.path_status_var, style="Muted.TLabel", wraplength=320).pack(anchor=tk.W, pady=(0, 6))
+        mode_box.bind("<<ComboboxSelected>>", lambda _e: self.sync_mode_from_display("path"))
+        ttk.Label(row, text=self.tr("safe_clearance")).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Entry(row, textvariable=self.path_clearance_var, width=8).pack(side=tk.LEFT, padx=6)
+        self._entry(card, self.tr("start_poi_name"), self.path_start_var)
+        self._entry(card, self.tr("end_poi_name"), self.path_end_var)
+        ttk.Label(card, textvariable=self.path_status_var, style="Muted.TLabel", wraplength=340).pack(anchor=tk.W, pady=(0, 6))
         row2 = ttk.Frame(card)
         row2.pack(fill=tk.X, pady=(0, 6))
-        ttk.Button(row2, text="Auto Loop", command=self.auto_loop).pack(side=tk.LEFT, padx=(0, 4))
-        self.connect_named_btn = ttk.Button(row2, text="Connect Named POI", command=self.connect_named_poi)
-        self.connect_named_btn.pack(side=tk.LEFT, padx=4)
-        ttk.Button(row2, text="Closed-Loop Check", command=lambda: self.validate_path(True)).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row2, text="Delete Segment", command=self.delete_selected_segment).pack(side=tk.LEFT, padx=4)
+        path_action_row, path_buttons = self._responsive_button_row(
+            row2,
+            [
+                (self.tr("auto_loop"), self.auto_loop),
+                (self.tr("connect_named_poi"), self.connect_named_poi),
+                (self.tr("clear_selection"), self.clear_selection),
+                (self.tr("closed_loop_check"), lambda: self.validate_path(True)),
+                (self.tr("delete_segment"), self.delete_selected_segment),
+            ],
+            min_button_width=150,
+        )
+        path_action_row.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.connect_named_btn = path_buttons[1]
+        ttk.Checkbutton(row2, text=self.tr("show_path"), variable=self.show_path_var).pack(side=tk.RIGHT, padx=4)
         self.path_box = tk.Listbox(card, height=10, bg="#ffffff", fg="#14232d", selectbackground="#0c7c78", font=("Segoe UI", 11))
         self.path_box.pack(fill=tk.BOTH, expand=True)
         self.path_box.bind("<<ListboxSelect>>", lambda _e: self.sync_selected_segment())
         self.path_start_var.trace_add("write", lambda *_: self.sync_path_panel())
         self.path_end_var.trace_add("write", lambda *_: self.sync_path_panel())
+        return card
+
+    def _map_controls(self, parent: ttk.Frame) -> ttk.LabelFrame:
+        card = ttk.LabelFrame(parent, text=self.tr("map"), padding=8)
+        card.pack(fill=tk.X, pady=(10, 0))
+        row = ttk.Frame(card)
+        row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(row, text=self.tr("map_tool"), width=18).pack(side=tk.LEFT)
+        edit_box = ttk.Combobox(row, textvariable=self.edit_tool_display_var, state="readonly", values=[self.tr("tool_view_select"), self.tr("tool_erase_noise"), self.tr("tool_draw_obstacle")])
+        edit_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        edit_box.bind("<<ComboboxSelected>>", lambda _e: self.sync_mode_from_display("edit"))
+        self._entry(card, self.tr("brush_radius"), self.brush_var)
+        map_action_row, _ = self._responsive_button_row(
+            card,
+            [
+                (self.tr("auto_clear_noise"), self.auto_clear_noise),
+                (self.tr("clear_loaded_map"), self.clear_loaded_map),
+                (self.tr("save_map"), self.save_stcm),
+                (self.tr("load_map"), self.load_stcm),
+                (self.tr("export_pgm"), lambda: self.export_inspector_file("pgm")),
+                (self.tr("export_yaml"), lambda: self.export_inspector_file("yaml")),
+                (self.tr("export_json"), lambda: self.export_inspector_file("json")),
+            ],
+            min_button_width=145,
+        )
+        map_action_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(card, textvariable=self.map_edit_status_var, style="Muted.TLabel", wraplength=340).pack(anchor=tk.W, pady=(6, 0))
+        return card
 
     def _center(self, parent: ttk.Frame) -> None:
-        card = ttk.LabelFrame(parent, text="Map View", padding=8)
+        card = ttk.LabelFrame(parent, text=self.tr("map_view"), padding=8)
         card.pack(fill=tk.BOTH, expand=True)
         row = ttk.Frame(card)
         row.pack(fill=tk.X, pady=(0, 6))
-        ttk.Button(row, text="Center Robot", command=self.center_robot).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(row, text="Reset View", command=self.reset_view).pack(side=tk.LEFT, padx=4)
-        ttk.Checkbutton(row, text="Show Path", variable=self.show_path_var).pack(side=tk.LEFT, padx=8)
-        ttk.Checkbutton(row, text="Show POI", variable=self.show_poi_var).pack(side=tk.LEFT, padx=4)
-        ttk.Checkbutton(row, text="Show Robot", variable=self.show_robot_var).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text=self.tr("center_robot"), command=self.center_robot).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(row, text=self.tr("center_loaded_map"), command=self.center_loaded_map).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text=self.tr("reset_view"), command=self.reset_view).pack(side=tk.LEFT, padx=4)
+        ttk.Checkbutton(row, text=self.tr("show_robot"), variable=self.show_robot_var).pack(side=tk.LEFT, padx=8)
         ttk.Label(row, textvariable=self.view_metrics_var, style="Muted.TLabel").pack(side=tk.RIGHT)
         badges = ttk.Frame(card)
         badges.pack(fill=tk.X, pady=(0, 6))
@@ -324,21 +1089,11 @@ class DesktopClient:
         self.canvas.bind("<ButtonPress-1>", self.canvas_press)
         self.canvas.bind("<B1-Motion>", self.canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.canvas_release)
-        map_row = ttk.Frame(card)
-        map_row.pack(fill=tk.X, pady=(6, 0))
-        ttk.Label(map_row, text="Map").pack(side=tk.LEFT)
-        edit_box = ttk.Combobox(map_row, textvariable=self.edit_tool_var, state="readonly", width=18, values=["view", "erase", "obstacle"])
-        edit_box.pack(side=tk.LEFT, padx=6)
-        edit_box.bind("<<ComboboxSelected>>", lambda _e: self.edit_tool_changed())
-        ttk.Label(map_row, text="Brush Radius").pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Entry(map_row, textvariable=self.brush_var, width=8).pack(side=tk.LEFT, padx=6)
-        ttk.Button(map_row, text="Auto Clear Noise", command=self.auto_clear_noise).pack(side=tk.LEFT, padx=4)
-        ttk.Button(map_row, text="Clear Loaded Map", command=self.clear_loaded_map).pack(side=tk.LEFT, padx=4)
-        ttk.Label(map_row, textvariable=self.map_edit_status_var, style="Muted.TLabel").pack(side=tk.LEFT, padx=(12, 0))
 
     def _right(self, parent: ttk.Frame) -> None:
-        self.camera_text = self._card_text(parent, "Cameras", 18)
-        self.comm_text = self._card_text(parent, "Communication / STCM", 18)
+        self.scan_text = self._card_text(parent, self.tr("odom_scan"), 8)
+        self.camera_text = self._card_text(parent, self.tr("cameras"), 14)
+        self.comm_text = self._card_text(parent, self.tr("comm_map"), 12)
 
     def _card_text(self, parent: ttk.Frame, title: str, height: int) -> tk.Text:
         card = ttk.LabelFrame(parent, text=title, padding=8)
@@ -353,36 +1108,224 @@ class DesktopClient:
         ttk.Label(row, text=label, width=18).pack(side=tk.LEFT)
         ttk.Entry(row, textvariable=var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
 
+    def _responsive_button_row(self, parent: ttk.Frame, buttons: list[tuple[str, object]], min_button_width: int = 120) -> tuple[ttk.Frame, list[ttk.Button]]:
+        frame = ttk.Frame(parent)
+        created: list[ttk.Button] = []
+        for text, command in buttons:
+            btn = ttk.Button(frame, text=text, command=command)
+            created.append(btn)
+        row_spec = {"frame": frame, "buttons": created, "min_width": min_button_width}
+        self.responsive_rows.append(row_spec)
+        frame.bind("<Configure>", lambda _e, spec=row_spec: self.layout_responsive_row(spec))
+        self.root.after_idle(lambda spec=row_spec: self.layout_responsive_row(spec))
+        return frame, created
+
+    def layout_responsive_row(self, spec: dict) -> None:
+        frame = spec["frame"]
+        buttons = spec["buttons"]
+        min_width = spec["min_width"]
+        width = max(frame.winfo_width(), 1)
+        columns = max(1, min(len(buttons), width // min_width))
+        for index, button in enumerate(buttons):
+            button.grid_forget()
+            row = index // columns
+            col = index % columns
+            button.grid(row=row, column=col, sticky="ew", padx=3, pady=3)
+        for col in range(columns):
+            frame.grid_columnconfigure(col, weight=1)
+        for col in range(columns, len(buttons)):
+            frame.grid_columnconfigure(col, weight=0)
+
+    def update_left_panel_notice(self) -> None:
+        if not hasattr(self, "left_panel"):
+            return
+        available = self.left_canvas.winfo_height() if hasattr(self, "left_canvas") else self.left_panel.winfo_height()
+        required = self.left_panel.winfo_reqheight()
+        needs_scroll = available > 0 and required > available + 4
+        if needs_scroll:
+            self.left_layout_notice_var.set(self.tr("left_notice"))
+        else:
+            self.left_layout_notice_var.set("")
+
+    def on_left_panel_configure(self, _event=None) -> None:
+        if not hasattr(self, "left_canvas"):
+            return
+        self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all"))
+        self.root.after_idle(self.update_left_panel_notice)
+
+    def on_left_canvas_configure(self, event) -> None:
+        if not hasattr(self, "left_canvas"):
+            return
+        self.left_canvas.itemconfigure(self.left_window_id, width=event.width)
+        self.root.after_idle(self.update_left_panel_notice)
+
+    def on_left_mousewheel(self, event) -> None:
+        if not hasattr(self, "left_canvas"):
+            return
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        if widget is None:
+            return
+        current = widget
+        while current is not None:
+            if current == self.left_canvas or current == self.left_panel:
+                self.left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                return
+            current = current.master
+
+    def number(self, var: tk.StringVar, fallback: float) -> float:
+        try:
+            return float(var.get().strip())
+        except Exception:
+            return fallback
+
+    def sync_visibility_cards(self) -> None:
+        order = [
+            (self.scan_card, True, tk.X, False),
+            (self.move_card, self.show_move_card_var.get(), tk.X, False),
+            (self.poi_card, self.show_poi_card_var.get(), tk.BOTH, True),
+            (self.path_card, self.show_path_card_var.get(), tk.BOTH, True),
+            (self.map_card, self.show_map_card_var.get(), tk.X, False),
+        ]
+        for frame, visible, fill_mode, expand in order:
+            if frame.winfo_manager():
+                frame.pack_forget()
+            if visible:
+                pady = (10, 0) if frame is self.map_card else (0, 10)
+                frame.pack(fill=fill_mode, expand=expand, pady=pady)
+        self.root.after_idle(self.update_left_panel_notice)
+
+    def sync_poi_mode_ui(self) -> None:
+        mode = self.poi_mode_var.get()
+        for frame in (self.batch_poi_frame, self.single_poi_frame, self.edit_poi_frame):
+            if frame.winfo_manager():
+                frame.pack_forget()
+        target = {
+            "batch": self.batch_poi_frame,
+            "single": self.single_poi_frame,
+            "edit": self.edit_poi_frame,
+        }[mode]
+        target.pack(fill=tk.X, pady=(0, 6))
+        self.batch_action_btn.configure(text=self.tr("start_batch_add") if self.pending_poi is None and not self.pending_poi_queue else self.tr("cancel_batch", count=len(self.pending_poi_queue) + (1 if self.pending_poi else 0)))
+
     def connect(self) -> None:
-        self.disconnect()
-        self.bridge = ServerBridge(self.server_var.get().strip())
-        self.bridge.start()
-        self.conn_var.set("Connecting")
+        try:
+            self.disconnect()
+            raw_url = self.server_var.get().strip()
+            normalized_url = normalize_server_ws_url(raw_url)
+            self.server_var.set(normalized_url)
+            self.logger.info("connect clicked ws_url=%s", normalized_url)
+            if not normalized_url:
+                raise ValueError("server address is empty")
+            self.bridge = ServerBridge(normalized_url, logger=self.logger)
+            health = self.bridge.get("/health")
+            self.health = health
+            self.status_detail_var.set(
+                self.tr(
+                    "status_detail",
+                    clients=health.get("ws_clients", "n/a"),
+                    scan="on" if health.get("scan_active") else "off",
+                    ros="enabled" if health.get("ros_enabled") else "detected only",
+                )
+            )
+            self.logger.info("connect preflight ok ws_clients=%s", health.get("ws_clients"))
+            self.bridge.start()
+            self.conn_var.set(self.tr("connecting"))
+        except Exception as exc:
+            self.stream_health["last_api_error"] = str(exc)
+            self.logger.exception("connect preflight failed")
+            messagebox.showerror(self.tr("api_error"), f"Connect preflight failed:\n{exc}")
+            self.bridge = None
+            self.conn_var.set(self.tr("disconnected"))
+            self.status_var.set(self.tr("ws_offline"))
+            self.status_detail_var.set(str(exc))
 
     def disconnect(self) -> None:
+        self.logger.info("disconnect clicked")
         if self.bridge:
             self.bridge.stop()
         self.bridge = None
-        self.conn_var.set("Disconnected")
-        self.status_var.set("WS offline")
+        self.conn_var.set(self.tr("disconnected"))
+        self.status_var.set(self.tr("ws_offline"))
+        self.status_detail_var.set(self.tr("disconnected"))
 
     def call_api(self, path: str, body: dict) -> dict | None:
         if not self.bridge:
-            messagebox.showwarning("Disconnected", "Connect to the server first.")
+            messagebox.showwarning(self.tr("disconnected"), self.tr("warning_disconnected"))
             return None
         try:
+            self.stream_health["last_api_error"] = ""
             return self.bridge.post(path, body)
         except Exception as exc:
-            messagebox.showerror("API Error", str(exc))
+            self.stream_health["retries_http"] += 1
+            self.stream_health["last_api_error"] = str(exc)
+            self.logger.exception("call_api failed path=%s", path)
+            messagebox.showerror(self.tr("api_error"), str(exc))
             return None
+
+    def poll_health(self) -> None:
+        now = time.monotonic()
+        if now - self.last_health_poll_at < 5.0 or not self.bridge:
+            return
+        self.last_health_poll_at = now
+        try:
+            self.health = self.bridge.get("/health")
+            self.status_detail_var.set(
+                self.tr(
+                    "status_detail",
+                    clients=self.health.get("ws_clients", "n/a"),
+                    scan="on" if self.health.get("scan_active") else "off",
+                    ros="enabled" if self.health.get("ros_enabled") else "detected only",
+                )
+            )
+        except Exception as exc:
+            self.stream_health["last_api_error"] = str(exc)
+            self.logger.warning("health poll failed err=%s", exc)
 
     def tick(self) -> None:
         self.consume_messages()
+        self.poll_health()
         self.render_canvas()
         self.render_text_panels()
-        self.conn_var.set("Connected" if self.bridge and self.bridge.connected else "Disconnected")
-        self.status_var.set(f"WS {'ok' if self.bridge and self.bridge.connected else 'offline'} | scan {'on' if self.scan['active'] else 'off'} | poi {len(self.poi_nodes)} | path {len(self.path_segments)}")
+        self.conn_var.set(self.tr("connected") if self.bridge and self.bridge.connected else self.tr("disconnected"))
+        self.status_var.set(
+            self.tr(
+                "status_line",
+                ws="ok" if self.bridge and self.bridge.connected else "offline",
+                scan="on" if self.scan["active"] else "off",
+                poi=len(self.poi_nodes),
+                path=len(self.path_segments),
+            )
+        )
         self.root.after(60, self.tick)
+
+    def validate_message(self, msg: dict) -> bool:
+        self.stream_health["msg_total"] += 1
+        stamp = float(msg.get("stamp", 0.0))
+        server_time_ms = int(msg.get("server_time_ms", 0))
+        seq = int(msg.get("seq", 0))
+        topic = str(msg.get("topic", ""))
+        payload = msg.get("payload", {})
+        checksum = msg.get("checksum")
+        if checksum:
+            raw_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            raw = f"{topic}|{stamp:.6f}|{seq}|{raw_payload}".encode("utf-8")
+            digest = hashlib.sha256(raw).hexdigest()
+            if digest != checksum:
+                self.stream_health["checksum_err"] += 1
+                self.logger.warning("checksum mismatch topic=%s seq=%s", topic, seq)
+                return False
+        else:
+            self.stream_health["checksum_skipped"] += 1
+        lag_ms = max(0, int(time.time() * 1000) - server_time_ms) if server_time_ms else 0
+        self.stream_health["last_lag_ms"] = lag_ms
+        if server_time_ms and abs(int(time.time() * 1000) - server_time_ms) > 5000:
+            self.stream_health["stale_ts_err"] += 1
+        last = self.stream_health["last_seq"].get(topic)
+        if last is not None and seq > last + 1:
+            self.stream_health["gap_err"] += seq - last - 1
+        self.stream_health["last_seq"][topic] = seq
+        self.last_message_at_ms = int(time.time() * 1000)
+        return True
 
     def consume_messages(self) -> None:
         if not self.bridge:
@@ -392,6 +1335,8 @@ class DesktopClient:
                 msg = self.bridge.queue.get_nowait()
             except queue.Empty:
                 break
+            if not self.validate_message(msg):
+                continue
             topic = msg.get("topic")
             payload = msg.get("payload", {})
             if topic == "/robot/pose":
@@ -413,14 +1358,10 @@ class DesktopClient:
                 self.last_scan["rear"] = {"raw_points": int(payload.get("raw_points", len(payload.get("points", [])))), "keyframe": bool(payload.get("keyframe")), "stamp": float(msg.get("stamp", 0))}
                 self.accumulate_points(payload.get("points", []), float(msg.get("stamp", 0)), bool(payload.get("keyframe")))
             elif topic and topic.startswith("/camera/"):
-                cam_id = int(topic.split("/")[2])
-                self.camera_data[cam_id] = {"objects": payload.get("objects", []), "meta": {"seq": msg.get("seq"), "stamp": msg.get("stamp")}}
-
-    def number(self, var: tk.StringVar, fallback: float) -> float:
-        try:
-            return float(var.get().strip())
-        except Exception:
-            return fallback
+                cam_id = parse_camera_topic_id(topic)
+                if cam_id is not None and cam_id in self.camera_inbox:
+                    self.camera_inbox[cam_id] = {"objects": payload.get("objects", []), "meta": {"seq": msg.get("seq"), "stamp": msg.get("stamp"), "received_at_ms": int(time.time() * 1000)}}
+        self.camera_refresh_var.set(build_camera_refresh_text(self.camera_inbox))
 
     def start_scan(self) -> None:
         if self.call_api("/scan/start", {}) is not None:
@@ -450,16 +1391,16 @@ class DesktopClient:
         occ = len(self.scan["occupied"])
         free = len(self.scan["free"])
         if self.scan["active"]:
-            self.scan_state_var.set(f"Recording {occ} obstacle cells")
+            self.scan_state_var.set(self.tr("recording_obstacles", count=occ))
         elif occ or free:
-            self.scan_state_var.set(f"Stopped | {occ} obs / {free} safe")
+            self.scan_state_var.set(self.tr("stopped_summary", obs=occ, free=free))
         else:
-            self.scan_state_var.set("Idle")
-        self.map_badge_var.set(f"Loaded: {self.edit['loaded_map_name']}" if self.edit["loaded_from_stcm"] else "Scan Session")
-        tool_map = {"view": "View / Select", "erase": "Erase Noise", "obstacle": "Draw Obstacle"}
+            self.scan_state_var.set(self.tr("idle"))
+        self.map_badge_var.set(self.tr("loaded_badge", name=self.edit["loaded_map_name"]) if self.edit["loaded_from_stcm"] else self.tr("scan_session"))
+        tool_map = {"view": self.tr("tool_view_select"), "erase": self.tr("tool_erase_noise"), "obstacle": self.tr("tool_draw_obstacle")}
         suffix = " | Pick end point" if self.edit["tool"] == "obstacle" and self.edit["pending_obstacle_start"] else ""
-        self.tool_badge_var.set(f"Tool: {tool_map.get(self.edit['tool'], 'View / Select')}{suffix}")
-        self.stats_badge_var.set(f"{occ} obstacle cells | {len(self.poi_nodes)} POI | {len(self.path_segments)} paths")
+        self.tool_badge_var.set(self.tr("tool_badge", name=tool_map.get(self.edit["tool"], self.tr("tool_view_select")), suffix=suffix))
+        self.stats_badge_var.set(self.tr("stats_badge", occ=occ, poi=len(self.poi_nodes), path=len(self.path_segments)))
 
     def cell_key(self, ix: int, iy: int) -> str:
         return f"{ix}:{iy}"
@@ -467,6 +1408,9 @@ class DesktopClient:
     def world_to_cell(self, x: float, y: float) -> tuple[int, int]:
         voxel = float(self.scan["voxel"])
         return round(x / voxel), round(y / voxel)
+
+    def occupied_lookup(self) -> dict[tuple[int, int], dict]:
+        return {(int(cell["ix"]), int(cell["iy"])): cell for cell in self.scan["occupied"].values()}
 
     def mark_free(self, ix: int, iy: int) -> None:
         key = self.cell_key(ix, iy)
@@ -513,6 +1457,9 @@ class DesktopClient:
         self.scan["raw_points"] += len(points)
         robot_ix, robot_iy = self.world_to_cell(float(pose.get("x", 0.0)), float(pose.get("y", 0.0)))
         for point in points:
+            if not isinstance(point, (list, tuple)) or len(point) < 2:
+                self.logger.warning("skip invalid lidar point payload=%s", point)
+                continue
             x, y = float(point[0]), float(point[1])
             intensity = float(point[2]) if len(point) > 2 else 1.0
             ix, iy = self.world_to_cell(x, y)
@@ -537,112 +1484,95 @@ class DesktopClient:
             "free_cells": [{"ix": int(c["ix"]), "iy": int(c["iy"]), "hits": int(c["hits"])} for c in self.scan["free"].values()],
         }
 
-    def save_stcm(self) -> None:
-        self.rebuild_path_nodes()
-        bundle = {
-            "version": "stcm.v2",
-            "notes": json.dumps({"text": "desktop client", "voxelSize": float(self.scan["voxel"]), "loadedFromStcm": self.edit["loaded_from_stcm"], "loadedMapName": self.edit["loaded_map_name"] or None}, ensure_ascii=False, indent=2),
-            "created_at": time.time(),
-            "source": "desktop",
-            "map_source": "stcm_editor" if self.edit["loaded_from_stcm"] else "laser_accumulation",
-            "browser_occupancy": self.browser_occupancy(),
-            "pose": self.pose,
-            "gps": self.gps,
-            "chassis": self.chassis,
-            "poi": [self.poi_payload(poi) for poi in self.poi_nodes],
-            "path": self.path_nodes,
-            "trajectory": [{"id": seg["id"], "source": seg["source"], "geometry": "line", "curveOffset": 0.0, "start": self.path_node(seg["start"]), "end": self.path_node(seg["end"])} for seg in self.path_segments],
-            "gps_track": [],
-            "chassis_track": [],
-            "scan_summary": {"scanActive": self.scan["active"], "obstacleCells": len(self.scan["occupied"]), "safeCells": len(self.scan["free"]), "rawLidarPoints": self.scan["raw_points"], "frontFrames": self.scan["front_frames"], "rearFrames": self.scan["rear_frames"], "voxelSize": float(self.scan["voxel"])},
-            "radar_points": self.occupied_points(),
+    def point_from_poi(self, poi: Poi) -> Point:
+        return Point(x=poi.x, y=poi.y, name=poi.name, yaw=poi.yaw, lat=poi.lat, lon=poi.lon, poi_id=poi.client_id)
+
+    def point_from_dict(self, payload: dict) -> Point:
+        return Point(
+            x=float(payload.get("x", 0.0)),
+            y=float(payload.get("y", 0.0)),
+            name=str(payload.get("name", "")),
+            yaw=float(payload.get("yaw", 0.0) or 0.0),
+            lat=float(payload["lat"]) if payload.get("lat") not in (None, "") else None,
+            lon=float(payload["lon"]) if payload.get("lon") not in (None, "") else None,
+            poi_id=payload.get("poi_id") or payload.get("poiId"),
+        )
+
+    def point_to_payload(self, point: Point) -> dict:
+        return {
+            "x": float(point.x),
+            "y": float(point.y),
+            "name": point.name,
+            "yaw": float(point.yaw),
+            "lat": None if point.lat is None else float(point.lat),
+            "lon": None if point.lon is None else float(point.lon),
+            "poi_id": point.poi_id,
         }
-        target = filedialog.asksaveasfilename(parent=self.root, defaultextension=".stcm", filetypes=[("STCM", "*.stcm")], initialfile=f"{self.map_name_var.get().strip() or 'desktop_map'}.stcm")
-        if not target:
-            return
-        manifest = {k: v for k, v in bundle.items() if k != "radar_points"}
-        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-            zf.writestr("radar_points.bin", b"".join(struct.pack("fff", *point) for point in bundle["radar_points"]))
-        self.scan["last_saved_file"] = target
-        self.scan["saved_point_count"] = len(bundle["radar_points"])
-        self.sync_scan_badges()
-        messagebox.showinfo("Saved", f"Map saved:\n{target}")
-
-    def load_stcm(self) -> None:
-        target = filedialog.askopenfilename(parent=self.root, filetypes=[("STCM", "*.stcm"), ("ZIP", "*.zip")])
-        if not target:
-            return
-        with zipfile.ZipFile(target, "r") as zf:
-            manifest = json.loads(zf.read("manifest.json"))
-            raw = zf.read("radar_points.bin")
-        points = [struct.unpack("fff", raw[i:i + 12]) for i in range(0, len(raw), 12) if i + 12 <= len(raw)]
-        self.apply_stcm(Path(target).name, manifest, points)
-        messagebox.showinfo("Loaded", f"Loaded map:\n{Path(target).name}")
-
-    def apply_stcm(self, file_name: str, manifest: dict, points: list[tuple[float, float, float]]) -> None:
-        self.clear_scan()
-        self.scan["active"] = False
-        occ = manifest.get("browser_occupancy", {})
-        if isinstance(occ, dict) and isinstance(occ.get("occupied_cells"), list):
-            self.scan["voxel"] = max(0.02, float(occ.get("voxel_size", self.number(self.voxel_var, 0.12))))
-            for cell in occ.get("occupied_cells", []):
-                self.mark_occupied(int(cell.get("ix", 0)), int(cell.get("iy", 0)), float(cell.get("intensity", 1.0)), int(cell.get("hits", 3)))
-            for cell in occ.get("free_cells", []):
-                self.scan["free"][self.cell_key(int(cell.get("ix", 0)), int(cell.get("iy", 0)))] = {"ix": int(cell.get("ix", 0)), "iy": int(cell.get("iy", 0)), "hits": int(cell.get("hits", 1))}
-        else:
-            self.scan["voxel"] = max(0.02, self.number(self.voxel_var, 0.12))
-            for point in points:
-                ix, iy = self.world_to_cell(float(point[0]), float(point[1]))
-                self.mark_occupied(ix, iy, float(point[2]), 3)
-        self.poi_nodes = []
-        self.poi_seed = 1
-        for poi in manifest.get("poi", []):
-            self.poi_nodes.append(Poi(client_id=f"poi-{self.poi_seed}", name=str(poi.get("name", f"POI {self.poi_seed}")), x=float(poi.get("x", 0.0)), y=float(poi.get("y", 0.0)), yaw=float(poi.get("yaw", 0.0) or 0.0), lat=float(poi["lat"]) if poi.get("lat") not in (None, "") else None, lon=float(poi["lon"]) if poi.get("lon") not in (None, "") else None))
-            self.poi_seed += 1
-        self.path_segments = []
-        self.segment_seed = 1
-        for seg in manifest.get("trajectory", []):
-            self.path_segments.append({"id": seg.get("id", f"seg-{self.segment_seed}"), "start": self.make_point(seg.get("start", {})), "end": self.make_point(seg.get("end", {})), "source": seg.get("source", "stcm")})
-            self.segment_seed += 1
-        self.edit["loaded_from_stcm"] = True
-        self.edit["loaded_map_name"] = file_name
-        self.stcm_summary = {"file": file_name, "mapSource": manifest.get("map_source", "unknown"), "radarPoints": len(points), "poiCount": len(self.poi_nodes), "pathCount": len(self.path_segments), "hasBrowserOccupancy": bool(occ), "restoredFreeCells": len(occ.get("free_cells", [])) if isinstance(occ, dict) else 0}
-        self.voxel_var.set(f"{float(self.scan['voxel']):.2f}")
-        self.map_name_var.set(file_name.replace(".stcm", ""))
-        self.pending_free_point = None
-        self.selected_segment_id = None
-        self.selected_poi_ids = set()
-        self.sync_poi_box()
-        self.sync_path_panel()
-        self.center_loaded_map()
-        self.sync_scan_badges()
-        self.map_edit_status_var.set(f"Loaded {file_name} into main map view")
-
-    def make_point(self, payload: dict) -> dict:
-        return {"x": float(payload.get("x", 0.0)), "y": float(payload.get("y", 0.0)), "lat": payload.get("lat"), "lon": payload.get("lon"), "poi_id": payload.get("poi_id"), "name": payload.get("name", "")}
 
     def poi_payload(self, poi: Poi) -> dict:
-        return {"name": poi.name, "x": float(poi.x), "y": float(poi.y), "yaw": float(poi.yaw), "lat": float(poi.lat) if poi.lat is not None else None, "lon": float(poi.lon) if poi.lon is not None else None}
+        return self.point_to_payload(self.point_from_poi(poi))
 
-    def path_node(self, node: dict) -> dict:
-        return {"x": float(node["x"]), "y": float(node["y"]), "lat": float(node["lat"]) if node.get("lat") is not None else None, "lon": float(node["lon"]) if node.get("lon") is not None else None}
+    def parse_geo_text(self, text: str, label: str) -> tuple[float | None, float | None]:
+        lat, lon = self.parse_geo(text.strip())
+        if text.strip() and lat is None:
+            raise ValueError(self.tr("poi_geo_format", label=label))
+        return lat, lon
+
+    def apply_geo_rules_to_pois(self, points: list[Poi]) -> list[Poi]:
+        copies = [Poi(**poi.__dict__) for poi in points]
+        geo_count = sum(1 for poi in copies if poi.lat is not None and poi.lon is not None)
+        if geo_count in (1, 2):
+            raise ValueError(self.tr("poi_geo_min3"))
+        if geo_count >= 3:
+            inferred = [self.point_from_poi(poi) for poi in copies]
+            infer_missing_geo_points(inferred)
+            for poi, point in zip(copies, inferred):
+                poi.lat = point.lat
+                poi.lon = point.lon
+        return copies
+
+    def build_segment(self, start: Point, end: Point, source: str) -> dict:
+        clearance = max(0.0, self.number(self.path_clearance_var, 0.3))
+        points = plan_path_points(start, end, float(self.scan["voxel"]), self.occupied_lookup(), clearance)
+        seg = {
+            "id": f"seg-{self.segment_seed}",
+            "start": self.point_to_payload(start),
+            "end": self.point_to_payload(end),
+            "source": source,
+            "geometry": "line",
+            "curveOffset": 0.0,
+            "clearance": clearance,
+            "points": [self.point_to_payload(point) for point in points],
+        }
+        self.segment_seed += 1
+        return seg
 
     def toggle_add_poi(self) -> None:
-        if self.pending_poi is not None:
+        if self.pending_poi is not None or self.pending_poi_queue:
             self.pending_poi = None
-            self.poi_status_var.set("POI idle")
+            self.pending_poi_queue = []
+            self.poi_status_var.set(self.tr("poi_idle"))
+            self.batch_action_btn.configure(text="Start Batch Add")
             return
-        name = self.poi_name_var.get().strip()
-        if not name:
-            messagebox.showwarning("POI", "Input POI name first.")
+        try:
+            queue = parse_batch_poi_text(self.poi_batch_text.get("1.0", tk.END))
+        except ValueError as exc:
+            messagebox.showwarning(self.tr("poi"), str(exc))
             return
-        lat, lon = self.parse_geo(self.poi_geo_var.get().strip())
-        if self.poi_geo_var.get().strip() and lat is None:
-            messagebox.showwarning("POI", "Geo format must be lon,lat.")
+        if not queue:
+            messagebox.showwarning(self.tr("poi"), self.tr("poi_batch_requires_input"))
             return
-        self.pending_poi = {"name": name, "lat": lat, "lon": lon}
-        self.poi_status_var.set(f'Ready to place "{name}" on canvas')
+        self.pending_poi_queue = queue
+        self.batch_action_btn.configure(text=self.tr("cancel_batch", count=len(queue)))
+        self.start_next_poi_draft()
+
+    def start_next_poi_draft(self) -> None:
+        if self.pending_poi is not None or not self.pending_poi_queue:
+            return
+        self.pending_poi = self.pending_poi_queue.pop(0)
+        self.pending_poi["batch_mode"] = True
+        self.poi_status_var.set(self.tr("poi_ready_place", name=self.pending_poi["name"]))
+        self.batch_action_btn.configure(text=self.tr("cancel_batch", count=len(self.pending_poi_queue) + 1))
 
     def parse_geo(self, text: str) -> tuple[float | None, float | None]:
         if not text:
@@ -653,6 +1583,8 @@ class DesktopClient:
         try:
             lon = float(parts[0])
             lat = float(parts[1])
+            if lon < -180 or lon > 180 or lat < -90 or lat > 90:
+                return None, None
             return lat, lon
         except Exception:
             return None, None
@@ -660,34 +1592,131 @@ class DesktopClient:
     def place_poi(self, x: float, y: float) -> None:
         if self.pending_poi is None:
             return
-        poi = Poi(client_id=f"poi-{self.poi_seed}", name=self.pending_poi["name"], x=x, y=y, yaw=float(self.pose.get("yaw", 0.0)), lat=self.pending_poi["lat"], lon=self.pending_poi["lon"])
+        poi = Poi(
+            client_id=f"poi-{self.poi_seed}",
+            name=self.pending_poi["name"],
+            x=x,
+            y=y,
+            yaw=float(self.pending_poi.get("yaw") or self.pose.get("yaw", 0.0)),
+            lat=self.pending_poi.get("lat"),
+            lon=self.pending_poi.get("lon"),
+        )
         self.poi_seed += 1
-        self.poi_nodes.append(poi)
+        next_nodes = self.poi_nodes + [poi]
+        batch_mode = bool(self.pending_poi.get("batch_mode"))
+        if batch_mode and self.pending_poi_queue:
+            pass
+        else:
+            try:
+                next_nodes = self.apply_geo_rules_to_pois(next_nodes)
+            except ValueError as exc:
+                messagebox.showwarning(self.tr("poi"), str(exc))
+                return
+        self.poi_nodes = next_nodes
         if self.bridge and self.bridge.connected:
-            self.call_api("/map/poi", {"poi": self.poi_payload(poi)})
+            self.call_api("/map/poi", {"poi": self.poi_payload(self.poi_nodes[-1])})
         self.pending_poi = None
-        self.poi_name_var.set("")
-        self.poi_status_var.set("POI idle")
+        if self.pending_poi_queue:
+            self.start_next_poi_draft()
+        else:
+            self.poi_name_var.set("")
+            self.poi_status_var.set(self.tr("poi_idle"))
+            self.batch_action_btn.configure(text=self.tr("start_batch_add"))
         self.sync_poi_box()
+
+    def add_single_poi(self) -> None:
+        name = self.single_poi_name_var.get().strip()
+        if not name:
+            messagebox.showwarning(self.tr("poi"), self.tr("poi_single_requires_name"))
+            return
+        try:
+            x = self.number(self.single_poi_x_var, 0.0)
+            y = self.number(self.single_poi_y_var, 0.0)
+            yaw = self.number(self.single_poi_yaw_var, 0.0)
+            lat, lon = self.parse_geo_text(self.single_poi_geo_var.get(), "Geo")
+        except ValueError as exc:
+            messagebox.showwarning(self.tr("poi"), str(exc))
+            return
+        next_nodes = self.poi_nodes + [
+            Poi(client_id=f"poi-{self.poi_seed}", name=name, x=x, y=y, yaw=yaw, lat=lat, lon=lon)
+        ]
+        try:
+            next_nodes = self.apply_geo_rules_to_pois(next_nodes)
+        except ValueError as exc:
+            messagebox.showwarning(self.tr("poi"), str(exc))
+            return
+        self.poi_nodes = next_nodes
+        self.poi_seed += 1
+        self.single_poi_name_var.set("")
+        self.single_poi_geo_var.set("")
+        self.sync_poi_box()
+        self.poi_status_var.set(self.tr("poi_added", name=name))
+
+    def apply_poi_edit(self) -> None:
+        selected = [poi for poi in self.poi_nodes if poi.client_id in self.selected_poi_ids]
+        if len(selected) != 1:
+            messagebox.showwarning(self.tr("poi"), self.tr("poi_edit_requires_one"))
+            return
+        target = selected[0]
+        try:
+            lat, lon = self.parse_geo_text(self.edit_poi_geo_var.get(), "Geo")
+            updated = Poi(
+                client_id=target.client_id,
+                name=self.edit_poi_name_var.get().strip() or target.name,
+                x=self.number(self.edit_poi_x_var, target.x),
+                y=self.number(self.edit_poi_y_var, target.y),
+                yaw=self.number(self.edit_poi_yaw_var, target.yaw),
+                lat=lat,
+                lon=lon,
+            )
+        except ValueError as exc:
+            messagebox.showwarning(self.tr("poi"), str(exc))
+            return
+        next_nodes = []
+        for poi in self.poi_nodes:
+            next_nodes.append(updated if poi.client_id == target.client_id else Poi(**poi.__dict__))
+        try:
+            next_nodes = self.apply_geo_rules_to_pois(next_nodes)
+        except ValueError as exc:
+            messagebox.showwarning(self.tr("poi"), str(exc))
+            return
+        self.poi_nodes = next_nodes
+        self.sync_poi_box()
+        self.poi_status_var.set(self.tr("poi_updated", name=updated.name))
 
     def sync_selected_poi(self) -> None:
         self.selected_poi_ids = set()
         for idx in self.poi_box.curselection():
             if 0 <= idx < len(self.poi_nodes):
                 self.selected_poi_ids.add(self.poi_nodes[idx].client_id)
+        selected = [poi for poi in self.poi_nodes if poi.client_id in self.selected_poi_ids]
+        if len(selected) == 1:
+            poi = selected[0]
+            self.edit_poi_name_var.set(poi.name)
+            self.edit_poi_x_var.set(f"{poi.x:.3f}")
+            self.edit_poi_y_var.set(f"{poi.y:.3f}")
+            self.edit_poi_yaw_var.set(f"{poi.yaw:.3f}")
+            self.edit_poi_geo_var.set("" if poi.lat is None or poi.lon is None else f"{poi.lon:.6f},{poi.lat:.6f}")
         self.sync_scan_badges()
+        self.sync_path_panel()
 
     def sync_poi_box(self) -> None:
         self.poi_box.delete(0, tk.END)
-        for poi in self.poi_nodes:
-            self.poi_box.insert(tk.END, f"{poi.name} ({poi.x:.2f}, {poi.y:.2f}) lat={poi.lat if poi.lat is not None else 'n/a'} lon={poi.lon if poi.lon is not None else 'n/a'}")
+        for index, poi in enumerate(self.poi_nodes, start=1):
+            self.poi_box.insert(tk.END, f"{index}. {poi.name} ({poi.x:.2f}, {poi.y:.2f}) yaw={poi.yaw:.3f} lat={poi.lat if poi.lat is not None else 'n/a'} lon={poi.lon if poi.lon is not None else 'n/a'}")
         self.sync_scan_badges()
 
     def delete_selected_poi(self) -> None:
         if not self.selected_poi_ids:
-            messagebox.showwarning("POI", "Select POI to delete.")
+            messagebox.showwarning(self.tr("poi"), self.tr("poi_select_delete"))
             return
-        self.poi_nodes = [poi for poi in self.poi_nodes if poi.client_id not in self.selected_poi_ids]
+        next_nodes = [poi for poi in self.poi_nodes if poi.client_id not in self.selected_poi_ids]
+        try:
+            next_nodes = self.apply_geo_rules_to_pois(next_nodes)
+        except ValueError as exc:
+            messagebox.showwarning(self.tr("poi"), str(exc))
+            return
+        self.poi_nodes = next_nodes
         self.path_segments = [seg for seg in self.path_segments if seg["start"].get("poi_id") not in self.selected_poi_ids and seg["end"].get("poi_id") not in self.selected_poi_ids]
         self.selected_poi_ids = set()
         self.selected_segment_id = None
@@ -696,7 +1725,7 @@ class DesktopClient:
 
     def apply_selected_geo(self) -> None:
         if not self.selected_poi_ids:
-            messagebox.showwarning("POI", "Select POI first.")
+            messagebox.showwarning(self.tr("poi"), self.tr("poi_select_first"))
             return
         lat, lon = self.parse_geo(self.poi_geo_var.get().strip())
         if self.poi_geo_var.get().strip() and lat is None:
@@ -708,15 +1737,28 @@ class DesktopClient:
                 poi.lon = lon
         self.sync_poi_box()
 
-    def segment_point(self, item: dict | Poi) -> dict:
-        if isinstance(item, Poi):
-            return {"x": float(item.x), "y": float(item.y), "lat": item.lat, "lon": item.lon, "poi_id": item.client_id, "name": item.name}
-        return {"x": float(item.get("x", 0.0)), "y": float(item.get("y", 0.0)), "lat": item.get("lat"), "lon": item.get("lon"), "poi_id": item.get("poi_id"), "name": item.get("name", "")}
+    def copy_poi_text(self) -> None:
+        if not self.poi_nodes:
+            messagebox.showwarning(self.tr("poi"), self.tr("poi_no_copy"))
+            return
+        text = build_poi_copy_text([self.point_from_poi(poi) for poi in self.poi_nodes])
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        messagebox.showinfo(self.tr("poi"), self.tr("poi_copied"))
 
-    def create_segment(self, start: dict | Poi, end: dict | Poi, source: str) -> dict:
-        seg = {"id": f"seg-{self.segment_seed}", "start": self.segment_point(start), "end": self.segment_point(end), "source": source}
-        self.segment_seed += 1
-        return seg
+    def find_poi_name(self, name: str) -> Poi | None:
+        target = name.strip().lower()
+        if not target:
+            messagebox.showwarning(self.tr("path"), self.tr("path_need_names"))
+            return None
+        matches = [poi for poi in self.poi_nodes if poi.name.strip().lower() == target]
+        if not matches:
+            messagebox.showwarning(self.tr("path"), self.tr("path_poi_not_found", name=name))
+            return None
+        if len(matches) > 1:
+            messagebox.showwarning(self.tr("path"), self.tr("path_poi_duplicate", name=name))
+            return None
+        return matches[0]
 
     def add_segment(self, seg: dict) -> None:
         self.path_segments.append(seg)
@@ -726,20 +1768,13 @@ class DesktopClient:
     def rebuild_path_nodes(self) -> None:
         self.path_nodes = []
         for seg in self.path_segments:
-            self.path_nodes.extend([self.path_node(seg["start"]), self.path_node(seg["end"])])
-
-    def find_poi_name(self, name: str) -> Poi | None:
-        if not name:
-            messagebox.showwarning("Path", "Input both POI names first.")
-            return None
-        matches = [poi for poi in self.poi_nodes if poi.name.strip().lower() == name.lower()]
-        if not matches:
-            messagebox.showwarning("Path", f'POI "{name}" not found.')
-            return None
-        if len(matches) > 1:
-            messagebox.showwarning("Path", f'POI name "{name}" is duplicated.')
-            return None
-        return matches[0]
+            samples = seg.get("points") or [seg["start"], seg["end"]]
+            for index, point in enumerate(samples):
+                node = {"x": float(point["x"]), "y": float(point["y"]), "lat": point.get("lat"), "lon": point.get("lon")}
+                prev = self.path_nodes[-1] if self.path_nodes else None
+                if index > 0 and prev and f"{prev['x']:.3f},{prev['y']:.3f}" == f"{node['x']:.3f},{node['y']:.3f}":
+                    continue
+                self.path_nodes.append(node)
 
     def connect_named_poi(self) -> None:
         a = self.find_poi_name(self.path_start_var.get().strip())
@@ -747,26 +1782,29 @@ class DesktopClient:
         if a is None or b is None:
             return
         if a.client_id == b.client_id:
-            messagebox.showwarning("Path", "Start and end POI cannot be the same.")
+            messagebox.showwarning(self.tr("path"), self.tr("path_same_poi"))
             return
-        self.add_segment(self.create_segment(a, b, "poi-name"))
+        try:
+            self.add_segment(self.build_segment(self.point_from_poi(a), self.point_from_poi(b), "poi-name"))
+        except ValueError as exc:
+            messagebox.showwarning(self.tr("path"), str(exc))
 
     def auto_loop(self) -> None:
         if len(self.poi_nodes) < 2:
-            messagebox.showwarning("Path", "At least two POI are required.")
+            messagebox.showwarning(self.tr("path"), self.tr("path_need_two_poi"))
             return
-        ordered = sorted(self.poi_nodes, key=lambda poi: (poi.x, poi.y))
-        self.path_segments = [seg for seg in self.path_segments if seg["source"] != "auto"]
-        route = [ordered[0]]
-        remaining = ordered[1:]
-        while remaining:
-            last = route[-1]
-            idx = min(range(len(remaining)), key=lambda i: math.hypot(last.x - remaining[i].x, last.y - remaining[i].y))
-            route.append(remaining.pop(idx))
-        for i in range(len(route) - 1):
-            self.path_segments.append(self.create_segment(route[i], route[i + 1], "auto"))
-        if len(route) > 2:
-            self.path_segments.append(self.create_segment(route[-1], route[0], "auto"))
+        route = optimize_loop_with_two_opt(solve_nearest_loop([self.point_from_poi(poi) for poi in self.poi_nodes]))
+        preserved = [seg for seg in self.path_segments if seg["source"] != "auto"]
+        auto_segments: list[dict] = []
+        try:
+            for index in range(len(route) - 1):
+                auto_segments.append(self.build_segment(route[index], route[index + 1], "auto"))
+            if len(route) > 2:
+                auto_segments.append(self.build_segment(route[-1], route[0], "auto"))
+        except ValueError as exc:
+            messagebox.showwarning(self.tr("path"), str(exc))
+            return
+        self.path_segments = preserved + auto_segments
         self.selected_segment_id = self.path_segments[-1]["id"] if self.path_segments else None
         self.sync_path_panel()
 
@@ -782,75 +1820,59 @@ class DesktopClient:
         self.selected_segment_id = None
         self.sync_path_panel()
 
-    def path_key(self, node: dict) -> str:
-        return f"{float(node['x']):.3f},{float(node['y']):.3f}"
+    def clear_selection(self) -> None:
+        self.selected_segment_id = None
+        self.selected_poi_ids = set()
+        self.pending_free_point = None
+        self.path_validation = {"checked": False, "ok": None, "invalid_ids": set(), "message": ""}
+        self.poi_box.selection_clear(0, tk.END)
+        self.path_box.selection_clear(0, tk.END)
+        self.sync_path_panel()
+        self.sync_poi_box()
 
     def validate_path(self, show_alert: bool) -> bool:
-        self.path_validation = {"checked": True, "ok": None, "invalid_ids": set(), "message": ""}
-        if len(self.path_segments) < 3:
-            self.path_validation["ok"] = False
-            self.path_validation["invalid_ids"] = {seg["id"] for seg in self.path_segments}
-            self.path_validation["message"] = "Closed-loop check failed: at least 3 path segments are required."
-        else:
-            endpoint_map, adjacency = {}, {}
-            for seg in self.path_segments:
-                a, b = self.path_key(seg["start"]), self.path_key(seg["end"])
-                endpoint_map.setdefault(a, []).append(seg["id"])
-                endpoint_map.setdefault(b, []).append(seg["id"])
-                adjacency.setdefault(a, set()).add(b)
-                adjacency.setdefault(b, set()).add(a)
-            invalid = set()
-            bad_nodes = 0
-            for ids in endpoint_map.values():
-                if len(ids) != 2:
-                    bad_nodes += 1
-                    invalid.update(ids)
-            visited, components = set(), 0
-            for node in list(adjacency.keys()):
-                if node in visited:
-                    continue
-                components += 1
-                stack = [node]
-                while stack:
-                    cur = stack.pop()
-                    if cur in visited:
-                        continue
-                    visited.add(cur)
-                    stack.extend(n for n in adjacency.get(cur, set()) if n not in visited)
-            if components != 1:
-                invalid.update(seg["id"] for seg in self.path_segments)
-            self.path_validation["ok"] = not invalid
-            self.path_validation["invalid_ids"] = invalid
-            if self.path_validation["ok"]:
-                self.path_validation["message"] = "Closed-loop check passed."
-            else:
-                parts = []
-                if bad_nodes:
-                    parts.append(f"{bad_nodes} endpoint(s) do not have degree 2")
-                if components != 1:
-                    parts.append(f"path is split into {components} disconnected component(s)")
-                self.path_validation["message"] = f"Closed-loop check failed: {'; '.join(parts)}."
+        segments = [{"id": seg["id"], "start": self.point_from_dict(seg["start"]), "end": self.point_from_dict(seg["end"])} for seg in self.path_segments]
+        self.path_validation = compute_path_closed_loop_validation(segments, float(self.scan["voxel"]))
+        self.selected_segment_id = None
+        self.selected_poi_ids = set()
         self.sync_path_panel()
         if show_alert:
-            messagebox.showinfo("Path Validation", self.path_validation["message"])
+            messagebox.showinfo(self.tr("path_validation_title"), self.path_validation["message"])
         return bool(self.path_validation["ok"])
+
+    def path_polyline_length(self, seg: dict) -> float:
+        points = seg.get("points") or [seg["start"], seg["end"]]
+        total = 0.0
+        for index in range(len(points) - 1):
+            total += math.hypot(points[index + 1]["x"] - points[index]["x"], points[index + 1]["y"] - points[index]["y"])
+        return total
 
     def sync_path_panel(self) -> None:
         self.rebuild_path_nodes()
         self.path_box.delete(0, tk.END)
         for seg in self.path_segments:
             suffix = " | closed-loop error" if seg["id"] in self.path_validation["invalid_ids"] else ""
-            dist = math.hypot(seg["start"]["x"] - seg["end"]["x"], seg["start"]["y"] - seg["end"]["y"])
-            self.path_box.insert(tk.END, f"{seg['source']} | ({seg['start']['x']:.2f}, {seg['start']['y']:.2f}) -> ({seg['end']['x']:.2f}, {seg['end']['y']:.2f}) | {dist:.2f} m{suffix}")
-        tool = f"Input POI names to connect ({self.path_start_var.get().strip() or '?'} -> {self.path_end_var.get().strip() or '?'})" if self.path_mode_var.get() == "poi" else "Click any two points to connect"
-        pending = f" | Start ({self.pending_free_point[0]:.2f}, {self.pending_free_point[1]:.2f})" if self.pending_free_point else ""
-        validation = " | Loop unchecked" if not self.path_validation["checked"] else " | Loop OK" if self.path_validation["ok"] else f" | Loop error {len(self.path_validation['invalid_ids'])} segment(s)"
-        self.path_status_var.set(f"Path segments {len(self.path_segments)} | Nodes {len(self.path_nodes)} | Tool {tool}{pending}{validation}")
+            self.path_box.insert(tk.END, f"{seg['source']} | ({seg['start']['x']:.2f}, {seg['start']['y']:.2f}) -> ({seg['end']['x']:.2f}, {seg['end']['y']:.2f}) | len {self.path_polyline_length(seg):.2f} m | key points {len(seg.get('points') or [])}{suffix}")
+        tool_map = {
+            "idle": self.tr("path_browse_only"),
+            "poi": self.tr("path_tool_named", start=self.path_start_var.get().strip() or "?", end=self.path_end_var.get().strip() or "?"),
+            "free": self.tr("path_tool_free"),
+        }
+        pending = ""
+        if self.pending_free_point:
+            pending = f" | Start ({self.pending_free_point['x']:.2f}, {self.pending_free_point['y']:.2f})"
+        validation = self.tr("loop_unchecked") if not self.path_validation["checked"] else self.tr("loop_ok") if self.path_validation["ok"] else self.tr("loop_error", count=len(self.path_validation["invalid_ids"]))
+        self.path_status_var.set(self.tr("path_status", segments=len(self.path_segments), nodes=len(self.path_nodes), tool=tool_map[self.path_mode_var.get()], pending=pending, validation=validation))
         if self.path_mode_var.get() == "poi" and self.path_start_var.get().strip() and self.path_end_var.get().strip():
             self.connect_named_btn.state(["!disabled"])
         else:
             self.connect_named_btn.state(["disabled"])
         self.sync_scan_badges()
+
+    def refresh_camera_snapshot(self) -> None:
+        self.logger.info("camera snapshot refresh")
+        self.camera_display = {idx: dict(payload) for idx, payload in self.camera_inbox.items()}
+        self.camera_refresh_var.set(self.camera_refresh_var.get().replace("Buffered", "Displayed", 1) if "Buffered" in self.camera_refresh_var.get() else self.camera_refresh_var.get())
 
     def move_click(self, name: str) -> None:
         fwd = self.number(self.forward_var, 0.8)
@@ -865,42 +1887,74 @@ class DesktopClient:
         elif name == "reverse":
             body = {"velocity": -rev, "yaw_rate": 0.0, "duration": dur}
         elif name == "left":
-            body = {"velocity": max(fwd * 0.5, 0.2), "yaw_rate": turn, "duration": dur}
+            body = {"velocity": 0.0, "yaw_rate": turn, "duration": dur}
         else:
-            body = {"velocity": max(fwd * 0.5, 0.2), "yaw_rate": -turn, "duration": dur}
+            body = {"velocity": 0.0, "yaw_rate": -turn, "duration": dur}
         self.call_api("/control/move", body)
 
+    def keyboard_command(self) -> str | None:
+        if "space" in self.keys_down:
+            return "stop"
+        if "w" in self.keys_down or "up" in self.keys_down:
+            return "forward"
+        if "s" in self.keys_down or "down" in self.keys_down:
+            return "reverse"
+        if "a" in self.keys_down or "left" in self.keys_down:
+            return "left"
+        if "d" in self.keys_down or "right" in self.keys_down:
+            return "right"
+        return None
+
+    def drive_loop(self) -> None:
+        self.drive_loop_scheduled = False
+        cmd = self.keyboard_command()
+        if cmd is None:
+            return
+        self.move_click(cmd)
+        self.keyboard_var.set(self.tr("keyboard_cmd", cmd=cmd))
+        self.drive_loop_scheduled = True
+        self.root.after(max(60, int(self.number(self.repeat_ms_var, 120))), self.drive_loop)
+
+    def ensure_drive_loop(self) -> None:
+        if self.drive_loop_scheduled:
+            return
+        self.drive_loop_scheduled = True
+        self.root.after(0, self.drive_loop)
+
+    def should_ignore_global_keys(self, widget: tk.Misc | None) -> bool:
+        return isinstance(widget, (tk.Entry, tk.Text, tk.Listbox, ttk.Entry, ttk.Combobox))
+
     def on_key_press(self, event: tk.Event) -> None:
+        if self.should_ignore_global_keys(self.root.focus_get()):
+            return
         key = event.keysym.lower()
-        if key == "w":
-            self.move_click("forward")
-            self.keyboard_var.set("W forward")
-        elif key == "s":
-            self.move_click("reverse")
-            self.keyboard_var.set("S reverse")
-        elif key == "a":
-            self.move_click("left")
-            self.keyboard_var.set("A left")
-        elif key == "d":
-            self.move_click("right")
-            self.keyboard_var.set("D right")
-        elif key == "space":
+        if key in {"w", "a", "s", "d", "up", "down", "left", "right", "space"}:
+            self.keys_down.add(key)
+            self.ensure_drive_loop()
+
+    def on_key_release(self, event: tk.Event) -> None:
+        if self.should_ignore_global_keys(self.root.focus_get()):
+            return
+        key = event.keysym.lower()
+        self.keys_down.discard(key)
+        if self.stop_on_keyup_var.get() and not self.keys_down:
             self.move_click("stop")
-            self.keyboard_var.set("Space stop")
+            self.keyboard_var.set(self.tr("keyboard_stop_keyup"))
 
     def edit_tool_changed(self) -> None:
         self.edit["tool"] = self.edit_tool_var.get()
         self.edit["pending_obstacle_start"] = None
         if self.edit["tool"] == "erase":
-            self.map_edit_status_var.set(f"Erase Noise mode active. Brush radius {self.number(self.brush_var, 0.25):.2f} m")
+            self.map_edit_status_var.set(self.tr("map_edit_erase", radius=self.number(self.brush_var, 0.25)))
         elif self.edit["tool"] == "obstacle":
-            self.map_edit_status_var.set("Draw Obstacle Line mode active. Click two points on the map.")
+            self.map_edit_status_var.set(self.tr("map_edit_obstacle"))
         else:
-            self.map_edit_status_var.set("View / Select mode active. You can pan, zoom, and select POI or path.")
+            self.map_edit_status_var.set(self.tr("map_edit_view"))
         self.sync_scan_badges()
 
     def canvas_press(self, event: tk.Event) -> None:
         self.view["last_xy"] = (event.x, event.y)
+        self.view["moved"] = False
         x, y = self.screen_to_world(event.x, event.y)
         if self.pending_poi is not None:
             self.place_poi(x, y)
@@ -912,11 +1966,11 @@ class DesktopClient:
         if self.edit["tool"] == "obstacle":
             if self.edit["pending_obstacle_start"] is None:
                 self.edit["pending_obstacle_start"] = (x, y)
-                self.map_edit_status_var.set(f"Obstacle start fixed at ({x:.2f}, {y:.2f}). Click end point next.")
+                self.map_edit_status_var.set(self.tr("obstacle_start", x=x, y=y))
             else:
                 self.draw_obstacle_line(self.edit["pending_obstacle_start"], (x, y))
                 self.edit["pending_obstacle_start"] = None
-                self.map_edit_status_var.set("Added obstacle line.")
+                self.map_edit_status_var.set(self.tr("obstacle_added"))
             self.sync_scan_badges()
             return
         self.view["dragging"] = True
@@ -930,6 +1984,8 @@ class DesktopClient:
             return
         dx = event.x - self.view["last_xy"][0]
         dy = event.y - self.view["last_xy"][1]
+        if dx or dy:
+            self.view["moved"] = True
         self.view["pan_x"] += dx
         self.view["pan_y"] += dy
         self.view["last_xy"] = (event.x, event.y)
@@ -942,12 +1998,18 @@ class DesktopClient:
         if not self.view["dragging"]:
             return
         self.view["dragging"] = False
+        if self.view["moved"]:
+            return
         x, y = self.screen_to_world(event.x, event.y)
         if self.path_mode_var.get() == "free":
+            point = Point(x=x, y=y, lat=self.gps.get("lat"), lon=self.gps.get("lon"))
             if self.pending_free_point is None:
-                self.pending_free_point = (x, y)
+                self.pending_free_point = self.point_to_payload(point)
             else:
-                self.add_segment(self.create_segment({"x": self.pending_free_point[0], "y": self.pending_free_point[1], "lat": self.gps.get("lat"), "lon": self.gps.get("lon")}, {"x": x, "y": y, "lat": self.gps.get("lat"), "lon": self.gps.get("lon")}, "free"))
+                try:
+                    self.add_segment(self.build_segment(self.point_from_dict(self.pending_free_point), point, "free"))
+                except ValueError as exc:
+                    messagebox.showwarning(self.tr("path"), str(exc))
                 self.pending_free_point = None
             self.sync_path_panel()
 
@@ -988,7 +2050,7 @@ class DesktopClient:
                 removable.append(key)
         for key in removable:
             self.scan["occupied"].pop(key, None)
-        self.map_edit_status_var.set(f"Auto cleared {len(removable)} noisy cells" if removable else "No isolated noise found")
+        self.map_edit_status_var.set(self.tr("noise_cleared", count=len(removable)) if removable else self.tr("noise_none"))
         self.sync_scan_badges()
 
     def clear_loaded_map(self) -> None:
@@ -1000,12 +2062,13 @@ class DesktopClient:
         self.selected_segment_id = None
         self.pending_free_point = None
         self.pending_poi = None
+        self.pending_poi_queue = []
         self.edit["loaded_from_stcm"] = False
         self.edit["loaded_map_name"] = ""
         self.path_validation = {"checked": False, "ok": None, "invalid_ids": set(), "message": ""}
         self.sync_poi_box()
         self.sync_path_panel()
-        self.map_edit_status_var.set("Loaded map cleared")
+        self.map_edit_status_var.set(self.tr("map_cleared"))
 
     def world_to_screen(self, x: float, y: float) -> tuple[float, float]:
         width = max(1, self.canvas.winfo_width())
@@ -1018,14 +2081,21 @@ class DesktopClient:
         return (x - width / 2 - self.view["pan_x"]) / self.view["scale"], (height / 2 + self.view["pan_y"] - y) / self.view["scale"]
 
     def on_mousewheel(self, event: tk.Event) -> None:
-        if event.widget is not self.canvas:
+        if not can_zoom_from_widget(getattr(event, "widget", None), self.canvas):
             return
         x, y = self.screen_to_world(event.x, event.y)
-        self.view["scale"] = max(8.0, min(80.0, self.view["scale"] * (1.08 if event.delta > 0 else 0.92)))
+        factor = zoom_scale_factor(event)
+        if factor == 1.0:
+            return
+        self.view["scale"] = max(8.0, min(80.0, self.view["scale"] * factor))
         sx, sy = self.world_to_screen(x, y)
         self.view["pan_x"] += event.x - sx
         self.view["pan_y"] += event.y - sy
         self.update_view_metrics()
+
+    def on_root_click(self, event: tk.Event) -> None:
+        if should_clear_focus_on_click(getattr(event, "widget", None)):
+            self.root.focus_set()
 
     def center_robot(self) -> None:
         self.view["pan_x"] = -float(self.pose.get("x", 0.0)) * self.view["scale"]
@@ -1114,14 +2184,16 @@ class DesktopClient:
         if not self.show_path_var.get():
             return
         for seg in self.path_segments:
-            sx1, sy1 = self.world_to_screen(seg["start"]["x"], seg["start"]["y"])
-            sx2, sy2 = self.world_to_screen(seg["end"]["x"], seg["end"]["y"])
+            points = seg.get("points") or [seg["start"], seg["end"]]
             invalid = seg["id"] in self.path_validation["invalid_ids"]
             color = "#cc4b37" if invalid else "#ff7b54" if seg["id"] == self.selected_segment_id else "#f3b441"
             width = 4 if invalid or seg["id"] == self.selected_segment_id else 2
-            self.canvas.create_line(sx1, sy1, sx2, sy2, fill=color, width=width)
+            for index in range(len(points) - 1):
+                sx1, sy1 = self.world_to_screen(points[index]["x"], points[index]["y"])
+                sx2, sy2 = self.world_to_screen(points[index + 1]["x"], points[index + 1]["y"])
+                self.canvas.create_line(sx1, sy1, sx2, sy2, fill=color, width=width)
         if self.pending_free_point is not None:
-            sx, sy = self.world_to_screen(self.pending_free_point[0], self.pending_free_point[1])
+            sx, sy = self.world_to_screen(self.pending_free_point["x"], self.pending_free_point["y"])
             self.canvas.create_oval(sx - 8, sy - 8, sx + 8, sy + 8, outline="#4fd1c5", dash=(6, 4), width=2)
 
     def draw_pois(self) -> None:
@@ -1147,14 +2219,284 @@ class DesktopClient:
         yaw = -float(self.pose.get("yaw", 0.0))
         self.canvas.create_line(sx, sy, sx + math.cos(yaw) * 14, sy + math.sin(yaw) * 14, fill="#ffffff", width=2)
 
+    def build_pgm_export(self, manifest: dict, points: list[list[float]] | list[tuple[float, float, float]], resolution: float, padding_cells: int = 8) -> dict:
+        browser = manifest.get("browser_occupancy") or {}
+        occupancy_voxel = max(0.02, float(browser.get("voxel_size", resolution)))
+        occupied_cells = browser.get("occupied_cells") if isinstance(browser.get("occupied_cells"), list) else None
+        occupied_set: set[tuple[int, int]] = set()
+        min_cell_x = math.inf
+        max_cell_x = -math.inf
+        min_cell_y = math.inf
+        max_cell_y = -math.inf
+        if occupied_cells:
+            for cell in occupied_cells:
+                ix = round(float(cell.get("ix", 0)))
+                iy = round(float(cell.get("iy", 0)))
+                occupied_set.add((ix, iy))
+                min_cell_x = min(min_cell_x, ix)
+                max_cell_x = max(max_cell_x, ix)
+                min_cell_y = min(min_cell_y, iy)
+                max_cell_y = max(max_cell_y, iy)
+        else:
+            if not points:
+                raise ValueError("No radar points in SLAM")
+            for point in points:
+                ix = round(float(point[0]) / resolution)
+                iy = round(float(point[1]) / resolution)
+                occupied_set.add((ix, iy))
+                min_cell_x = min(min_cell_x, ix)
+                max_cell_x = max(max_cell_x, ix)
+                min_cell_y = min(min_cell_y, iy)
+                max_cell_y = max(max_cell_y, iy)
+        padded_min_x = int(min_cell_x) - padding_cells
+        padded_min_y = int(min_cell_y) - padding_cells
+        padded_max_x = int(max_cell_x) + padding_cells
+        padded_max_y = int(max_cell_y) + padding_cells
+        width = max(1, padded_max_x - padded_min_x + 1)
+        height = max(1, padded_max_y - padded_min_y + 1)
+        grid = [205] * (width * height)
+        for ix, iy in occupied_set:
+            x = ix - padded_min_x
+            y = iy - padded_min_y
+            flipped_y = height - 1 - y
+            grid[flipped_y * width + x] = 0
+        rows = []
+        for row in range(height):
+            start = row * width
+            rows.append(" ".join(str(grid[start + col]) for col in range(width)))
+        origin = [round(padded_min_x * occupancy_voxel, 3), round(padded_min_y * occupancy_voxel, 3), 0]
+        return {
+            "pgm": f"P2\n# Generated from SLAM occupancy\n{width} {height}\n255\n" + "\n".join(rows) + "\n",
+            "origin": origin,
+            "width": width,
+            "height": height,
+            "occupied_cells": len(occupied_set),
+        }
+
+    def build_yaml_export(self, file_name: str, resolution: float, origin: list[float]) -> str:
+        stem = Path(file_name).with_suffix(".pgm").name
+        return "\n".join(
+            [
+                f"image: {stem}",
+                "mode: trinary",
+                f"resolution: {resolution:.3f}",
+                f"origin: [{origin[0]:.3f}, {origin[1]:.3f}, {int(origin[2])}]",
+                "negate: 0",
+                "occupied_thresh: 0.65",
+                "free_thresh: 0.196",
+            ]
+        )
+
+    def set_inspector_bundle_state(self, file_name: str, manifest: dict, points: list) -> None:
+        resolution = max(0.02, self.number(self.voxel_var, 0.10))
+        pgm = self.build_pgm_export(manifest, points, resolution)
+        yaml_text = self.build_yaml_export(file_name, resolution, pgm["origin"])
+        export_manifest = strip_legacy_trajectory(manifest)
+        export_manifest.pop("browser_occupancy", None)
+        self.inspector = {
+            "file": file_name,
+            "manifest": manifest,
+            "points": points,
+            "pgm": pgm["pgm"],
+            "yaml": yaml_text,
+            "json": json.dumps(export_manifest, ensure_ascii=False, indent=2),
+            "meta": pgm,
+        }
+
+    def save_stcm(self) -> None:
+        self.rebuild_path_nodes()
+        voxel_size = float(self.scan["voxel"])
+        notes = {
+            "text": self.map_notes_var.get().strip(),
+            "voxelSize": voxel_size,
+            "loadedFromStcm": self.edit["loaded_from_stcm"],
+            "loadedMapName": self.edit["loaded_map_name"] or None,
+            "manualCameraSnapshotAt": self.camera_refresh_var.get(),
+            "editTool": self.edit["tool"],
+        }
+        bundle = {
+            "version": "stcm.v2",
+            "notes": json.dumps(notes, ensure_ascii=False, indent=2),
+            "created_at": time.time(),
+            "source": "desktop",
+            "map_source": "stcm_editor" if self.edit["loaded_from_stcm"] else "laser_accumulation",
+            "browser_occupancy": self.browser_occupancy(),
+            "pose": self.pose,
+            "gps": self.gps,
+            "chassis": self.chassis,
+            "poi": [self.poi_payload(poi) for poi in self.poi_nodes],
+            "path": [
+                {
+                    "id": seg["id"],
+                    "source": seg["source"],
+                    "clearance": float(seg.get("clearance", 0.0)),
+                    "start": dict(seg["start"]),
+                    "end": dict(seg["end"]),
+                    "points": [dict(point) for point in (seg.get("points") or [])],
+                }
+                for seg in self.path_segments
+            ],
+            "gps_track": [],
+            "chassis_track": [],
+            "scan_summary": {
+                "scanActive": self.scan["active"],
+                "elapsedSec": round(max(0.0, (int(time.time() * 1000) - self.scan["started_ms"]) / 1000), 1) if self.scan["started_ms"] else 0.0,
+                "obstacleCells": len(self.scan["occupied"]),
+                "safeCells": len(self.scan["free"]),
+                "rawLidarPoints": self.scan["raw_points"],
+                "frontFrames": self.scan["front_frames"],
+                "rearFrames": self.scan["rear_frames"],
+                "voxelSize": voxel_size,
+            },
+            "radar_points": self.occupied_points(),
+        }
+        target = filedialog.asksaveasfilename(parent=self.root, defaultextension=".slam", filetypes=[("SLAM", "*.slam")], initialfile=f"{self.map_name_var.get().strip() or 'desktop_map'}.slam")
+        if not target:
+            return
+        manifest = strip_legacy_trajectory({k: v for k, v in bundle.items() if k != "radar_points"})
+        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+            zf.writestr("radar_points.bin", b"".join(struct.pack("fff", *point) for point in bundle["radar_points"]))
+        self.scan["last_saved_file"] = target
+        self.scan["saved_point_count"] = len(bundle["radar_points"])
+        self.sync_scan_badges()
+        self.set_inspector_bundle_state(Path(target).name, manifest, bundle["radar_points"])
+        self.logger.info("map saved path=%s points=%s", target, len(bundle["radar_points"]))
+        messagebox.showinfo(self.tr("save_title"), self.tr("save_done", path=target))
+
+    def load_stcm(self) -> None:
+        target = filedialog.askopenfilename(parent=self.root, filetypes=[("SLAM", "*.slam"), ("ZIP", "*.zip")])
+        if not target:
+            return
+        with zipfile.ZipFile(target, "r") as zf:
+            manifest = json.loads(zf.read("manifest.json"))
+            raw = zf.read("radar_points.bin")
+        points = [struct.unpack("fff", raw[i:i + 12]) for i in range(0, len(raw), 12) if i + 12 <= len(raw)]
+        self.apply_stcm(Path(target).name, manifest, points)
+        self.set_inspector_bundle_state(Path(target).name, manifest, points)
+        self.logger.info("map loaded path=%s points=%s", target, len(points))
+        messagebox.showinfo(self.tr("load_title"), self.tr("load_done", name=Path(target).name))
+
+    def apply_stcm(self, file_name: str, manifest: dict, points: list[tuple[float, float, float]]) -> None:
+        self.clear_scan()
+        self.scan["active"] = False
+        occ = manifest.get("browser_occupancy", {})
+        if isinstance(occ, dict) and isinstance(occ.get("occupied_cells"), list):
+            self.scan["voxel"] = max(0.02, float(occ.get("voxel_size", self.number(self.voxel_var, 0.12))))
+            for cell in occ.get("occupied_cells", []):
+                self.mark_occupied(int(cell.get("ix", 0)), int(cell.get("iy", 0)), float(cell.get("intensity", 1.0)), int(cell.get("hits", 3)))
+            for cell in occ.get("free_cells", []):
+                self.scan["free"][self.cell_key(int(cell.get("ix", 0)), int(cell.get("iy", 0)))] = {"ix": int(cell.get("ix", 0)), "iy": int(cell.get("iy", 0)), "hits": int(cell.get("hits", 1))}
+        else:
+            self.scan["voxel"] = max(0.02, self.number(self.voxel_var, 0.12))
+            for point in points:
+                ix, iy = self.world_to_cell(float(point[0]), float(point[1]))
+                self.mark_occupied(ix, iy, float(point[2]), 3)
+        self.poi_nodes = []
+        self.poi_seed = 1
+        for poi in manifest.get("poi", []):
+            self.poi_nodes.append(Poi(client_id=f"poi-{self.poi_seed}", name=str(poi.get("name", f"POI {self.poi_seed}")), x=float(poi.get("x", 0.0)), y=float(poi.get("y", 0.0)), yaw=float(poi.get("yaw", 0.0) or 0.0), lat=float(poi["lat"]) if poi.get("lat") not in (None, "") else None, lon=float(poi["lon"]) if poi.get("lon") not in (None, "") else None))
+            self.poi_seed += 1
+        self.path_segments = []
+        self.segment_seed = 1
+        for seg in manifest.get("path", []):
+            self.path_segments.append(
+                {
+                    "id": seg.get("id", f"seg-{self.segment_seed}"),
+                    "start": self.point_to_payload(self.point_from_dict(seg.get("start", {}))),
+                    "end": self.point_to_payload(self.point_from_dict(seg.get("end", {}))),
+                    "source": seg.get("source", "stcm"),
+                    "geometry": seg.get("geometry", "line"),
+                    "curveOffset": float(seg.get("curveOffset", 0.0) or 0.0),
+                    "clearance": float(seg.get("clearance", 0.0) or 0.0),
+                    "points": [self.point_to_payload(self.point_from_dict(point)) for point in seg.get("points", [])],
+                }
+            )
+            self.segment_seed += 1
+        self.edit["loaded_from_stcm"] = True
+        self.edit["loaded_map_name"] = file_name
+        self.stcm_summary = {"file": file_name, "mapSource": manifest.get("map_source", "unknown"), "radarPoints": len(points), "poiCount": len(self.poi_nodes), "pathCount": len(self.path_segments), "hasBrowserOccupancy": bool(occ), "restoredFreeCells": len(occ.get("free_cells", [])) if isinstance(occ, dict) else 0}
+        if manifest.get("notes"):
+            try:
+                notes = json.loads(manifest["notes"])
+                if isinstance(notes, dict) and notes.get("text"):
+                    self.map_notes_var.set(str(notes["text"]))
+            except Exception:
+                pass
+        self.voxel_var.set(f"{float(self.scan['voxel']):.2f}")
+        self.map_name_var.set(file_name.replace(".slam", ""))
+        self.pending_free_point = None
+        self.selected_segment_id = None
+        self.selected_poi_ids = set()
+        self.sync_poi_box()
+        self.sync_path_panel()
+        self.center_loaded_map()
+        self.sync_scan_badges()
+        self.map_edit_status_var.set(self.tr("map_loaded_view", name=file_name))
+
+    def export_inspector_file(self, kind: str) -> None:
+        if not self.inspector["file"]:
+            messagebox.showwarning(self.tr("export_title"), self.tr("export_need_map"))
+            return
+        mapping = {
+            "pgm": (self.inspector["pgm"], ".pgm"),
+            "yaml": (self.inspector["yaml"], ".yaml"),
+            "json": (self.inspector["json"], ".json"),
+        }
+        content, ext = mapping[kind]
+        path = filedialog.asksaveasfilename(parent=self.root, defaultextension=ext, filetypes=[(kind.upper(), f"*{ext}")], initialfile=Path(self.inspector["file"]).with_suffix(ext).name)
+        if not path:
+            return
+        Path(path).write_text(content, encoding="utf-8")
+        self.logger.info("map export kind=%s path=%s", kind, path)
+        messagebox.showinfo(self.tr("export_title"), self.tr("export_done", kind=kind.upper(), path=path))
+
     def render_text_panels(self) -> None:
-        self.write_text(self.scan_text, {"scan": self.scan_state_var.get(), "pose": self.pose, "odom": self.odom, "gps": self.gps, "last_scan": self.last_scan})
-        self.write_text(self.camera_text, {f"camera_{idx}": self.camera_data[idx] for idx in range(1, 5)})
-        self.write_text(self.comm_text, {"connection": self.conn_var.get(), "status": self.status_var.get(), "path_validation": self.path_validation, "stcm_summary": self.stcm_summary, "last_saved_file": self.scan["last_saved_file"], "saved_point_count": self.scan["saved_point_count"]})
+        self.write_text(
+            self.scan_text,
+            {
+                "scan": self.scan_state_var.get(),
+                "odom": {key: self.odom.get(key) for key in ("x", "y", "yaw")},
+                "last_scan": self.last_scan,
+            },
+        )
+        self.write_text(
+            self.camera_text,
+            {
+                "refresh_status": self.camera_refresh_var.get(),
+                **{f"camera_{idx}": self.camera_display[idx] for idx in range(1, 5)},
+            },
+        )
+        self.write_text(
+            self.comm_text,
+            {
+                "connection": self.conn_var.get(),
+                "status": self.status_var.get(),
+                "status_detail": self.status_detail_var.get(),
+                "stream_health": self.stream_health,
+                "log_file": self.log_path,
+                "health": self.health,
+                "path_validation": self.path_validation,
+                "map_summary": self.stcm_summary,
+                "inspector": {
+                    "file": self.inspector["file"],
+                    "meta": self.inspector["meta"],
+                },
+                "last_saved_file": self.scan["last_saved_file"],
+                "saved_point_count": self.scan["saved_point_count"],
+            },
+        )
 
     def write_text(self, widget: tk.Text, payload: dict) -> None:
+        text = json.dumps(payload, ensure_ascii=False, indent=2, default=lambda value: list(value) if isinstance(value, set) else str(value))
+        widget_id = id(widget)
+        if safe_focus_widget(self.root) is widget:
+            return
+        if self.text_cache.get(widget_id) == text:
+            return
+        self.text_cache[widget_id] = text
         widget.delete("1.0", tk.END)
-        widget.insert(tk.END, json.dumps(payload, ensure_ascii=False, indent=2, default=lambda value: list(value) if isinstance(value, set) else str(value)))
+        widget.insert(tk.END, text)
 
     def on_close(self) -> None:
         self.disconnect()
