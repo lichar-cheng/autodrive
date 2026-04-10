@@ -1,8 +1,45 @@
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from typing import Any
+
+
+SCAN_FUSION_PRESETS: dict[str, dict[str, Any]] = {
+    "sim_clean": {
+        "preset": "sim_clean",
+        "voxel_size": 0.12,
+        "occupied_min_hits": 3,
+        "occupied_over_free_ratio": 0.90,
+        "turn_skip_wz": 0.35,
+        "skip_turn_frames": True,
+    },
+    "indoor_balanced": {
+        "preset": "indoor_balanced",
+        "voxel_size": 0.08,
+        "occupied_min_hits": 2,
+        "occupied_over_free_ratio": 0.75,
+        "turn_skip_wz": 0.45,
+        "skip_turn_frames": True,
+    },
+    "indoor_sensitive": {
+        "preset": "indoor_sensitive",
+        "voxel_size": 0.06,
+        "occupied_min_hits": 1,
+        "occupied_over_free_ratio": 0.55,
+        "turn_skip_wz": 0.60,
+        "skip_turn_frames": False,
+    },
+    "warehouse_sparse": {
+        "preset": "warehouse_sparse",
+        "voxel_size": 0.10,
+        "occupied_min_hits": 2,
+        "occupied_over_free_ratio": 0.65,
+        "turn_skip_wz": 0.50,
+        "skip_turn_frames": True,
+    },
+}
 
 
 @dataclass
@@ -47,6 +84,67 @@ def parse_optional_float(value: Any) -> float | None:
         return float(text)
     except (TypeError, ValueError):
         return None
+
+
+def resolve_scan_fusion_config(preset: str | None = None, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    selected = str(preset or "indoor_balanced")
+    base = SCAN_FUSION_PRESETS.get(selected, SCAN_FUSION_PRESETS["indoor_balanced"])
+    config = dict(base)
+    config["preset"] = selected if selected in SCAN_FUSION_PRESETS else "indoor_balanced"
+    if overrides:
+        for key, value in overrides.items():
+            if value is None:
+                continue
+            config[key] = value
+    config["voxel_size"] = max(0.02, float(config["voxel_size"]))
+    config["occupied_min_hits"] = max(1, int(config["occupied_min_hits"]))
+    config["occupied_over_free_ratio"] = max(0.0, float(config["occupied_over_free_ratio"]))
+    config["turn_skip_wz"] = max(0.0, float(config["turn_skip_wz"]))
+    config["skip_turn_frames"] = bool(config["skip_turn_frames"])
+    return config
+
+
+def should_skip_scan_by_turn(wz: float, keyframe: bool, config: dict[str, Any]) -> bool:
+    if keyframe or not bool(config.get("skip_turn_frames", True)):
+        return False
+    return abs(float(wz)) >= float(config.get("turn_skip_wz", 0.0))
+
+
+def is_occupied_scan_cell(cell: dict[str, Any], free: dict[str, Any] | None, config: dict[str, Any]) -> bool:
+    hits = int(cell.get("hits", 0) or 0)
+    if hits < int(config.get("occupied_min_hits", 1)):
+        return False
+    free_hits = int((free or {}).get("hits", 0) or 0)
+    return hits >= free_hits * float(config.get("occupied_over_free_ratio", 0.0))
+
+
+def build_scan_fusion_metadata(config: dict[str, Any]) -> dict[str, Any]:
+    resolved = resolve_scan_fusion_config(str(config.get("preset", "indoor_balanced")), config)
+    return {
+        "preset": str(resolved["preset"]),
+        "voxel_size": float(resolved["voxel_size"]),
+        "occupied_min_hits": int(resolved["occupied_min_hits"]),
+        "occupied_over_free_ratio": float(resolved["occupied_over_free_ratio"]),
+        "turn_skip_wz": float(resolved["turn_skip_wz"]),
+        "skip_turn_frames": bool(resolved["skip_turn_frames"]),
+    }
+
+
+def extract_scan_fusion_config(manifest: dict[str, Any], default_preset: str = "indoor_balanced") -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    scan_fusion = manifest.get("scan_fusion")
+    if isinstance(scan_fusion, dict):
+        overrides.update(scan_fusion)
+    notes = manifest.get("notes")
+    if isinstance(notes, str) and notes.strip():
+        try:
+            parsed_notes = json.loads(notes)
+        except Exception:  # noqa: BLE001
+            parsed_notes = None
+        if isinstance(parsed_notes, dict) and "voxelSize" in parsed_notes and "voxel_size" not in overrides:
+            overrides["voxel_size"] = parsed_notes["voxelSize"]
+    preset = str(overrides.get("preset") or default_preset)
+    return resolve_scan_fusion_config(preset, overrides)
 
 
 def parse_batch_poi_text(text: str) -> list[dict[str, Any]]:

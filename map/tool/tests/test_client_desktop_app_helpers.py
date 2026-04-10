@@ -244,6 +244,63 @@ def test_on_key_press_cancels_pending_keyup_stop_before_it_fires() -> None:
     assert ensured == ["loop"]
 
 
+def test_browser_occupancy_includes_scan_fusion_metadata() -> None:
+    class Var:
+        def __init__(self, value) -> None:
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value) -> None:
+            self.value = value
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.scan = {"voxel": 0.06, "occupied": {"1:2": {"ix": 1, "iy": 2, "hits": 1, "intensity": 0.8}}, "free": {}}
+    client.scan_fusion = {"preset": "indoor_sensitive", "voxel_size": 0.06, "occupied_min_hits": 1, "occupied_over_free_ratio": 0.55, "turn_skip_wz": 0.6, "skip_turn_frames": False}
+    client.scan_fusion_preset_var = Var("indoor_sensitive")
+    client.voxel_var = Var("0.06")
+    client.occupied_min_hits_var = Var("1")
+    client.occupied_over_free_ratio_var = Var("0.55")
+    client.turn_skip_wz_var = Var("0.60")
+    client.skip_turn_frames_var = Var(False)
+    client.number = DesktopClient.number.__get__(client, DesktopClient)
+    client.effective_scan_fusion_config = DesktopClient.effective_scan_fusion_config.__get__(client, DesktopClient)
+
+    payload = DesktopClient.browser_occupancy(client)
+
+    assert payload["scan_fusion"]["preset"] == "indoor_sensitive"
+    assert payload["scan_fusion"]["occupied_min_hits"] == 1
+
+
+def test_apply_scan_fusion_config_updates_runtime_and_vars() -> None:
+    class Var:
+        def __init__(self, value) -> None:
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value) -> None:
+            self.value = value
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.scan = {"voxel": 0.08}
+    client.scan_fusion = {}
+    client.scan_fusion_preset_var = Var("indoor_balanced")
+    client.voxel_var = Var("0.08")
+    client.occupied_min_hits_var = Var("2")
+    client.occupied_over_free_ratio_var = Var("0.75")
+    client.turn_skip_wz_var = Var("0.45")
+    client.skip_turn_frames_var = Var(True)
+
+    DesktopClient.apply_scan_fusion_config(client, {"preset": "warehouse_sparse", "occupied_min_hits": 4}, update_vars=True)
+
+    assert client.scan["voxel"] == 0.1
+    assert client.scan_fusion_preset_var.get() == "warehouse_sparse"
+    assert client.occupied_min_hits_var.get() == "4"
+
+
 def test_start_scan_does_not_activate_local_scan_when_server_rejects_prereq(monkeypatch) -> None:
     warnings = []
     monkeypatch.setattr("client_desktop.app.messagebox.showwarning", lambda title, message: warnings.append((title, message)))
