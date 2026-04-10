@@ -33,6 +33,7 @@ map_dir = Path("data/maps")
 latest_points: list[tuple[float, float, float]] = []
 seq_by_topic: dict[str, int] = defaultdict(int)
 ws_clients: set[int] = set()
+motion_command_seq = 0
 
 
 STREAM_TOPICS = [
@@ -327,9 +328,13 @@ async def reset_scan() -> dict:
 @app.post("/control/move")
 async def move(cmd: MoveCommand) -> dict:
     if ros.enabled and ros.bridge is not None:
+        global motion_command_seq
+        motion_command_seq += 1
+        command_seq = motion_command_seq
         ros.bridge.publish_cmd_vel(cmd.velocity, cmd.yaw_rate)
         await asyncio.sleep(cmd.duration)
-        ros.bridge.stop_motion()
+        if command_seq == motion_command_seq:
+            ros.bridge.stop_motion()
         state = {
             "pose": ros.bridge.latest_pose(),
             "gps": ros.bridge.latest_gps(),
@@ -345,6 +350,8 @@ async def move(cmd: MoveCommand) -> dict:
 
 @app.post("/control/stop")
 async def stop() -> dict:
+    global motion_command_seq
+    motion_command_seq += 1
     if ros.enabled and ros.bridge is not None:
         ros.bridge.stop_motion()
     else:
