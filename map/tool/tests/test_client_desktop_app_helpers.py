@@ -158,3 +158,109 @@ def test_move_click_uses_async_api_for_stop() -> None:
     DesktopClient.move_click(client, "stop")
 
     assert calls == [("async", "/control/stop", {})]
+
+
+def test_on_key_release_delays_stop_until_after_confirmation_window() -> None:
+    class Root:
+        def __init__(self) -> None:
+            self.scheduled: list[tuple[int, object]] = []
+
+        def focus_get(self):
+            return None
+
+        def after(self, delay_ms: int, callback):
+            token = object()
+            self.scheduled.append((delay_ms, callback))
+            return token
+
+        def after_cancel(self, _token) -> None:
+            raise AssertionError("should not cancel in this scenario")
+
+    class Var:
+        def __init__(self, value) -> None:
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value) -> None:
+            self.value = value
+
+    class Event:
+        keysym = "w"
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.root = Root()
+    client.keys_down = set()
+    client.stop_on_keyup_var = Var(True)
+    client.keyboard_var = Var("")
+    client.pending_keyup_stop_id = None
+    client.move_click = lambda name: (_ for _ in ()).throw(AssertionError(f"unexpected immediate move_click({name})"))
+    client.tr = lambda key, **_kwargs: key
+
+    DesktopClient.on_key_release(client, Event())
+
+    assert len(client.root.scheduled) == 1
+    assert client.root.scheduled[0][0] > 0
+
+
+def test_on_key_press_cancels_pending_keyup_stop_before_it_fires() -> None:
+    class Root:
+        def __init__(self) -> None:
+            self.cancelled = []
+
+        def focus_get(self):
+            return None
+
+        def after(self, _delay_ms: int, _callback):
+            raise AssertionError("after should not be called by key press")
+
+        def after_cancel(self, token) -> None:
+            self.cancelled.append(token)
+
+    class Var:
+        def __init__(self, value) -> None:
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    class Event:
+        keysym = "w"
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.root = Root()
+    client.keys_down = set()
+    client.stop_on_keyup_var = Var(True)
+    client.pending_keyup_stop_id = "pending-stop"
+    ensured = []
+    client.ensure_drive_loop = lambda: ensured.append("loop")
+
+    DesktopClient.on_key_press(client, Event())
+
+    assert client.root.cancelled == ["pending-stop"]
+    assert client.pending_keyup_stop_id is None
+    assert client.keys_down == {"w"}
+    assert ensured == ["loop"]
+
+
+def test_start_scan_does_not_activate_local_scan_when_server_rejects_prereq(monkeypatch) -> None:
+    warnings = []
+    monkeypatch.setattr("client_desktop.app.messagebox.showwarning", lambda title, message: warnings.append((title, message)))
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.scan = {"active": False}
+    client.edit = {"loaded_from_stcm": True, "loaded_map_name": "demo"}
+    client.tr = lambda key, **_kwargs: key
+    client.call_api = lambda _path, _body: {
+        "ok": False,
+        "reason": "mapping_prereq_failed",
+        "mapping_prereq": {"blockers": ["tf base->lidar missing", "odom topic stale"]},
+    }
+    client.clear_scan = lambda: (_ for _ in ()).throw(AssertionError("clear_scan should not run"))
+    client.sync_scan_badges = lambda: (_ for _ in ()).throw(AssertionError("sync_scan_badges should not run"))
+
+    DesktopClient.start_scan(client)
+
+    assert client.scan["active"] is False
+    assert warnings
