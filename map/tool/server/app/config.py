@@ -14,8 +14,8 @@ class RosTopicConfig(BaseModel):
     tf: str = "/tf"
     tf_static: str = "/tf_static"
     odom_frame: str = "odom"
-    robot_base_frame: str = "base_footprint"
-    lidar_frame: str = "base_scan"
+    robot_base_frame: str = "base_link"
+    lidar_frame: str = "laser"
     camera_topics: list[str] = Field(default_factory=list)
     cmd_vel: str = "/cmd_vel"
 

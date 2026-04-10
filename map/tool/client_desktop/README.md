@@ -21,6 +21,38 @@ The desktop client now tracks the browser client feature set closely:
 - Buffered camera snapshot refresh
 - Panel visibility toggles
 
+## Keyboard Drive Notes
+
+Move control uses three parameters together:
+
+- `cmd duration`: how long each `/control/move` command stays effective on the server.
+- `repeat (ms)`: how often the desktop client resends the current keyboard command while a key is held.
+- `stop on keyup`: when enabled, key release schedules a short confirmation window before sending `/control/stop`.
+
+Recommended relationship:
+
+- Keep `repeat (ms)` slightly smaller than `cmd duration`.
+- Default values `cmd duration=0.15` and `repeat=120ms` are intended to overlap, so motion remains continuous while the key is held.
+
+Why `stop on keyup` previously felt blunt:
+
+- Continuous keyboard drive is implemented by repeated short-duration `/control/move` commands.
+- Some platforms emit repeat-related `KeyRelease/KeyPress` jitter while a key is still physically held.
+- The desktop client now delays `keyup` stop confirmation briefly before sending `/control/stop`, so auto-repeat jitter does not interrupt motion, while real key release still stops quickly.
+
+Current behavior:
+
+- `stop on keyup` enabled: smooth hold motion, quick stop on real key release.
+- `stop on keyup` disabled: movement stops only when the repeated move commands stop arriving and their server-side `cmd duration` expires.
+
+## Mapping Prerequisites
+
+The desktop client no longer treats `/health` as a high-frequency connection probe.
+
+- WebSocket state, message gap, lag, and API errors are still detected directly by the client.
+- `/health` is polled at a lower frequency and is mainly used to display server-side mapping readiness summary.
+- If the server rejects `/scan/start` because TF, odom, or lidar prerequisites are not ready, the desktop client shows the returned blockers directly.
+
 ## Run
 
 ```bash

@@ -166,6 +166,33 @@ def strip_legacy_trajectory(manifest: dict) -> dict:
     return cleaned
 
 
+KEYUP_STOP_CONFIRM_MS = 50
+HEALTH_POLL_INTERVAL_SEC = 15.0
+
+
+def summarize_mapping_status(health: dict) -> str:
+    status = str(health.get("mapping_status", "ok"))
+    blockers = list(health.get("mapping_blockers", []) or [])
+    warnings = list(health.get("mapping_warnings", []) or [])
+    if blockers:
+        return f"blocked: {blockers[0]}"
+    if warnings:
+        return f"warn: {warnings[0]}"
+    if status == "ok" and "mapping_ready" in health:
+        return "ready"
+    return status
+
+
+def mapping_prereq_message(summary: dict) -> str:
+    blockers = list(summary.get("blockers", []) or [])
+    warnings = list(summary.get("warnings", []) or [])
+    if blockers:
+        return "\n".join(blockers)
+    if warnings:
+        return "\n".join(warnings)
+    return "mapping prerequisites not satisfied"
+
+
 def runtime_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -423,6 +450,7 @@ class DesktopClient:
                 "connected": "Connected",
                 "status_line": "WS {ws} | scan {scan} | poi {poi} | path {path}",
                 "status_detail": "WS ok | clients {clients} | scan {scan} | ros {ros}",
+                "status_detail_mapping": "WS ok | clients {clients} | scan {scan} | ros {ros} | map {mapping}",
                 "recording_obstacles": "Recording {count} obstacle cells",
                 "stopped_summary": "Stopped | {obs} obs / {free} safe",
                 "loaded_badge": "Loaded: {name}",
@@ -572,6 +600,7 @@ class DesktopClient:
                 "connected": "已连接",
                 "status_line": "WS {ws} | 扫描 {scan} | POI {poi} | 路径 {path}",
                 "status_detail": "WS 正常 | 客户端 {clients} | 扫描 {scan} | ROS {ros}",
+                "status_detail_mapping": "WS 正常 | 客户端 {clients} | 扫描 {scan} | ROS {ros} | 建图 {mapping}",
                 "recording_obstacles": "正在记录 {count} 个障碍栅格",
                 "stopped_summary": "已停止 | 障碍 {obs} / 空闲 {free}",
                 "loaded_badge": "已加载：{name}",
@@ -684,6 +713,7 @@ class DesktopClient:
         self.view = {"scale": 25.0, "pan_x": 0.0, "pan_y": 0.0, "dragging": False, "moved": False, "last_xy": (0, 0)}
         self.keys_down: set[str] = set()
         self.drive_loop_scheduled = False
+        self.pending_keyup_stop_id = None
         self.last_message_at_ms = 0
         self.last_health_poll_at = 0.0
         self.health: dict = {}
@@ -1231,6 +1261,17 @@ class DesktopClient:
         target.pack(fill=tk.X, pady=(0, 6))
         self.batch_action_btn.configure(text=self.tr("start_batch_add") if self.pending_poi is None and not self.pending_poi_queue else self.tr("cancel_batch", count=len(self.pending_poi_queue) + (1 if self.pending_poi else 0)))
 
+    def update_health_status_detail(self, health: dict) -> None:
+        self.status_detail_var.set(
+            self.tr(
+                "status_detail_mapping",
+                clients=health.get("ws_clients", "n/a"),
+                scan="on" if health.get("scan_active") else "off",
+                ros="enabled" if health.get("ros_enabled") else "detected only",
+                mapping=summarize_mapping_status(health),
+            )
+        )
+
     def connect(self) -> None:
         try:
             self.disconnect()
@@ -1243,14 +1284,7 @@ class DesktopClient:
             self.bridge = ServerBridge(normalized_url, logger=self.logger)
             health = self.bridge.get("/health")
             self.health = health
-            self.status_detail_var.set(
-                self.tr(
-                    "status_detail",
-                    clients=health.get("ws_clients", "n/a"),
-                    scan="on" if health.get("scan_active") else "off",
-                    ros="enabled" if health.get("ros_enabled") else "detected only",
-                )
-            )
+            self.update_health_status_detail(health)
             self.logger.info("connect preflight ok ws_clients=%s", health.get("ws_clients"))
             self.bridge.start()
             self.conn_var.set(self.tr("connecting"))
@@ -1295,19 +1329,12 @@ class DesktopClient:
 
     def poll_health(self) -> None:
         now = time.monotonic()
-        if now - self.last_health_poll_at < 5.0 or not self.bridge:
+        if now - self.last_health_poll_at < HEALTH_POLL_INTERVAL_SEC or not self.bridge or not self.bridge.connected:
             return
         self.last_health_poll_at = now
         try:
             self.health = self.bridge.get("/health")
-            self.status_detail_var.set(
-                self.tr(
-                    "status_detail",
-                    clients=self.health.get("ws_clients", "n/a"),
-                    scan="on" if self.health.get("scan_active") else "off",
-                    ros="enabled" if self.health.get("ros_enabled") else "detected only",
-                )
-            )
+            self.update_health_status_detail(self.health)
         except Exception as exc:
             self.stream_health["last_api_error"] = str(exc)
             self.logger.warning("health poll failed err=%s", exc)
@@ -1395,7 +1422,14 @@ class DesktopClient:
         self.camera_refresh_var.set(build_camera_refresh_text(self.camera_inbox))
 
     def start_scan(self) -> None:
-        if self.call_api("/scan/start", {}) is not None:
+        response = self.call_api("/scan/start", {})
+        if response is None:
+            return
+        if not bool(response.get("ok", True)):
+            if response.get("reason") == "mapping_prereq_failed":
+                messagebox.showwarning(self.tr("scan"), mapping_prereq_message(response.get("mapping_prereq") or {}))
+            return
+        if response is not None:
             self.clear_scan()
             self.edit["loaded_from_stcm"] = False
             self.edit["loaded_map_name"] = ""
@@ -1952,6 +1986,26 @@ class DesktopClient:
         self.drive_loop_scheduled = True
         self.root.after(0, self.drive_loop)
 
+    def cancel_pending_keyup_stop(self) -> None:
+        if self.pending_keyup_stop_id is None:
+            return
+        try:
+            self.root.after_cancel(self.pending_keyup_stop_id)
+        except Exception:
+            pass
+        self.pending_keyup_stop_id = None
+
+    def confirm_keyup_stop(self) -> None:
+        self.pending_keyup_stop_id = None
+        if not self.stop_on_keyup_var.get() or self.keys_down:
+            return
+        self.move_click("stop")
+        self.keyboard_var.set(self.tr("keyboard_stop_keyup"))
+
+    def schedule_keyup_stop(self) -> None:
+        self.cancel_pending_keyup_stop()
+        self.pending_keyup_stop_id = self.root.after(KEYUP_STOP_CONFIRM_MS, self.confirm_keyup_stop)
+
     def should_ignore_global_keys(self, widget: tk.Misc | None) -> bool:
         return isinstance(widget, (tk.Entry, tk.Text, tk.Listbox, ttk.Entry, ttk.Combobox))
 
@@ -1960,6 +2014,7 @@ class DesktopClient:
             return
         key = event.keysym.lower()
         if key in {"w", "a", "s", "d", "up", "down", "left", "right", "space"}:
+            self.cancel_pending_keyup_stop()
             self.keys_down.add(key)
             self.ensure_drive_loop()
 
@@ -1969,8 +2024,7 @@ class DesktopClient:
         key = event.keysym.lower()
         self.keys_down.discard(key)
         if self.stop_on_keyup_var.get() and not self.keys_down:
-            self.move_click("stop")
-            self.keyboard_var.set(self.tr("keyboard_stop_keyup"))
+            self.schedule_keyup_stop()
 
     def edit_tool_changed(self) -> None:
         self.edit["tool"] = self.edit_tool_var.get()

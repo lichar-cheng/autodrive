@@ -72,7 +72,6 @@ SERVER_RUNTIME = {
     "forced_disconnect_total": 0,
 }
 
-
 SCAN_SESSION = {
     "active": False,
     "started_at": 0.0,
@@ -220,6 +219,63 @@ def _ros_diag() -> dict[str, Any]:
     return {}
 
 
+def _network_diag_summary() -> dict[str, Any]:
+    topic_stats = bus.stats()
+    warnings: list[str] = []
+    checks = {
+        "ws_clients": {"ok": len(ws_clients) > 0, "value": len(ws_clients)},
+        "topic_bus": {"ok": True, "topics": []},
+    }
+    if len(ws_clients) == 0:
+        warnings.append("no websocket clients connected")
+    degraded_topics: list[str] = []
+    for topic, stat in topic_stats.items():
+        if float(stat.get("drop_rate", 0.0)) > 0.05 or float(stat.get("peak_fill_ratio", 0.0)) > 0.9:
+            degraded_topics.append(topic)
+    if degraded_topics:
+        warnings.append(f"topic bus pressure on {', '.join(sorted(degraded_topics))}")
+        checks["topic_bus"]["ok"] = False
+    checks["topic_bus"]["topics"] = degraded_topics
+    return {"ok": not warnings, "warnings": warnings, "checks": checks}
+
+
+def _mapping_prereq_summary() -> dict[str, Any]:
+    if ros.enabled and ros.bridge is not None and hasattr(ros.bridge, "mapping_prerequisites"):
+        summary = dict(ros.bridge.mapping_prerequisites())
+    elif ros.enabled:
+        summary = {
+            "ready": False,
+            "severity": "error",
+            "blockers": ["ros bridge does not expose mapping prerequisites"],
+            "warnings": [],
+            "checks": {"ros_runtime": {"ok": False}},
+        }
+    else:
+        summary = {
+            "ready": bool(sim._running),
+            "severity": "ok" if bool(sim._running) else "warn",
+            "blockers": [] if bool(sim._running) else ["ros disabled and simulator inactive"],
+            "warnings": [] if bool(sim._running) else ["mapping data source unavailable"],
+            "checks": {"data_source": {"ok": bool(sim._running), "source": "simulator" if bool(sim._running) else "none"}},
+        }
+
+    network = _network_diag_summary()
+    checks = dict(summary.get("checks", {}))
+    checks["network"] = network["checks"]
+    warnings = list(summary.get("warnings", []))
+    warnings.extend(item for item in network["warnings"] if item not in warnings)
+    blockers = list(summary.get("blockers", []))
+    severity = "error" if blockers else "warn" if warnings else "ok"
+    ready = bool(summary.get("ready", False)) and not blockers
+    return {
+        "ready": ready,
+        "severity": severity,
+        "blockers": blockers,
+        "warnings": warnings,
+        "checks": checks,
+    }
+
+
 def _current_map_points() -> list[tuple[float, float, float]]:
     global latest_points
 
@@ -260,6 +316,7 @@ async def shutdown() -> None:
 
 @app.get("/health")
 async def health() -> dict:
+    mapping_prereq = _mapping_prereq_summary()
     return {
         "ok": True,
         "ros_enabled": ros.enabled,
@@ -269,6 +326,10 @@ async def health() -> dict:
         "topics": STREAM_TOPICS,
         "scan_summary": _scan_summary(),
         "ros_diag": _ros_diag(),
+        "mapping_ready": bool(mapping_prereq["ready"]),
+        "mapping_status": mapping_prereq["severity"],
+        "mapping_blockers": list(mapping_prereq["blockers"]),
+        "mapping_warnings": list(mapping_prereq["warnings"]),
         "simulator_active": bool(sim._running),
         "map_source": "occupancy_grid" if CONFIG.ros.topics.occupancy_grid else "laser_accumulation",
         "frames": {
@@ -277,6 +338,17 @@ async def health() -> dict:
             "lidar": CONFIG.ros.topics.lidar_frame,
         },
         "capacity": _server_capacity_summary(),
+    }
+
+
+@app.get("/diag/mapping_prereq")
+async def diag_mapping_prereq() -> dict:
+    return {
+        "ok": True,
+        "ros_enabled": ros.enabled,
+        "simulator_active": bool(sim._running),
+        "mapping_prereq": _mapping_prereq_summary(),
+        "ros_diag": _ros_diag(),
     }
 
 
@@ -296,6 +368,16 @@ async def diag_stream_stats() -> dict:
 
 @app.post("/scan/start")
 async def start_scan() -> dict:
+    mapping_prereq = _mapping_prereq_summary()
+    if not mapping_prereq["ready"]:
+        logger.warning("scan start rejected blockers=%s warnings=%s", mapping_prereq["blockers"], mapping_prereq["warnings"])
+        return {
+            "ok": False,
+            "reason": "mapping_prereq_failed",
+            "scan_active": False,
+            "mapping_prereq": mapping_prereq,
+            "ros_enabled": ros.enabled,
+        }
     _reset_scan_session()
     SCAN_SESSION["active"] = True
     SCAN_SESSION["started_at"] = time.time()

@@ -7,6 +7,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+MAPPING_TOPIC_MAX_AGE_SEC = 2.5
+MAPPING_TF_MAX_AGE_SEC = 2.5
+
 
 @dataclass
 class RosRuntime:
@@ -31,6 +34,7 @@ class RosBridgeState:
     latest_occupancy_points: list[tuple[float, float, float]] = field(default_factory=list)
     camera_payloads: dict[str, dict[str, Any]] = field(default_factory=dict)
     tf_tree: dict[tuple[str, str], dict[str, float | str]] = field(default_factory=dict)
+    last_scan_frame_by_side: dict[str, str] = field(default_factory=dict)
     scanning: bool = False
 
 
@@ -42,6 +46,18 @@ def _yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
 
 def _normalize_frame(frame_id: str) -> str:
     return str(frame_id).lstrip("/")
+
+
+def _build_tf_static_qos(qos_module: Any, sensor_profile: Any) -> Any:
+    try:
+        return qos_module.QoSProfile(
+            depth=1,
+            durability=qos_module.DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=qos_module.ReliabilityPolicy.RELIABLE,
+            history=qos_module.HistoryPolicy.KEEP_LAST,
+        )
+    except Exception:  # noqa: BLE001
+        return sensor_profile
 
 
 class RosBridge:
@@ -72,6 +88,7 @@ class RosBridge:
             import rclpy
             from geometry_msgs.msg import Twist
             from nav_msgs.msg import OccupancyGrid, Odometry
+            from rclpy import qos as rclpy_qos
             from rclpy.qos import qos_profile_sensor_data
             from sensor_msgs.msg import CompressedImage, Imu, LaserScan, NavSatFix
             from tf2_msgs.msg import TFMessage
@@ -87,11 +104,12 @@ class RosBridge:
         self._node = rclpy.create_node(self.config.node_name)
         self._cmd_pub = self._node.create_publisher(Twist, self.config.topics.cmd_vel, 10)
 
+        tf_static_qos = _build_tf_static_qos(rclpy_qos, qos_profile_sensor_data)
         self._subscriptions = [
             self._node.create_subscription(Odometry, self.config.topics.odom, self._on_odom, qos_profile_sensor_data),
             self._node.create_subscription(Imu, self.config.topics.imu, self._on_imu, qos_profile_sensor_data),
             self._node.create_subscription(TFMessage, self.config.topics.tf, self._on_tf, qos_profile_sensor_data),
-            self._node.create_subscription(TFMessage, self.config.topics.tf_static, self._on_tf_static, qos_profile_sensor_data),
+            self._node.create_subscription(TFMessage, self.config.topics.tf_static, self._on_tf_static, tf_static_qos),
         ]
 
         if self.config.topics.gps:
@@ -160,6 +178,7 @@ class RosBridge:
             self._rclpy.shutdown()
 
     def diagnostics(self) -> dict[str, Any]:
+        lidar_transform = self._resolve_lidar_mount()
         with self._lock:
             return {
                 "connected_topics": list(self.state.connected_topics),
@@ -172,8 +191,72 @@ class RosBridge:
                 "imu": dict(self.state.last_imu),
                 "has_occupancy_grid": bool(self.config.topics.occupancy_grid),
                 "tf_pairs": [f"{parent}->{child}" for parent, child in self.state.tf_tree.keys()],
-                "lidar_transform_available": self._resolve_lidar_mount() is not None,
+                "lidar_transform_available": lidar_transform is not None,
+                "lidar_transform": dict(lidar_transform) if lidar_transform is not None else None,
             }
+
+    def mapping_prerequisites(self, now: float | None = None) -> dict[str, Any]:
+        now = float(now if now is not None else time.time())
+        checks: dict[str, dict[str, Any]] = {}
+        blockers: list[str] = []
+        warnings: list[str] = []
+
+        def add_topic_check(name: str, topic_name: str, required: bool = True) -> None:
+            if not topic_name:
+                checks[name] = {"ok": not required, "required": required, "topic": topic_name, "reason": "not configured"}
+                if required:
+                    blockers.append(f"{name} topic not configured")
+                return
+            last_at = float(self.state.last_message_time_by_topic.get(topic_name, 0.0))
+            age_sec = round(max(0.0, now - last_at), 3) if last_at > 0 else None
+            ok = last_at > 0 and (now - last_at) <= MAPPING_TOPIC_MAX_AGE_SEC
+            checks[name] = {"ok": ok, "required": required, "topic": topic_name, "age_sec": age_sec}
+            if required and not ok:
+                blockers.append(f"{name} topic stale or missing")
+
+        with self._lock:
+            add_topic_check("odom", self.config.topics.odom, required=True)
+            lidar_topics: list[tuple[str, str, bool]] = []
+            if self.config.topics.lidar_front:
+                lidar_topics.append(("lidar_front", self.config.topics.lidar_front, True))
+            if self.config.topics.lidar_rear:
+                lidar_topics.append(("lidar_rear", self.config.topics.lidar_rear, True))
+            if not lidar_topics:
+                lidar_topics.append(("lidar", self.config.topics.lidar_fallback, True))
+            for name, topic_name, required in lidar_topics:
+                add_topic_check(name, topic_name, required=required)
+
+            lidar_transform = self._resolve_lidar_mount()
+
+        tf_ok = lidar_transform is not None
+        tf_age_sec = None
+        tf_source = None
+        if lidar_transform is not None:
+            tf_source = str(lidar_transform.get("source", ""))
+            tf_stamp = float(lidar_transform.get("stamp", 0.0) or 0.0)
+            if tf_stamp > 0:
+                tf_age_sec = round(max(0.0, now - tf_stamp), 3)
+            if tf_source and "tf_static" not in tf_source and tf_age_sec is not None and tf_age_sec > MAPPING_TF_MAX_AGE_SEC:
+                tf_ok = False
+        checks["tf_tree"] = {
+            "ok": tf_ok,
+            "required": True,
+            "base_frame": self.config.topics.robot_base_frame,
+            "lidar_frame": self.config.topics.lidar_frame,
+            "source": tf_source,
+            "age_sec": tf_age_sec,
+        }
+        if not tf_ok:
+            blockers.append("tf base->lidar missing or stale")
+
+        readiness = not blockers
+        return {
+            "ready": readiness,
+            "severity": "ok" if readiness and not warnings else "warn" if not blockers else "error",
+            "blockers": blockers,
+            "warnings": warnings,
+            "checks": checks,
+        }
 
     def latest_map_points(self) -> list[tuple[float, float, float]]:
         with self._lock:
@@ -267,11 +350,41 @@ class RosBridge:
         }
 
     def _resolve_lidar_mount(self) -> dict[str, float | str] | None:
-        lidar_frame = self.config.topics.lidar_frame
         base_frame = self.config.topics.robot_base_frame
-        if not lidar_frame or _normalize_frame(lidar_frame) == _normalize_frame(base_frame):
+        normalized_base = _normalize_frame(base_frame)
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def add_candidate(frame_id: str) -> None:
+            normalized = _normalize_frame(frame_id)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                candidates.append(normalized)
+
+        add_candidate(self.config.topics.lidar_frame)
+        with self._lock:
+            for frame_id in self.state.last_scan_frame_by_side.values():
+                add_candidate(frame_id)
+
+        if not candidates:
             return {"tx": 0.0, "ty": 0.0, "tz": 0.0, "yaw": 0.0, "source": "identity", "stamp": time.time()}
-        return self._lookup_transform(base_frame, lidar_frame)
+
+        for lidar_frame in candidates:
+            if lidar_frame == normalized_base:
+                return {
+                    "tx": 0.0,
+                    "ty": 0.0,
+                    "tz": 0.0,
+                    "yaw": 0.0,
+                    "source": "identity",
+                    "stamp": time.time(),
+                    "lidar_frame": lidar_frame,
+                }
+            transform = self._lookup_transform(base_frame, lidar_frame)
+            if transform is not None:
+                transform["lidar_frame"] = lidar_frame
+                return transform
+        return None
 
     def _on_odom(self, msg) -> None:  # noqa: ANN001
         pose = msg.pose.pose
@@ -364,6 +477,8 @@ class RosBridge:
         max_points = int(self.config.lidar_max_points_per_scan)
         pose = self.latest_pose()
         scan_frame = _normalize_frame(msg.header.frame_id) if getattr(msg, "header", None) else _normalize_frame(self.config.topics.lidar_frame)
+        with self._lock:
+            self.state.last_scan_frame_by_side[side] = scan_frame
         lidar_mount = self._resolve_lidar_mount()
         mount_tx = 0.0
         mount_ty = 0.0

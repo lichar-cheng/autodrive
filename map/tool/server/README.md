@@ -46,6 +46,7 @@ tool/server/
 - 若 ROS2 可用，启用 `RosBridge`。
 - 若 ROS2 不可用且允许降级，启动 `Simulator`。
 - 提供全部 HTTP 接口。
+- 提供 `/health` 和 `/diag/mapping_prereq` 诊断接口。
 - 提供 `/ws/stream` 实时推流。
 - 维护扫描会话状态：
   - 是否在采集中
@@ -139,6 +140,7 @@ ROS2 桥接层，作用是把 ROS topic 统一转成服务端内部 topic。
 - 根据 TF 解析雷达相对车体安装位姿。
 - 发布 `/cmd_vel` 控制机器人。
 - 提供 ROS 诊断信息。
+- 提供建图前置条件检查。
 
 内部转换后的统一 topic 仍然是：
 
@@ -218,6 +220,146 @@ ROS2 不可用且允许 fallback 时：
 - `Simulator.start()` 启动异步循环。
 - 按 `sim_rate_hz` 周期生成位姿、GPS、底盘、相机、雷达和简化地图。
 - 所有消息同样进入 `TopicBus`。
+
+## 5. 健康检查与建图前置条件
+
+### 5.1 `/health`
+
+`/health` 提供轻量摘要，适合客户端低频轮询。
+
+重点字段：
+
+- `mapping_ready`
+- `mapping_status`
+- `mapping_blockers`
+- `mapping_warnings`
+
+保留的基础运行信息：
+
+- `ros_enabled`
+- `scan_active`
+- `ws_clients`
+- `scan_summary`
+- `ros_diag`
+
+设计意图：
+
+- 客户端对连接不稳定的主要感知仍来自 WebSocket 自身状态、消息 gap、延迟和 API 错误。
+- `/health` 不再承担高频链路探测职责，更多用于提供“是否具备开始建图条件”的摘要。
+
+### 5.2 `/diag/mapping_prereq`
+
+`/diag/mapping_prereq` 返回建图前置条件的详细结果，结构包含：
+
+- `ready`
+- `severity`
+- `blockers`
+- `warnings`
+- `checks`
+
+当前检查重点：
+
+- `odom` topic 是否存在且足够新鲜
+- 前/后雷达或 fallback lidar 是否存在且足够新鲜
+- `robot_base_frame -> lidar_frame` 或实际观测到的 `scan_frame` 是否可解析
+- 动态 TF 是否过旧
+- websocket client 和 topic bus 是否存在明显链路压力
+
+约定：
+
+- `blockers` 会阻止开始建图
+- `warnings` 只提示风险，不阻止开始建图
+
+### 5.3 `/scan/start` 前置拦截
+
+调用 `/scan/start` 时，服务端会先执行建图前置检查。
+
+如果条件不满足，不会启动扫描，而是返回：
+
+```json
+{
+  "ok": false,
+  "reason": "mapping_prereq_failed",
+  "scan_active": false,
+  "mapping_prereq": {
+    "ready": false,
+    "severity": "error",
+    "blockers": ["..."],
+    "warnings": ["..."],
+    "checks": {}
+  }
+}
+```
+
+这样可以避免 TF 树未准备好、里程计缺失或激光输入异常时误开始建图。
+
+### 5.4 TF 树要求
+
+ROS 模式下，建图至少要求：
+
+- 有可用的 `odom`
+- 有可用的 lidar topic
+- 服务端可以从 `robot_base_frame` 解析到雷达 frame
+
+说明：
+
+- 服务端优先使用实际收到的 `LaserScan.header.frame_id` 作为雷达 frame
+- `lidar_frame` 是配置兜底值，当雷达消息里没有可用 frame 或尚未收到 scan 时使用
+- 若解析出的雷达 frame 与 `robot_base_frame` 相同，视为 identity transform
+- `tf_static` 来源的变换可以长期有效
+- 动态 `tf` 若长时间不更新，会被视为 stale 并进入 blocker
+
+### 5.4.1 新车适配需要改哪些配置
+
+适配一台新车时，优先检查并修改 `server/app/config.py` 里的 `RosTopicConfig`。
+
+通常至少需要确认这些字段：
+
+- `odom`
+- `imu`
+- `tf`
+- `tf_static`
+- `cmd_vel`
+- `lidar_fallback`，或者 `lidar_front` / `lidar_rear`
+- `odom_frame`
+- `robot_base_frame`
+- `lidar_frame`
+
+如果现场真实 TF 是：
+
+```text
+odom -> base_link -> laser
+```
+
+那默认建议配置就是：
+
+```python
+odom_frame = "odom"
+robot_base_frame = "base_link"
+lidar_frame = "laser"
+lidar_fallback = "/scan"
+```
+
+推荐做法是两层都保留：
+
+- 配置里明确写这台车的标准 frame/topic
+- 运行时允许服务端根据实际 `scan_frame` 自动兜底
+
+这样既方便诊断，也不会把 TF 树完全写死。
+
+### 5.5 网络不稳定时的处理原则
+
+区分两类问题：
+
+1. 数据源前置条件失效
+例如 odom 或 lidar 实际断流，导致建图基础条件不成立
+这类进入 `blockers`
+
+2. 客户端连接或推流质量波动
+例如没有 websocket client、topic bus 有压力、掉帧风险升高
+这类进入 `warnings`
+
+这样可以把“不能开始建图”和“可以建图但链路质量不好”分开表达。
 - 所以客户端不需要区分 ROS 模式和模拟模式。
 
 ## 4.4 WebSocket 推流机制
@@ -364,8 +506,8 @@ python run_server.py
   "map_source": "laser_accumulation",
   "frames": {
     "odom": "odom",
-    "base": "base_footprint",
-    "lidar": "base_scan"
+    "base": "base_link",
+    "lidar": "laser"
   },
   "capacity": {}
 }
