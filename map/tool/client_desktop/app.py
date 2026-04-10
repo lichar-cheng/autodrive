@@ -25,24 +25,36 @@ import websocket
 
 try:
     from .logic import (
+        SCAN_FUSION_PRESETS,
         Point,
+        build_scan_fusion_metadata,
         build_poi_copy_text,
         compute_path_closed_loop_validation,
+        extract_scan_fusion_config,
         infer_missing_geo_points,
+        is_occupied_scan_cell,
         optimize_loop_with_two_opt,
         parse_batch_poi_text,
         plan_path_points,
+        resolve_scan_fusion_config,
+        should_skip_scan_by_turn,
         solve_nearest_loop,
     )
 except ImportError:
     from logic import (  # type: ignore
+        SCAN_FUSION_PRESETS,
         Point,
+        build_scan_fusion_metadata,
         build_poi_copy_text,
         compute_path_closed_loop_validation,
+        extract_scan_fusion_config,
         infer_missing_geo_points,
+        is_occupied_scan_cell,
         optimize_loop_with_two_opt,
         parse_batch_poi_text,
         plan_path_points,
+        resolve_scan_fusion_config,
+        should_skip_scan_by_turn,
         solve_nearest_loop,
     )
 
@@ -694,7 +706,7 @@ class DesktopClient:
         self.scan = {
             "active": False,
             "started_ms": 0,
-            "voxel": 0.12,
+            "voxel": 0.08,
             "front_frames": 0,
             "rear_frames": 0,
             "raw_points": 0,
@@ -703,6 +715,7 @@ class DesktopClient:
             "last_saved_file": "",
             "saved_point_count": 0,
         }
+        self.scan_fusion = resolve_scan_fusion_config("indoor_balanced")
         self.edit = {
             "tool": "view",
             "pending_obstacle_start": None,
@@ -731,7 +744,12 @@ class DesktopClient:
         self.camera_refresh_var = tk.StringVar(value="No buffered frame")
         self.map_name_var = tk.StringVar(value="desktop_map")
         self.map_notes_var = tk.StringVar(value="Desktop scan session")
-        self.voxel_var = tk.StringVar(value="0.12")
+        self.voxel_var = tk.StringVar(value=f"{float(self.scan_fusion['voxel_size']):.2f}")
+        self.scan_fusion_preset_var = tk.StringVar(value=str(self.scan_fusion["preset"]))
+        self.occupied_min_hits_var = tk.StringVar(value=str(int(self.scan_fusion["occupied_min_hits"])))
+        self.occupied_over_free_ratio_var = tk.StringVar(value=f"{float(self.scan_fusion['occupied_over_free_ratio']):.2f}")
+        self.turn_skip_wz_var = tk.StringVar(value=f"{float(self.scan_fusion['turn_skip_wz']):.2f}")
+        self.skip_turn_frames_var = tk.BooleanVar(value=bool(self.scan_fusion["skip_turn_frames"]))
         self.poi_name_var = tk.StringVar()
         self.poi_geo_var = tk.StringVar()
         self.poi_mode_var = tk.StringVar(value="batch")
@@ -980,7 +998,23 @@ class DesktopClient:
         )
         scan_row.pack(fill=tk.X, pady=(0, 6))
         self._entry(card, self.tr("map_name"), self.map_name_var)
+        preset_row = ttk.Frame(card)
+        preset_row.pack(fill=tk.X, pady=2)
+        ttk.Label(preset_row, text="Fusion Preset", width=18).pack(side=tk.LEFT)
+        preset_box = ttk.Combobox(
+            preset_row,
+            textvariable=self.scan_fusion_preset_var,
+            state="readonly",
+            values=list(SCAN_FUSION_PRESETS.keys()),
+            width=18,
+        )
+        preset_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        preset_box.bind("<<ComboboxSelected>>", lambda _e: self.apply_scan_fusion_config_from_ui())
         self._entry(card, self.tr("voxel"), self.voxel_var)
+        self._entry(card, "Min Occupied Hits", self.occupied_min_hits_var)
+        self._entry(card, "Occ/Free Ratio", self.occupied_over_free_ratio_var)
+        self._entry(card, "Turn Skip Wz", self.turn_skip_wz_var)
+        ttk.Checkbutton(card, text="Skip Turn Frames", variable=self.skip_turn_frames_var, command=self.apply_scan_fusion_config_from_ui).pack(anchor=tk.W, pady=(4, 2))
         self._entry(card, self.tr("notes"), self.map_notes_var)
         return card
 
@@ -1474,6 +1508,32 @@ class DesktopClient:
         voxel = float(self.scan["voxel"])
         return round(x / voxel), round(y / voxel)
 
+    def effective_scan_fusion_config(self) -> dict:
+        overrides = {
+            "voxel_size": max(0.02, self.number(self.voxel_var, float(self.scan_fusion.get("voxel_size", 0.08)))),
+            "occupied_min_hits": max(1, round(self.number(self.occupied_min_hits_var, float(self.scan_fusion.get("occupied_min_hits", 2))))),
+            "occupied_over_free_ratio": max(0.0, self.number(self.occupied_over_free_ratio_var, float(self.scan_fusion.get("occupied_over_free_ratio", 0.75)))),
+            "turn_skip_wz": max(0.0, self.number(self.turn_skip_wz_var, float(self.scan_fusion.get("turn_skip_wz", 0.45)))),
+            "skip_turn_frames": bool(self.skip_turn_frames_var.get()),
+        }
+        return resolve_scan_fusion_config(self.scan_fusion_preset_var.get(), overrides)
+
+    def apply_scan_fusion_config(self, config: dict, update_vars: bool = True) -> dict:
+        resolved = resolve_scan_fusion_config(str(config.get("preset", "indoor_balanced")), config)
+        self.scan_fusion = resolved
+        self.scan["voxel"] = float(resolved["voxel_size"])
+        if update_vars:
+            self.scan_fusion_preset_var.set(str(resolved["preset"]))
+            self.voxel_var.set(f"{float(resolved['voxel_size']):.2f}")
+            self.occupied_min_hits_var.set(str(int(resolved["occupied_min_hits"])))
+            self.occupied_over_free_ratio_var.set(f"{float(resolved['occupied_over_free_ratio']):.2f}")
+            self.turn_skip_wz_var.set(f"{float(resolved['turn_skip_wz']):.2f}")
+            self.skip_turn_frames_var.set(bool(resolved["skip_turn_frames"]))
+        return resolved
+
+    def apply_scan_fusion_config_from_ui(self) -> dict:
+        return self.apply_scan_fusion_config(self.effective_scan_fusion_config(), update_vars=True)
+
     def occupied_lookup(self) -> dict[tuple[int, int], dict]:
         return {(int(cell["ix"]), int(cell["iy"])): cell for cell in self.scan["occupied"].values()}
 
@@ -1515,9 +1575,9 @@ class DesktopClient:
     def accumulate_points(self, points: list, stamp: float, keyframe: bool) -> None:
         if not self.scan["active"] or not points:
             return
-        self.scan["voxel"] = max(0.02, self.number(self.voxel_var, 0.12))
+        config = self.apply_scan_fusion_config_from_ui()
         pose = self.pose_for_stamp(stamp)
-        if not keyframe and abs(float(pose.get("wz", 0.0))) >= 0.35:
+        if should_skip_scan_by_turn(float(pose.get("wz", 0.0)), keyframe, config):
             return
         self.scan["raw_points"] += len(points)
         robot_ix, robot_iy = self.world_to_cell(float(pose.get("x", 0.0)), float(pose.get("y", 0.0)))
@@ -1533,18 +1593,20 @@ class DesktopClient:
         self.sync_scan_badges()
 
     def occupied_points(self) -> list[list[float]]:
+        config = self.effective_scan_fusion_config()
         points = []
         for cell in self.scan["occupied"].values():
             free = self.scan["free"].get(self.cell_key(int(cell["ix"]), int(cell["iy"])))
-            free_hits = int(free["hits"]) if free else 0
-            if int(cell["hits"]) < 3 or int(cell["hits"]) < free_hits * 0.9:
+            if not is_occupied_scan_cell(cell, free, config):
                 continue
             points.append([float(cell["ix"]) * float(self.scan["voxel"]), float(cell["iy"]) * float(self.scan["voxel"]), float(cell["intensity"])])
         return points or [[0.0, 0.0, 1.0]]
 
     def browser_occupancy(self) -> dict:
+        config = self.effective_scan_fusion_config()
         return {
             "voxel_size": float(self.scan["voxel"]),
+            "scan_fusion": build_scan_fusion_metadata(config),
             "occupied_cells": [{"ix": int(c["ix"]), "iy": int(c["iy"]), "hits": int(c["hits"]), "intensity": float(c["intensity"])} for c in self.scan["occupied"].values()],
             "free_cells": [{"ix": int(c["ix"]), "iy": int(c["iy"]), "hits": int(c["hits"])} for c in self.scan["free"].values()],
         }
@@ -2251,8 +2313,7 @@ class DesktopClient:
             self.canvas.create_rectangle(sx - size / 2, sy - size / 2, sx + size / 2, sy + size / 2, fill="#ffffff", outline="")
         for cell in self.scan["occupied"].values():
             free = self.scan["free"].get(self.cell_key(int(cell["ix"]), int(cell["iy"])))
-            free_hits = int(free["hits"]) if free else 0
-            if int(cell["hits"]) < 3 or int(cell["hits"]) < free_hits * 0.9:
+            if not is_occupied_scan_cell(cell, free, self.effective_scan_fusion_config()):
                 continue
             sx, sy = self.world_to_screen(float(cell["ix"]) * float(self.scan["voxel"]), float(cell["iy"]) * float(self.scan["voxel"]))
             self.canvas.create_rectangle(sx - size / 2, sy - size / 2, sx + size / 2, sy + size / 2, fill="#0c0f12", outline="")
@@ -2373,7 +2434,8 @@ class DesktopClient:
         )
 
     def set_inspector_bundle_state(self, file_name: str, manifest: dict, points: list) -> None:
-        resolution = max(0.02, self.number(self.voxel_var, 0.10))
+        config = extract_scan_fusion_config(manifest, default_preset=self.scan_fusion_preset_var.get())
+        resolution = float(config["voxel_size"])
         pgm = self.build_pgm_export(manifest, points, resolution)
         yaml_text = self.build_yaml_export(file_name, resolution, pgm["origin"])
         export_manifest = strip_legacy_trajectory(manifest)
@@ -2390,10 +2452,12 @@ class DesktopClient:
 
     def save_stcm(self) -> None:
         self.rebuild_path_nodes()
+        config = self.apply_scan_fusion_config_from_ui()
         voxel_size = float(self.scan["voxel"])
         notes = {
             "text": self.map_notes_var.get().strip(),
             "voxelSize": voxel_size,
+            "scanFusionPreset": config["preset"],
             "loadedFromStcm": self.edit["loaded_from_stcm"],
             "loadedMapName": self.edit["loaded_map_name"] or None,
             "manualCameraSnapshotAt": self.camera_refresh_var.get(),
@@ -2405,6 +2469,7 @@ class DesktopClient:
             "created_at": time.time(),
             "source": "desktop",
             "map_source": "stcm_editor" if self.edit["loaded_from_stcm"] else "laser_accumulation",
+            "scan_fusion": build_scan_fusion_metadata(config),
             "browser_occupancy": self.browser_occupancy(),
             "pose": self.pose,
             "gps": self.gps,
@@ -2465,15 +2530,17 @@ class DesktopClient:
     def apply_stcm(self, file_name: str, manifest: dict, points: list[tuple[float, float, float]]) -> None:
         self.clear_scan()
         self.scan["active"] = False
+        config = extract_scan_fusion_config(manifest, default_preset=self.scan_fusion_preset_var.get())
+        self.apply_scan_fusion_config(config, update_vars=True)
         occ = manifest.get("browser_occupancy", {})
         if isinstance(occ, dict) and isinstance(occ.get("occupied_cells"), list):
-            self.scan["voxel"] = max(0.02, float(occ.get("voxel_size", self.number(self.voxel_var, 0.12))))
+            self.scan["voxel"] = max(0.02, float(occ.get("voxel_size", float(config["voxel_size"]))))
             for cell in occ.get("occupied_cells", []):
                 self.mark_occupied(int(cell.get("ix", 0)), int(cell.get("iy", 0)), float(cell.get("intensity", 1.0)), int(cell.get("hits", 3)))
             for cell in occ.get("free_cells", []):
                 self.scan["free"][self.cell_key(int(cell.get("ix", 0)), int(cell.get("iy", 0)))] = {"ix": int(cell.get("ix", 0)), "iy": int(cell.get("iy", 0)), "hits": int(cell.get("hits", 1))}
         else:
-            self.scan["voxel"] = max(0.02, self.number(self.voxel_var, 0.12))
+            self.scan["voxel"] = float(config["voxel_size"])
             for point in points:
                 ix, iy = self.world_to_cell(float(point[0]), float(point[1]))
                 self.mark_occupied(ix, iy, float(point[2]), 3)
@@ -2508,7 +2575,7 @@ class DesktopClient:
                     self.map_notes_var.set(str(notes["text"]))
             except Exception:
                 pass
-        self.voxel_var.set(f"{float(self.scan['voxel']):.2f}")
+        self.apply_scan_fusion_config(config, update_vars=True)
         self.map_name_var.set(file_name.replace(".slam", ""))
         self.pending_free_point = None
         self.selected_segment_id = None
