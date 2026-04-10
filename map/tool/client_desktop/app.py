@@ -246,6 +246,30 @@ class ServerBridge:
                 time.sleep(0.2 * (2**index))
         raise RuntimeError(str(last_err))
 
+    def post_async(self, path: str, body: dict, retries: int = 1) -> None:
+        def worker() -> None:
+            session = requests.Session()
+            session.trust_env = False
+            last_err: Exception | None = None
+            try:
+                for index in range(retries + 1):
+                    try:
+                        self.logger.info("http post async path=%s try=%s", path, index + 1)
+                        res = session.post(f"{self.http_base}{path}", json=body, timeout=1.5)
+                        res.raise_for_status()
+                        return
+                    except Exception as exc:
+                        last_err = exc
+                        self.logger.warning("http post async failed path=%s try=%s err=%s", path, index + 1, exc)
+                        time.sleep(0.1 * (2**index))
+                raise RuntimeError(str(last_err))
+            except Exception:
+                self.logger.exception("http post async aborted path=%s", path)
+            finally:
+                session.close()
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def get(self, path: str) -> dict:
         self.logger.info("http get path=%s", path)
         res = self.session.get(f"{self.http_base}{path}", timeout=2)
@@ -1262,6 +1286,13 @@ class DesktopClient:
             messagebox.showerror(self.tr("api_error"), str(exc))
             return None
 
+    def call_api_async(self, path: str, body: dict) -> None:
+        if not self.bridge:
+            messagebox.showwarning(self.tr("disconnected"), self.tr("warning_disconnected"))
+            return
+        self.stream_health["last_api_error"] = ""
+        self.bridge.post_async(path, body)
+
     def poll_health(self) -> None:
         now = time.monotonic()
         if now - self.last_health_poll_at < 5.0 or not self.bridge:
@@ -1880,7 +1911,7 @@ class DesktopClient:
         turn = self.number(self.turn_var, 1.0)
         dur = self.number(self.duration_var, 0.15)
         if name == "stop":
-            self.call_api("/control/stop", {})
+            self.call_api_async("/control/stop", {})
             return
         if name == "forward":
             body = {"velocity": fwd, "yaw_rate": 0.0, "duration": dur}
@@ -1890,7 +1921,7 @@ class DesktopClient:
             body = {"velocity": 0.0, "yaw_rate": turn, "duration": dur}
         else:
             body = {"velocity": 0.0, "yaw_rate": -turn, "duration": dur}
-        self.call_api("/control/move", body)
+        self.call_api_async("/control/move", body)
 
     def keyboard_command(self) -> str | None:
         if "space" in self.keys_down:

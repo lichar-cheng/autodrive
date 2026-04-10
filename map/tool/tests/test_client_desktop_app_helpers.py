@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from client_desktop.app import (
+    DesktopClient,
     build_camera_refresh_text,
     can_zoom_from_widget,
     compute_log_candidates,
@@ -111,3 +112,49 @@ def test_compute_log_candidates_prefers_runtime_logs_dir() -> None:
     )
 
     assert candidates[0] == runtime_dir / "logs" / "client_desktop.log"
+
+
+def test_move_click_uses_async_api_for_forward() -> None:
+    class Var:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def get(self) -> str:
+            return self.value
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.forward_var = Var("0.8")
+    client.reverse_var = Var("0.5")
+    client.turn_var = Var("1.0")
+    client.duration_var = Var("0.15")
+    client.number = DesktopClient.number.__get__(client, DesktopClient)
+    calls: list[tuple[str, str, dict]] = []
+    client.call_api = lambda path, body: calls.append(("sync", path, body))
+    client.call_api_async = lambda path, body: calls.append(("async", path, body))
+
+    DesktopClient.move_click(client, "forward")
+
+    assert calls == [("async", "/control/move", {"velocity": 0.8, "yaw_rate": 0.0, "duration": 0.15})]
+
+
+def test_move_click_uses_async_api_for_stop() -> None:
+    class Var:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def get(self) -> str:
+            return self.value
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.forward_var = Var("0.8")
+    client.reverse_var = Var("0.5")
+    client.turn_var = Var("1.0")
+    client.duration_var = Var("0.15")
+    client.number = DesktopClient.number.__get__(client, DesktopClient)
+    calls: list[tuple[str, str, dict]] = []
+    client.call_api = lambda path, body: calls.append(("sync", path, body))
+    client.call_api_async = lambda path, body: calls.append(("async", path, body))
+
+    DesktopClient.move_click(client, "stop")
+
+    assert calls == [("async", "/control/stop", {})]
