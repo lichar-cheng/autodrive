@@ -42,8 +42,33 @@
               <input id="mapNameInput" value="demo_map" />
             </label>
             <label class="field">
+              <span>Fusion Preset</span>
+              <select id="scanFusionPresetInput">
+                <option value="sim_clean">sim_clean</option>
+                <option value="indoor_balanced" selected>indoor_balanced</option>
+                <option value="indoor_sensitive">indoor_sensitive</option>
+                <option value="warehouse_sparse">warehouse_sparse</option>
+              </select>
+            </label>
+            <label class="field">
               <span>Voxel (m)</span>
-              <input id="voxelSizeInput" type="number" min="0.02" max="1" step="0.01" value="0.12" />
+              <input id="voxelSizeInput" type="number" min="0.02" max="1" step="0.01" value="0.08" />
+            </label>
+            <label class="field">
+              <span>Min Occupied Hits</span>
+              <input id="occupiedMinHitsInput" type="number" min="1" max="20" step="1" value="2" />
+            </label>
+            <label class="field">
+              <span>Occ/Free Ratio</span>
+              <input id="occupiedOverFreeRatioInput" type="number" min="0" max="2" step="0.05" value="0.75" />
+            </label>
+            <label class="field">
+              <span>Turn Skip Wz</span>
+              <input id="turnSkipWzInput" type="number" min="0" max="5" step="0.05" value="0.45" />
+            </label>
+            <label class="field inline checkbox-field">
+              <input id="skipTurnFramesInput" type="checkbox" checked />
+              <span>Skip Turn Frames</span>
             </label>
           </div>
           <label class="field">

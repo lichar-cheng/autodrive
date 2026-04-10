@@ -41,13 +41,18 @@ const scanSession = {
   freeCells: new Map(),
   lastSavedFile: "",
   savedPointCount: 0,
-  voxelSize: 0.12,
+  voxelSize: 0.08,
+};
+
+const SCAN_FUSION_PRESETS = {
+  sim_clean: { preset: "sim_clean", voxel_size: 0.12, occupied_min_hits: 3, occupied_over_free_ratio: 0.9, turn_skip_wz: 0.35, skip_turn_frames: true },
+  indoor_balanced: { preset: "indoor_balanced", voxel_size: 0.08, occupied_min_hits: 2, occupied_over_free_ratio: 0.75, turn_skip_wz: 0.45, skip_turn_frames: true },
+  indoor_sensitive: { preset: "indoor_sensitive", voxel_size: 0.06, occupied_min_hits: 1, occupied_over_free_ratio: 0.55, turn_skip_wz: 0.6, skip_turn_frames: false },
+  warehouse_sparse: { preset: "warehouse_sparse", voxel_size: 0.1, occupied_min_hits: 2, occupied_over_free_ratio: 0.65, turn_skip_wz: 0.5, skip_turn_frames: true },
 };
 
 const scanMergeConfig = {
   maxPoseHistory: 240,
-  turnSkipWz: 0.35,
-  saveMinHits: 3,
 };
 
 const streamHealth = {
@@ -131,6 +136,11 @@ const elements = {
   mapNameInput: document.getElementById("mapNameInput"),
   mapNotesInput: document.getElementById("mapNotesInput"),
   voxelSizeInput: document.getElementById("voxelSizeInput"),
+  scanFusionPresetInput: document.getElementById("scanFusionPresetInput"),
+  occupiedMinHitsInput: document.getElementById("occupiedMinHitsInput"),
+  occupiedOverFreeRatioInput: document.getElementById("occupiedOverFreeRatioInput"),
+  turnSkipWzInput: document.getElementById("turnSkipWzInput"),
+  skipTurnFramesInput: document.getElementById("skipTurnFramesInput"),
   forwardSpeedInput: document.getElementById("forwardSpeedInput"),
   reverseSpeedInput: document.getElementById("reverseSpeedInput"),
   turnRateInput: document.getElementById("turnRateInput"),
@@ -705,7 +715,7 @@ function updateEditorBadges() {
   elements.editorStatsBadge.innerText = `${scanSession.occupiedCells.size} obstacle cells | ${poiNodes.length} POI | ${pathSegments.length} paths`;
 }
 
-function setOccupiedCell(ix, iy, hits = scanMergeConfig.saveMinHits, intensity = 1) {
+function setOccupiedCell(ix, iy, hits = effectiveScanFusionConfig().occupied_min_hits, intensity = 1) {
   scanSession.occupiedCells.set(cellKey(ix, iy), { ix, iy, hits, intensity });
 }
 
@@ -739,9 +749,10 @@ function rasterizeObstacleLine(startPoint, endPoint) {
 }
 
 function autoClearNoise() {
+  const config = effectiveScanFusionConfig();
   const removable = [];
   for (const cell of scanSession.occupiedCells.values()) {
-    if (cell.hits > scanMergeConfig.saveMinHits) {
+    if (cell.hits > config.occupied_min_hits) {
       continue;
     }
     let neighbors = 0;
@@ -799,7 +810,9 @@ function loadStcmIntoEditor() {
 
   clearAccumulation();
   scanSession.active = false;
-  scanSession.voxelSize = Math.max(0.02, numberFromInput(elements.voxelSizeInput, 0.12));
+  const config = extractScanFusionConfig(stcmInspector.bundle, elements.scanFusionPresetInput.value);
+  applyScanFusionConfig(config);
+  scanSession.voxelSize = Math.max(0.02, Number(config.voxel_size || scanSession.voxelSize));
   const browserOccupancy = stcmInspector.bundle.browser_occupancy;
   if (browserOccupancy && Array.isArray(browserOccupancy.occupied_cells)) {
     scanSession.voxelSize = Math.max(0.02, Number(browserOccupancy.voxel_size || scanSession.voxelSize));
@@ -807,7 +820,7 @@ function loadStcmIntoEditor() {
       setOccupiedCell(
         Number(cell.ix || 0),
         Number(cell.iy || 0),
-        Number(cell.hits || scanMergeConfig.saveMinHits),
+        Number(cell.hits || effectiveScanFusionConfig().occupied_min_hits),
         Number(cell.intensity || 1),
       );
     });
@@ -823,7 +836,7 @@ function loadStcmIntoEditor() {
   } else {
     stcmInspector.points.forEach((point) => {
       const [ix, iy] = worldToCell(Number(point[0] || 0), Number(point[1] || 0));
-      setOccupiedCell(ix, iy, scanMergeConfig.saveMinHits, Number(point[2] || 1));
+      setOccupiedCell(ix, iy, effectiveScanFusionConfig().occupied_min_hits, Number(point[2] || 1));
     });
   }
 
@@ -1021,7 +1034,8 @@ function serializeRadarPoints(points) {
 
 function buildClientStcmBundle() {
   rebuildPathNodes();
-  const voxelSize = Math.max(0.02, numberFromInput(elements.voxelSizeInput, 0.12));
+  const config = effectiveScanFusionConfig();
+  const voxelSize = Math.max(0.02, Number(config.voxel_size));
   const pointsToSave = occupiedPointsForSave();
   const notes = {
     text: elements.mapNotesInput.value.trim(),
@@ -1029,6 +1043,7 @@ function buildClientStcmBundle() {
     browserSafeCells: scanSession.freeCells.size,
     browserRawLidarPoints: scanSession.totalLivePoints,
     voxelSize,
+    scanFusionPreset: config.preset,
     manualCameraSnapshotAt: elements.cameraRefreshStatus.innerText,
     clientObstaclePreview: pointsToSave.length,
     loadedFromStcm: editState.loadedFromStcm,
@@ -1037,10 +1052,11 @@ function buildClientStcmBundle() {
   };
   const browserOccupancy = {
     voxel_size: voxelSize,
+    scan_fusion: buildScanFusionMetadata(config),
     occupied_cells: Array.from(scanSession.occupiedCells.values()).map((cell) => ({
       ix: Number(cell.ix),
       iy: Number(cell.iy),
-      hits: Number(cell.hits || scanMergeConfig.saveMinHits),
+      hits: Number(cell.hits || config.occupied_min_hits),
       intensity: Number(cell.intensity || 1),
     })),
     free_cells: Array.from(scanSession.freeCells.values()).map((cell) => ({
@@ -1056,6 +1072,7 @@ function buildClientStcmBundle() {
     created_at: Date.now() / 1000,
     source: "browser",
     map_source: editState.loadedFromStcm ? "stcm_editor" : "laser_accumulation",
+    scan_fusion: buildScanFusionMetadata(config),
     browser_occupancy: browserOccupancy,
     pose: lastPose,
     gps: lastGps,
@@ -1286,6 +1303,79 @@ function numberFromInput(el, fallback) {
   return Number.isFinite(value) ? value : fallback;
 }
 
+function resolveScanFusionConfig(preset = "indoor_balanced", overrides = {}) {
+  const base = SCAN_FUSION_PRESETS[preset] || SCAN_FUSION_PRESETS.indoor_balanced;
+  const config = { ...base, ...overrides };
+  config.preset = SCAN_FUSION_PRESETS[preset] ? preset : "indoor_balanced";
+  config.voxel_size = Math.max(0.02, Number(config.voxel_size || base.voxel_size));
+  config.occupied_min_hits = Math.max(1, Math.round(Number(config.occupied_min_hits || base.occupied_min_hits)));
+  config.occupied_over_free_ratio = Math.max(0, Number(config.occupied_over_free_ratio || base.occupied_over_free_ratio));
+  config.turn_skip_wz = Math.max(0, Number(config.turn_skip_wz || base.turn_skip_wz));
+  config.skip_turn_frames = Boolean(config.skip_turn_frames);
+  return config;
+}
+
+function effectiveScanFusionConfig() {
+  return resolveScanFusionConfig(elements.scanFusionPresetInput.value, {
+    voxel_size: numberFromInput(elements.voxelSizeInput, 0.08),
+    occupied_min_hits: numberFromInput(elements.occupiedMinHitsInput, 2),
+    occupied_over_free_ratio: numberFromInput(elements.occupiedOverFreeRatioInput, 0.75),
+    turn_skip_wz: numberFromInput(elements.turnSkipWzInput, 0.45),
+    skip_turn_frames: elements.skipTurnFramesInput.checked,
+  });
+}
+
+function applyScanFusionConfig(config) {
+  const resolved = resolveScanFusionConfig(config.preset, config);
+  elements.scanFusionPresetInput.value = resolved.preset;
+  elements.voxelSizeInput.value = resolved.voxel_size.toFixed(2);
+  elements.occupiedMinHitsInput.value = String(resolved.occupied_min_hits);
+  elements.occupiedOverFreeRatioInput.value = resolved.occupied_over_free_ratio.toFixed(2);
+  elements.turnSkipWzInput.value = resolved.turn_skip_wz.toFixed(2);
+  elements.skipTurnFramesInput.checked = resolved.skip_turn_frames;
+  scanSession.voxelSize = resolved.voxel_size;
+  return resolved;
+}
+
+function isOccupiedScanCell(cell, free, config) {
+  const hits = Number(cell.hits || 0);
+  if (hits < Number(config.occupied_min_hits || 1)) {
+    return false;
+  }
+  const freeHits = Number((free && free.hits) || 0);
+  return hits >= freeHits * Number(config.occupied_over_free_ratio || 0);
+}
+
+function buildScanFusionMetadata(config) {
+  const resolved = resolveScanFusionConfig(config.preset, config);
+  return {
+    preset: resolved.preset,
+    voxel_size: resolved.voxel_size,
+    occupied_min_hits: resolved.occupied_min_hits,
+    occupied_over_free_ratio: resolved.occupied_over_free_ratio,
+    turn_skip_wz: resolved.turn_skip_wz,
+    skip_turn_frames: resolved.skip_turn_frames,
+  };
+}
+
+function extractScanFusionConfig(manifest, defaultPreset = "indoor_balanced") {
+  const overrides = { ...(manifest.scan_fusion || {}) };
+  if (typeof manifest.notes === "string") {
+    try {
+      const notes = JSON.parse(manifest.notes);
+      if (overrides.voxel_size === undefined && notes.voxelSize !== undefined) {
+        overrides.voxel_size = notes.voxelSize;
+      }
+      if (overrides.preset === undefined && notes.scanFusionPreset) {
+        overrides.preset = notes.scanFusionPreset;
+      }
+    } catch (_err) {
+      // ignore invalid or legacy notes payloads
+    }
+  }
+  return resolveScanFusionConfig(overrides.preset || defaultPreset, overrides);
+}
+
 function readMotionConfig() {
   return {
     forwardSpeed: numberFromInput(elements.forwardSpeedInput, 0.8),
@@ -1490,10 +1580,11 @@ function poseForStamp(stamp) {
 }
 
 function shouldSkipScanFrame(framePose, keyframe) {
-  if (keyframe) {
+  const config = effectiveScanFusionConfig();
+  if (keyframe || !config.skip_turn_frames) {
     return false;
   }
-  return Math.abs(Number(framePose.wz || 0)) >= scanMergeConfig.turnSkipWz;
+  return Math.abs(Number(framePose.wz || 0)) >= config.turn_skip_wz;
 }
 
 function accumulatePoints(points, meta = {}) {
@@ -1502,7 +1593,7 @@ function accumulatePoints(points, meta = {}) {
     return;
   }
 
-  scanSession.voxelSize = Math.max(0.02, numberFromInput(elements.voxelSizeInput, 0.12));
+  scanSession.voxelSize = Math.max(0.02, Number(effectiveScanFusionConfig().voxel_size));
   const framePose = poseForStamp(Number(meta.stamp || 0));
   if (shouldSkipScanFrame(framePose, Boolean(meta.keyframe))) {
     renderScanState();
@@ -1522,7 +1613,9 @@ function accumulatePoints(points, meta = {}) {
 }
 
 function occupiedPointsForSave() {
+  const config = effectiveScanFusionConfig();
   return Array.from(scanSession.occupiedCells.values())
+    .filter((cell) => isOccupiedScanCell(cell, scanSession.freeCells.get(cellKey(cell.ix, cell.iy)), config))
     .map((cell) => [
       cell.ix * scanSession.voxelSize,
       cell.iy * scanSession.voxelSize,
@@ -1545,6 +1638,7 @@ function renderScanState() {
     frontFrames: scanSession.frontFrames,
     rearFrames: scanSession.rearFrames,
     voxelSize: scanSession.voxelSize,
+    fusionPreset: effectiveScanFusionConfig().preset,
     lastSavedFile: scanSession.lastSavedFile || "-",
     lastSavedPointCount: scanSession.savedPointCount,
   };
@@ -2912,10 +3006,12 @@ function drawGrid() {
 }
 
 function drawOccupancy() {
+  const config = effectiveScanFusionConfig();
   const sizePx = Math.max(2, scanSession.voxelSize * viewState.scale);
 
   for (const cell of scanSession.freeCells.values()) {
-    if (scanSession.occupiedCells.has(cellKey(cell.ix, cell.iy))) {
+    const occupied = scanSession.occupiedCells.get(cellKey(cell.ix, cell.iy));
+    if (occupied && isOccupiedScanCell(occupied, cell, config)) {
       continue;
     }
     const worldX = cell.ix * scanSession.voxelSize;
@@ -2926,6 +3022,9 @@ function drawOccupancy() {
   }
 
   for (const cell of scanSession.occupiedCells.values()) {
+    if (!isOccupiedScanCell(cell, scanSession.freeCells.get(cellKey(cell.ix, cell.iy)), config)) {
+      continue;
+    }
     const worldX = cell.ix * scanSession.voxelSize;
     const worldY = cell.iy * scanSession.voxelSize;
     const [sx, sy] = worldToCanvas(worldX, worldY);
@@ -3201,6 +3300,20 @@ function bindUi() {
   elements.pathSafetyMarginInput.addEventListener("input", syncTrajectoryPanel);
   elements.poiBatchCreateInput.addEventListener("input", syncTrajectoryButtons);
   elements.poiGeoInput.addEventListener("input", syncTrajectoryPanel);
+  [
+    elements.scanFusionPresetInput,
+    elements.voxelSizeInput,
+    elements.occupiedMinHitsInput,
+    elements.occupiedOverFreeRatioInput,
+    elements.turnSkipWzInput,
+  ].forEach((input) => input.addEventListener("input", () => {
+    applyScanFusionConfig(effectiveScanFusionConfig());
+    renderScanState();
+  }));
+  elements.skipTurnFramesInput.addEventListener("change", () => {
+    applyScanFusionConfig(effectiveScanFusionConfig());
+    renderScanState();
+  });
   elements.showPathToggle.addEventListener("change", syncDrawControls);
   elements.showPoiToggle.addEventListener("change", syncDrawControls);
   elements.showRobotToggle.addEventListener("change", syncDrawControls);
@@ -3250,6 +3363,7 @@ function bindUi() {
 
 bindUi();
 bindCanvasInteractions();
+applyScanFusionConfig(SCAN_FUSION_PRESETS.indoor_balanced);
 syncDrawControls();
 syncTrajectoryPanel();
 renderCamera();

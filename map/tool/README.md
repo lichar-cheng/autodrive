@@ -159,6 +159,35 @@ chmod +x build_macos.sh
 - 内存接口，直接返回 `.pgm` / `.yaml` / `.json` 文本
 - 文件接口，直接把 3 个导出文件写到目标目录
 
+## Scan Fusion Presets
+
+扫描融合支持场景预设和参数覆盖，主要用于适配仿真和真实环境里不同的障碍物密度。
+
+预设包括：
+
+- `sim_clean`
+- `indoor_balanced`
+- `indoor_sensitive`
+- `warehouse_sparse`
+
+核心参数包括：
+
+- `voxel_size`
+- `occupied_min_hits`
+- `occupied_over_free_ratio`
+- `turn_skip_wz`
+- `skip_turn_frames`
+
+建议：
+
+- 仿真默认用 `sim_clean`
+- 实车默认用 `indoor_balanced`
+- 如果桌椅、细腿、边缘障碍容易丢失，切到 `indoor_sensitive`
+
+详细的场景选择、参数说明和调参指南见：
+
+- `docs/product_manual.md` 的“5.2 到 5.7”
+
 ## 验证
 
 桌面端共享逻辑测试：
