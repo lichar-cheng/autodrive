@@ -143,6 +143,22 @@ chmod +x build_macos.sh
 - `radar_points.bin`
   - `(x, y, intensity)` 的 `float32` 三元组
 
+`.slam` 还可以导出为：
+
+- `.pgm`
+- `.yaml`
+- `.json`
+
+独立导出工具位于：
+
+- `tools/slam_export/java`
+- `tools/slam_export/cpp`
+
+两套工具都支持：
+
+- 内存接口，直接返回 `.pgm` / `.yaml` / `.json` 文本
+- 文件接口，直接把 3 个导出文件写到目标目录
+
 ## 验证
 
 桌面端共享逻辑测试：

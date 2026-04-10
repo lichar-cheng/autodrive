@@ -1,0 +1,2 @@
+/usr/bin/ar qc libslam_export_tool.a CMakeFiles/slam_export_tool.dir/src/slam_export_tool.cpp.o
+/usr/bin/ranlib libslam_export_tool.a

@@ -1,0 +1,18 @@
+Start testing: Apr 10 17:22 CST
+----------------------------------------------------------
+1/1 Testing: test_slam_export_tool
+1/1 Test: test_slam_export_tool
+Command: "/home/autodrive/map/tool/tools/slam_export/cpp/build/test_slam_export_tool"
+Directory: /home/autodrive/map/tool/tools/slam_export/cpp/build
+"test_slam_export_tool" start time: Apr 10 17:22 CST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_slam_export_tool" end time: Apr 10 17:22 CST
+"test_slam_export_tool" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Apr 10 17:22 CST
