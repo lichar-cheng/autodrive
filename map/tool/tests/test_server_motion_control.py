@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 from server.app import main
@@ -10,6 +11,8 @@ class FakeBridge:
         self.commands: list[tuple[str, float, float]] = []
         self.scan_states: list[bool] = []
         self.mapping_prereq = {"ready": True, "severity": "ok", "blockers": [], "warnings": [], "checks": {}}
+        self.map_points: list[tuple] = []
+        self.config = SimpleNamespace(scan_mode="2d")
 
     def publish_cmd_vel(self, velocity: float, yaw_rate: float) -> None:
         self.commands.append(("move", float(velocity), float(yaw_rate)))
@@ -23,8 +26,14 @@ class FakeBridge:
     def latest_gps(self) -> dict:
         return {}
 
+    def latest_imu(self) -> dict:
+        return {}
+
     def latest_chassis(self) -> dict:
         return {}
+
+    def latest_map_points(self) -> list[tuple]:
+        return list(self.map_points)
 
     def set_scan_active(self, active: bool) -> None:
         self.scan_states.append(bool(active))
@@ -99,3 +108,38 @@ def test_health_includes_mapping_prereq_summary(monkeypatch) -> None:
     assert result["mapping_blockers"] == []
     assert "ws stream unstable" in result["mapping_warnings"]
     assert "no websocket clients connected" in result["mapping_warnings"]
+
+
+def test_save_map_uses_point_cloud_payload_in_3d_mode(monkeypatch, tmp_path) -> None:
+    bridge = FakeBridge()
+    bridge.map_points = [(1.0, 2.0, 3.0, 0.5), (4.0, 5.0, 6.0, 1.0)]
+    monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
+    monkeypatch.setattr(main, "map_dir", tmp_path)
+    monkeypatch.setattr(main.CONFIG, "scan_mode", "3d")
+
+    result = asyncio.run(main.save_map(main.SaveMapRequest(name="demo", scan_mode="3d")))
+
+    assert result["ok"] is True
+    assert result["scan_mode"] == "3d"
+    assert result["contains"]["point_cloud"] == 2
+    bundle = main.load_stcm(tmp_path / Path(result["file"]).name)
+    assert bundle["scan_mode"] == "3d"
+    assert bundle["point_cloud"] == bridge.map_points
+
+
+def test_set_scan_mode_updates_runtime_config_and_resets_scan(monkeypatch) -> None:
+    bridge = FakeBridge()
+    monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
+    monkeypatch.setattr(main, "sim", SimpleNamespace(_running=False, scanning=False))
+    main.SCAN_SESSION["active"] = True
+    main.SCAN_SESSION["raw_points"] = 42
+
+    result = asyncio.run(main.set_scan_mode(main.ScanModeRequest(scan_mode="3d")))
+
+    assert result["ok"] is True
+    assert result["scan_mode"] == "3d"
+    assert main.CONFIG.scan_mode == "3d"
+    assert main.CONFIG.ros.scan_mode == "3d"
+    assert bridge.config.scan_mode == "3d"
+    assert main.SCAN_SESSION["active"] is False
+    assert main.SCAN_SESSION["raw_points"] == 0

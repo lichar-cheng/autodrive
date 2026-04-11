@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Literal, List, Optional
 
 from pydantic import BaseModel, Field
+
+
+AuthMode = Literal["local", "cloud"]
+ScanMode = Literal["2d", "3d"]
 
 
 class MoveCommand(BaseModel):
@@ -15,6 +19,7 @@ class SaveMapRequest(BaseModel):
     name: str = "session"
     notes: str = ""
     voxel_size: Optional[float] = Field(default=None, ge=0.02, le=1.0)
+    scan_mode: Optional[ScanMode] = None
     reset_after_save: bool = False
 
 
@@ -37,9 +42,26 @@ class PoiPoint(BaseModel):
     name: str
     x: float
     y: float
+    yaw: float = 0.0
     lat: Optional[float] = None
     lon: Optional[float] = None
 
 
 class AddPoiRequest(BaseModel):
     poi: PoiPoint
+
+
+class BackendConnectionDescriptor(BaseModel):
+    auth_mode: AuthMode = "local"
+    backend_host: str
+    backend_port: int = Field(default=8080, ge=1, le=65535)
+    token: str = ""
+    expires_at: Optional[str] = None
+
+
+class ScanModeConfig(BaseModel):
+    scan_mode: ScanMode = "2d"
+
+
+class ScanModeRequest(BaseModel):
+    scan_mode: ScanMode = "2d"

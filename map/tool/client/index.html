@@ -28,6 +28,75 @@
       <aside class="panel left-panel">
         <section class="card">
           <div class="section-head">
+            <h2>Authentication</h2>
+            <div class="view-chip" id="authStatus">Not authenticated</div>
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>Auth Mode</span>
+              <select id="authModeInput">
+                <option value="local" selected>Local Login</option>
+                <option value="cloud">Cloud Login</option>
+              </select>
+            </label>
+          </div>
+          <div id="localAuthPanel">
+            <div class="hint">
+              Local login posts fixed credentials to the target IP login page, then resolves the backend host, port, and token from the response.
+            </div>
+            <div class="field-grid">
+              <label class="field">
+                <span>Target IP</span>
+                <input id="localAuthIpInput" value="127.0.0.1" />
+              </label>
+              <label class="field">
+                <span>Port</span>
+                <input id="localAuthPortInput" type="number" min="1" max="65535" step="1" value="8080" />
+              </label>
+              <label class="field">
+                <span>Path</span>
+                <input id="localAuthPathInput" value="/login" />
+              </label>
+            </div>
+            <div class="action-row">
+              <button id="localAuthBtn" class="primary">Login Local</button>
+            </div>
+          </div>
+          <div id="cloudAuthPanel" hidden>
+            <div class="hint">
+              Cloud login posts the entered username and password to the cloud auth service, then resolves the backend host, port, and token from the response.
+            </div>
+            <div class="field-grid">
+              <label class="field">
+                <span>Auth Host</span>
+                <input id="cloudAuthHostInput" value="" placeholder="auth.example.com" />
+              </label>
+              <label class="field">
+                <span>Port</span>
+                <input id="cloudAuthPortInput" type="number" min="1" max="65535" step="1" value="8443" />
+              </label>
+              <label class="field">
+                <span>Path</span>
+                <input id="cloudAuthPathInput" value="/api/auth/login" />
+              </label>
+              <label class="field">
+                <span>Username</span>
+                <input id="cloudAuthUsernameInput" value="" />
+              </label>
+              <label class="field">
+                <span>Password</span>
+                <input id="cloudAuthPasswordInput" type="password" value="" />
+              </label>
+            </div>
+            <div class="action-row">
+              <button id="cloudAuthBtn" class="primary">Login Cloud</button>
+            </div>
+          </div>
+          <div class="hint" id="authResolvedHint">Resolved backend will replace manual WS connect after login.</div>
+        </section>
+
+        <section class="card">
+          <div class="section-head">
             <h2>Scan Session</h2>
             <div class="scan-state" id="scanState">Idle</div>
           </div>
@@ -37,6 +106,13 @@
             <button id="clearAccumBtn">Clear Accumulation</button>
           </div>
           <div class="field-grid">
+            <label class="field">
+              <span>Scan Mode</span>
+              <select id="scanModeInput">
+                <option value="2d" selected>2D Laser</option>
+                <option value="3d">3D Point Cloud</option>
+              </select>
+            </label>
             <label class="field">
               <span>Map Name</span>
               <input id="mapNameInput" value="demo_map" />

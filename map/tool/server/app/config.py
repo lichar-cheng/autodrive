@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -16,17 +18,24 @@ class RosTopicConfig(BaseModel):
     odom_frame: str = "odom"
     robot_base_frame: str = "base_link"
     lidar_frame: str = "laser"
+    pointcloud: str = ""
+    pointcloud_frame: str = "lidar"
     camera_topics: list[str] = Field(default_factory=list)
     cmd_vel: str = "/cmd_vel"
 
 
 class RosBridgeConfig(BaseModel):
     enabled: bool = True
+    scan_mode: Literal["2d", "3d"] = "2d"
     node_name: str = "autodrive_map_bridge"
     spin_hz: float = 30.0
     occupancy_stride: int = Field(default=2, ge=1, le=20)
     occupancy_sample_limit: int = Field(default=12000, ge=1000, le=100000)
     lidar_max_points_per_scan: int = Field(default=4000, ge=100, le=50000)
+    pointcloud_preview_voxel_size: float = Field(default=0.12, ge=0.02, le=2.0)
+    pointcloud_save_voxel_size: float = Field(default=0.06, ge=0.02, le=2.0)
+    pointcloud_preview_limit: int = Field(default=5000, ge=100, le=100000)
+    pointcloud_save_limit: int = Field(default=50000, ge=1000, le=500000)
     use_occupancy_grid_for_save: bool = True
     fallback_to_simulator_on_failure: bool = True
     prefer_tf_pose: bool = True
@@ -38,6 +47,7 @@ class ServerConfig(BaseModel):
     port: int = 8080
     ws_queue_size: int = 200
     sim_rate_hz: float = 10.0
+    scan_mode: Literal["2d", "3d"] = "2d"
     lidar_points_per_scan: int = Field(default=700, ge=50, le=5000)
     map_resolution: float = 0.1
     map_size: int = 300

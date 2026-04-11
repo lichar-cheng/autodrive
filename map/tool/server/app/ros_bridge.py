@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import struct
 import threading
 import time
 from dataclasses import dataclass, field
@@ -32,9 +33,12 @@ class RosBridgeState:
     latest_rear_points: list[list[float]] = field(default_factory=list)
     latest_occupancy_payload: dict[str, Any] = field(default_factory=dict)
     latest_occupancy_points: list[tuple[float, float, float]] = field(default_factory=list)
+    latest_pointcloud_preview: list[list[float]] = field(default_factory=list)
+    latest_pointcloud_save: list[tuple[float, float, float, float]] = field(default_factory=list)
     camera_payloads: dict[str, dict[str, Any]] = field(default_factory=dict)
     tf_tree: dict[tuple[str, str], dict[str, float | str]] = field(default_factory=dict)
     last_scan_frame_by_side: dict[str, str] = field(default_factory=dict)
+    last_pointcloud_frame: str = ""
     scanning: bool = False
 
 
@@ -58,6 +62,61 @@ def _build_tf_static_qos(qos_module: Any, sensor_profile: Any) -> Any:
         )
     except Exception:  # noqa: BLE001
         return sensor_profile
+
+
+def _voxel_key_3d(x: float, y: float, z: float, voxel_size: float) -> str:
+    return f"{round(x / voxel_size)}:{round(y / voxel_size)}:{round(z / voxel_size)}"
+
+
+def _voxelize_pointcloud(
+    points: list[tuple[float, float, float, float]] | list[list[float]],
+    voxel_size: float,
+    limit: int,
+    existing: dict[str, tuple[float, float, float, float]] | None = None,
+) -> dict[str, tuple[float, float, float, float]]:
+    cells: dict[str, tuple[float, float, float, float]] = dict(existing or {})
+    for point in points:
+        x, y, z, intensity = float(point[0]), float(point[1]), float(point[2]), float(point[3] if len(point) > 3 else 1.0)
+        key = _voxel_key_3d(x, y, z, voxel_size)
+        if key in cells:
+            current = cells[key]
+            if intensity >= float(current[3]):
+                cells[key] = (x, y, z, intensity)
+            continue
+        if len(cells) >= limit:
+            continue
+        cells[key] = (x, y, z, intensity)
+    return cells
+
+
+def _decode_pointcloud2_points(msg, limit: int) -> list[tuple[float, float, float, float]]:  # noqa: ANN001
+    fields = {str(field.name): field for field in getattr(msg, "fields", [])}
+    if not {"x", "y", "z"}.issubset(fields):
+        return []
+    offsets = {name: int(fields[name].offset) for name in ("x", "y", "z")}
+    intensity_field = fields.get("intensity")
+    point_step = int(getattr(msg, "point_step", 0) or 0)
+    width = int(getattr(msg, "width", 0) or 0)
+    height = int(getattr(msg, "height", 1) or 1)
+    data = bytes(getattr(msg, "data", b""))
+    if point_step <= 0 or not data:
+        return []
+    count = min(max(0, width * height), max(0, len(data) // point_step), max(0, int(limit)))
+    points: list[tuple[float, float, float, float]] = []
+    intensity_offset = int(intensity_field.offset) if intensity_field is not None else None
+    for index in range(count):
+        base = index * point_step
+        try:
+            x = struct.unpack_from("<f", data, base + offsets["x"])[0]
+            y = struct.unpack_from("<f", data, base + offsets["y"])[0]
+            z = struct.unpack_from("<f", data, base + offsets["z"])[0]
+            intensity = struct.unpack_from("<f", data, base + intensity_offset)[0] if intensity_offset is not None else 1.0
+        except struct.error:
+            break
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z) and math.isfinite(intensity)):
+            continue
+        points.append((x, y, z, intensity))
+    return points
 
 
 class RosBridge:
@@ -90,7 +149,7 @@ class RosBridge:
             from nav_msgs.msg import OccupancyGrid, Odometry
             from rclpy import qos as rclpy_qos
             from rclpy.qos import qos_profile_sensor_data
-            from sensor_msgs.msg import CompressedImage, Imu, LaserScan, NavSatFix
+            from sensor_msgs.msg import CompressedImage, Imu, LaserScan, NavSatFix, PointCloud2
             from tf2_msgs.msg import TFMessage
         except Exception as exc:  # noqa: BLE001
             self._import_error = str(exc)
@@ -141,6 +200,16 @@ class RosBridge:
                 )
             )
 
+        if self.config.topics.pointcloud:
+            self._subscriptions.append(
+                self._node.create_subscription(
+                    PointCloud2,
+                    self.config.topics.pointcloud,
+                    self._on_pointcloud,
+                    qos_profile_sensor_data,
+                )
+            )
+
         for idx, topic_name in enumerate(self.config.topics.camera_topics, start=1):
             self._subscriptions.append(
                 self._node.create_subscription(
@@ -159,6 +228,8 @@ class RosBridge:
             *[item[0] for item in lidar_topics],
             *self.config.topics.camera_topics,
         ]
+        if self.config.topics.pointcloud:
+            self.state.connected_topics.append(self.config.topics.pointcloud)
         if self.config.topics.gps:
             self.state.connected_topics.append(self.config.topics.gps)
         if self.config.topics.occupancy_grid:
@@ -188,6 +259,8 @@ class RosBridge:
                 "occupancy_points": len(self.state.latest_occupancy_points),
                 "front_scan_points": len(self.state.latest_front_points),
                 "rear_scan_points": len(self.state.latest_rear_points),
+                "pointcloud_preview_points": len(self.state.latest_pointcloud_preview),
+                "pointcloud_save_points": len(self.state.latest_pointcloud_save),
                 "imu": dict(self.state.last_imu),
                 "has_occupancy_grid": bool(self.config.topics.occupancy_grid),
                 "tf_pairs": [f"{parent}->{child}" for parent, child in self.state.tf_tree.keys()],
@@ -200,6 +273,7 @@ class RosBridge:
         checks: dict[str, dict[str, Any]] = {}
         blockers: list[str] = []
         warnings: list[str] = []
+        pointcloud_mode = self.config.scan_mode == "3d"
 
         def add_topic_check(name: str, topic_name: str, required: bool = True) -> None:
             if not topic_name:
@@ -216,24 +290,31 @@ class RosBridge:
 
         with self._lock:
             add_topic_check("odom", self.config.topics.odom, required=True)
-            lidar_topics: list[tuple[str, str, bool]] = []
-            if self.config.topics.lidar_front:
-                lidar_topics.append(("lidar_front", self.config.topics.lidar_front, True))
-            if self.config.topics.lidar_rear:
-                lidar_topics.append(("lidar_rear", self.config.topics.lidar_rear, True))
-            if not lidar_topics:
-                lidar_topics.append(("lidar", self.config.topics.lidar_fallback, True))
-            for name, topic_name, required in lidar_topics:
-                add_topic_check(name, topic_name, required=required)
+            if pointcloud_mode:
+                add_topic_check("pointcloud", self.config.topics.pointcloud, required=True)
+                sensor_transform = self._resolve_pointcloud_mount()
+                sensor_label = "pointcloud"
+                sensor_frame = self.config.topics.pointcloud_frame
+            else:
+                lidar_topics: list[tuple[str, str, bool]] = []
+                if self.config.topics.lidar_front:
+                    lidar_topics.append(("lidar_front", self.config.topics.lidar_front, True))
+                if self.config.topics.lidar_rear:
+                    lidar_topics.append(("lidar_rear", self.config.topics.lidar_rear, True))
+                if not lidar_topics:
+                    lidar_topics.append(("lidar", self.config.topics.lidar_fallback, True))
+                for name, topic_name, required in lidar_topics:
+                    add_topic_check(name, topic_name, required=required)
+                sensor_transform = self._resolve_lidar_mount()
+                sensor_label = "lidar"
+                sensor_frame = self.config.topics.lidar_frame
 
-            lidar_transform = self._resolve_lidar_mount()
-
-        tf_ok = lidar_transform is not None
+        tf_ok = sensor_transform is not None
         tf_age_sec = None
         tf_source = None
-        if lidar_transform is not None:
-            tf_source = str(lidar_transform.get("source", ""))
-            tf_stamp = float(lidar_transform.get("stamp", 0.0) or 0.0)
+        if sensor_transform is not None:
+            tf_source = str(sensor_transform.get("source", ""))
+            tf_stamp = float(sensor_transform.get("stamp", 0.0) or 0.0)
             if tf_stamp > 0:
                 tf_age_sec = round(max(0.0, now - tf_stamp), 3)
             if tf_source and "tf_static" not in tf_source and tf_age_sec is not None and tf_age_sec > MAPPING_TF_MAX_AGE_SEC:
@@ -242,12 +323,12 @@ class RosBridge:
             "ok": tf_ok,
             "required": True,
             "base_frame": self.config.topics.robot_base_frame,
-            "lidar_frame": self.config.topics.lidar_frame,
+            f"{sensor_label}_frame": sensor_frame,
             "source": tf_source,
             "age_sec": tf_age_sec,
         }
         if not tf_ok:
-            blockers.append("tf base->lidar missing or stale")
+            blockers.append(f"tf base->{sensor_label} missing or stale")
 
         readiness = not blockers
         return {
@@ -258,8 +339,10 @@ class RosBridge:
             "checks": checks,
         }
 
-    def latest_map_points(self) -> list[tuple[float, float, float]]:
+    def latest_map_points(self) -> list[tuple]:
         with self._lock:
+            if self.config.scan_mode == "3d" and self.state.latest_pointcloud_save:
+                return list(self.state.latest_pointcloud_save)
             if self.state.latest_occupancy_points:
                 return list(self.state.latest_occupancy_points)
             return [tuple(p) for p in self.state.latest_front_points + self.state.latest_rear_points]
@@ -284,6 +367,8 @@ class RosBridge:
         with self._lock:
             self.state.scanning = active
             self.state.last_chassis["mode"] = "AUTO_MAP" if active else "ROS_IDLE"
+            if active and self.config.scan_mode == "3d":
+                self.state.latest_pointcloud_save = []
 
     def publish_cmd_vel(self, velocity: float, yaw_rate: float) -> None:
         if self._cmd_pub is None or self._node is None or self._twist_cls is None:
@@ -349,7 +434,7 @@ class RosBridge:
             "stamp": reverse["stamp"],
         }
 
-    def _resolve_lidar_mount(self) -> dict[str, float | str] | None:
+    def _resolve_sensor_mount(self, configured_frame: str, observed_frames: list[str]) -> dict[str, float | str] | None:
         base_frame = self.config.topics.robot_base_frame
         normalized_base = _normalize_frame(base_frame)
         candidates: list[str] = []
@@ -361,10 +446,9 @@ class RosBridge:
                 seen.add(normalized)
                 candidates.append(normalized)
 
-        add_candidate(self.config.topics.lidar_frame)
-        with self._lock:
-            for frame_id in self.state.last_scan_frame_by_side.values():
-                add_candidate(frame_id)
+        add_candidate(configured_frame)
+        for frame_id in observed_frames:
+            add_candidate(frame_id)
 
         if not candidates:
             return {"tx": 0.0, "ty": 0.0, "tz": 0.0, "yaw": 0.0, "source": "identity", "stamp": time.time()}
@@ -385,6 +469,16 @@ class RosBridge:
                 transform["lidar_frame"] = lidar_frame
                 return transform
         return None
+
+    def _resolve_lidar_mount(self) -> dict[str, float | str] | None:
+        with self._lock:
+            observed_frames = list(self.state.last_scan_frame_by_side.values())
+        return self._resolve_sensor_mount(self.config.topics.lidar_frame, observed_frames)
+
+    def _resolve_pointcloud_mount(self) -> dict[str, float | str] | None:
+        with self._lock:
+            observed_frames = [self.state.last_pointcloud_frame] if self.state.last_pointcloud_frame else []
+        return self._resolve_sensor_mount(self.config.topics.pointcloud_frame, observed_frames)
 
     def _on_odom(self, msg) -> None:  # noqa: ANN001
         pose = msg.pose.pose
@@ -471,6 +565,10 @@ class RosBridge:
             )
 
     def _on_lidar(self, msg, side: str) -> None:  # noqa: ANN001
+        if self.config.scan_mode != "2d":
+            topic_name = self.config.topics.lidar_front if side == "front" else self.config.topics.lidar_rear
+            self._mark_topic(topic_name or self.config.topics.lidar_fallback)
+            return
         points: list[list[float]] = []
         angle = float(msg.angle_min)
         step = float(msg.angle_increment)
@@ -522,6 +620,59 @@ class RosBridge:
                 "scan_frame": scan_frame,
                 "base_frame": self.config.topics.robot_base_frame,
                 "mount": {"tx": mount_tx, "ty": mount_ty, "yaw": mount_yaw},
+            },
+            time.time(),
+        )
+
+    def _on_pointcloud(self, msg) -> None:  # noqa: ANN001
+        if self.config.scan_mode != "3d":
+            self._mark_topic(self.config.topics.pointcloud)
+            return
+        local_points = _decode_pointcloud2_points(msg, int(self.config.pointcloud_save_limit) * 2)
+        if not local_points:
+            return
+        pose = self.latest_pose()
+        pointcloud_frame = _normalize_frame(msg.header.frame_id) if getattr(msg, "header", None) else _normalize_frame(self.config.topics.pointcloud_frame)
+        with self._lock:
+            self.state.last_pointcloud_frame = pointcloud_frame
+        pointcloud_mount = self._resolve_pointcloud_mount()
+        mount_tx = float(pointcloud_mount["tx"]) if pointcloud_mount is not None else 0.0
+        mount_ty = float(pointcloud_mount["ty"]) if pointcloud_mount is not None else 0.0
+        mount_tz = float(pointcloud_mount["tz"]) if pointcloud_mount is not None else 0.0
+        mount_yaw = float(pointcloud_mount["yaw"]) if pointcloud_mount is not None else 0.0
+        world_points: list[tuple[float, float, float, float]] = []
+        for x, y, z, intensity in local_points:
+            base_x = mount_tx + x * math.cos(mount_yaw) - y * math.sin(mount_yaw)
+            base_y = mount_ty + x * math.sin(mount_yaw) + y * math.cos(mount_yaw)
+            base_z = mount_tz + z
+            world_x = pose["x"] + base_x * math.cos(pose["yaw"]) - base_y * math.sin(pose["yaw"])
+            world_y = pose["y"] + base_x * math.sin(pose["yaw"]) + base_y * math.cos(pose["yaw"])
+            world_points.append((round(world_x, 4), round(world_y, 4), round(base_z, 4), round(float(intensity), 4)))
+
+        preview_cells = _voxelize_pointcloud(world_points, float(self.config.pointcloud_preview_voxel_size), int(self.config.pointcloud_preview_limit))
+        with self._lock:
+            self.state.latest_pointcloud_preview = [list(point) for point in preview_cells.values()]
+            if self.state.scanning:
+                save_existing = {
+                    _voxel_key_3d(point[0], point[1], point[2], float(self.config.pointcloud_save_voxel_size)): point
+                    for point in self.state.latest_pointcloud_save
+                }
+                save_cells = _voxelize_pointcloud(
+                    world_points,
+                    float(self.config.pointcloud_save_voxel_size),
+                    int(self.config.pointcloud_save_limit),
+                    existing=save_existing,
+                )
+                self.state.latest_pointcloud_save = list(save_cells.values())
+        self._mark_topic(self.config.topics.pointcloud)
+        self._publish_async(
+            "/pointcloud/preview",
+            {
+                "points": [list(point) for point in preview_cells.values()],
+                "raw_points": len(local_points),
+                "pointcloud_frame": pointcloud_frame,
+                "base_frame": self.config.topics.robot_base_frame,
+                "mount": {"tx": mount_tx, "ty": mount_ty, "tz": mount_tz, "yaw": mount_yaw},
             },
             time.time(),
         )

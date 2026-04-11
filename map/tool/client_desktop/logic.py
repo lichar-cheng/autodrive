@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 
 SCAN_FUSION_PRESETS: dict[str, dict[str, Any]] = {
@@ -42,6 +42,18 @@ SCAN_FUSION_PRESETS: dict[str, dict[str, Any]] = {
 }
 
 
+AuthMode = Literal["local", "cloud"]
+ScanMode = Literal["2d", "3d"]
+
+
+class BackendConnectionDescriptor(TypedDict):
+    auth_mode: AuthMode
+    backend_host: str
+    backend_port: int
+    token: str
+    expires_at: str | None
+
+
 @dataclass
 class Point:
     x: float
@@ -74,6 +86,56 @@ class Segment:
     points: list[Point] | None = None
 
 
+def normalize_auth_descriptor(auth_mode: str, payload: dict[str, Any] | None = None) -> BackendConnectionDescriptor:
+    data = dict(payload or {})
+    resolved_mode = str(auth_mode or data.get("auth_mode") or "local").strip().lower()
+    if resolved_mode not in ("local", "cloud"):
+        resolved_mode = "local"
+    backend_host = data.get("backend_host") or data.get("host") or data.get("ip") or ""
+    backend_port = data.get("backend_port", data.get("port"))
+    if backend_port is None:
+        raise ValueError("backend_port is required")
+    try:
+        port_value = int(str(backend_port).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("backend_port must be an integer") from exc
+    if port_value < 1 or port_value > 65535:
+        raise ValueError("backend_port must be between 1 and 65535")
+    token = data.get("token") or ""
+    expires_at = data.get("expires_at")
+    return {
+        "auth_mode": resolved_mode,
+        "backend_host": str(backend_host).strip(),
+        "backend_port": port_value,
+        "token": str(token),
+        "expires_at": None if expires_at is None else str(expires_at),
+    }
+
+
+def resolve_scan_mode_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    resolved = dict(config or {})
+    scan_mode = str(resolved.get("scan_mode", "2d")).strip().lower()
+    if scan_mode not in ("2d", "3d"):
+        scan_mode = "2d"
+    resolved["scan_mode"] = scan_mode
+    return resolved
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "y", "on"):
+        return True
+    if text in ("0", "false", "no", "n", "off", ""):
+        return False
+    return bool(value)
+
+
 def parse_optional_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -100,7 +162,7 @@ def resolve_scan_fusion_config(preset: str | None = None, overrides: dict[str, A
     config["occupied_min_hits"] = max(1, int(config["occupied_min_hits"]))
     config["occupied_over_free_ratio"] = max(0.0, float(config["occupied_over_free_ratio"]))
     config["turn_skip_wz"] = max(0.0, float(config["turn_skip_wz"]))
-    config["skip_turn_frames"] = bool(config["skip_turn_frames"])
+    config["skip_turn_frames"] = _coerce_bool(config["skip_turn_frames"], True)
     return config
 
 

@@ -13,7 +13,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import CONFIG
-from .models import AddPoiRequest, LoadMapRequest, MoveCommand, PlanPathRequest, SaveMapRequest
+from .models import AddPoiRequest, LoadMapRequest, MoveCommand, PlanPathRequest, SaveMapRequest, ScanModeRequest
 from .ros_bridge import RosRuntime, detect_ros
 from .simulator import Simulator
 from .stcm_codec import load_stcm, save_stcm
@@ -30,7 +30,7 @@ bus = TopicBus(queue_size=CONFIG.ws_queue_size)
 sim = Simulator(bus, rate_hz=CONFIG.sim_rate_hz, points_per_scan=CONFIG.lidar_points_per_scan)
 ros: RosRuntime = RosRuntime(enabled=False, reason="ROS runtime not initialized")
 map_dir = Path("data/maps")
-latest_points: list[tuple[float, float, float]] = []
+latest_points: list[tuple] = []
 seq_by_topic: dict[str, int] = defaultdict(int)
 ws_clients: set[int] = set()
 motion_command_seq = 0
@@ -43,6 +43,7 @@ STREAM_TOPICS = [
     "/chassis/status",
     "/lidar/front",
     "/lidar/rear",
+    "/pointcloud/preview",
     "/camera/1/compressed",
     "/camera/2/compressed",
     "/camera/3/compressed",
@@ -59,6 +60,7 @@ TOPIC_MIN_INTERVAL_SEC = {
 }
 LIDAR_MAX_WS_POINTS = 1200
 LIDAR_KEYFRAME_INTERVAL_SEC = 1.0
+POINTCLOUD_MAX_WS_POINTS = 3000
 
 QUEUE_NEAR_CAPACITY_RATIO = 0.8
 QUEUE_WARN_INTERVAL_SEC = 5.0
@@ -81,6 +83,7 @@ SCAN_SESSION = {
     "rear_frames": 0,
     "raw_points": 0,
     "accumulated": {},
+    "pointcloud_frames": 0,
 }
 
 
@@ -121,6 +124,7 @@ def _reset_scan_session(voxel_size: float | None = None, keep_points: bool = Fal
     SCAN_SESSION["front_frames"] = 0
     SCAN_SESSION["rear_frames"] = 0
     SCAN_SESSION["raw_points"] = 0
+    SCAN_SESSION["pointcloud_frames"] = 0
     if voxel_size is not None:
         SCAN_SESSION["voxel_size"] = max(0.02, float(voxel_size))
     if not keep_points:
@@ -210,6 +214,8 @@ def _scan_summary() -> dict[str, Any]:
         "rear_frames": int(SCAN_SESSION["rear_frames"]),
         "raw_points": int(SCAN_SESSION["raw_points"]),
         "accumulated_points": len(SCAN_SESSION["accumulated"]),
+        "pointcloud_frames": int(SCAN_SESSION["pointcloud_frames"]),
+        "scan_mode": CONFIG.scan_mode,
     }
 
 
@@ -276,7 +282,7 @@ def _mapping_prereq_summary() -> dict[str, Any]:
     }
 
 
-def _current_map_points() -> list[tuple[float, float, float]]:
+def _current_map_points() -> list[tuple]:
     global latest_points
 
     if ros.enabled and ros.bridge is not None:
@@ -289,12 +295,19 @@ def _current_map_points() -> list[tuple[float, float, float]]:
     return latest_points
 
 
+def _current_map_source() -> str:
+    if CONFIG.scan_mode == "3d":
+        return "point_cloud"
+    return "occupancy_grid" if CONFIG.ros.topics.occupancy_grid else "laser_accumulation"
+
+
 @app.on_event("startup")
 async def startup() -> None:
     global ros
 
     map_dir.mkdir(parents=True, exist_ok=True)
     loop = asyncio.get_running_loop()
+    CONFIG.ros.scan_mode = CONFIG.scan_mode
     ros = detect_ros(bus=bus, loop=loop, config=CONFIG.ros)
 
     if ros.enabled:
@@ -331,7 +344,7 @@ async def health() -> dict:
         "mapping_blockers": list(mapping_prereq["blockers"]),
         "mapping_warnings": list(mapping_prereq["warnings"]),
         "simulator_active": bool(sim._running),
-        "map_source": "occupancy_grid" if CONFIG.ros.topics.occupancy_grid else "laser_accumulation",
+        "map_source": _current_map_source(),
         "frames": {
             "odom": CONFIG.ros.topics.odom_frame,
             "base": CONFIG.ros.topics.robot_base_frame,
@@ -387,6 +400,25 @@ async def start_scan() -> dict:
         sim.scanning = True
     logger.info("scan started")
     return {"ok": True, "scan_active": True, "scan_summary": _scan_summary(), "ros_enabled": ros.enabled}
+
+
+@app.post("/scan/mode")
+async def set_scan_mode(req: ScanModeRequest) -> dict:
+    scan_mode = str(req.scan_mode or "2d").strip().lower()
+    if scan_mode not in {"2d", "3d"}:
+        scan_mode = "2d"
+    CONFIG.scan_mode = scan_mode
+    CONFIG.ros.scan_mode = scan_mode
+    if ros.enabled and ros.bridge is not None:
+        ros.bridge.config.scan_mode = scan_mode
+    _reset_scan_session()
+    logger.info("scan mode switched mode=%s", scan_mode)
+    return {
+        "ok": True,
+        "scan_mode": scan_mode,
+        "scan_summary": _scan_summary(),
+        "mapping_prereq": _mapping_prereq_summary(),
+    }
 
 
 @app.post("/scan/stop")
@@ -456,10 +488,11 @@ async def add_poi(req: AddPoiRequest) -> dict:
 @app.post("/map/save")
 async def save_map(req: SaveMapRequest) -> dict:
     points_to_save = _current_map_points()
+    scan_mode = str(req.scan_mode or CONFIG.scan_mode).strip().lower()
     if req.voxel_size is not None:
         SCAN_SESSION["voxel_size"] = max(0.02, float(req.voxel_size))
     if not points_to_save:
-        points_to_save = [(0.0, 0.0, 1.0)]
+        points_to_save = [(0.0, 0.0, 0.0, 1.0)] if scan_mode == "3d" else [(0.0, 0.0, 1.0)]
 
     pose = ros.bridge.latest_pose() if ros.enabled and ros.bridge is not None else {
         "x": sim.state.x,
@@ -471,11 +504,12 @@ async def save_map(req: SaveMapRequest) -> dict:
     filename = f"{req.name}_{int(time.time())}.slam"
     target = map_dir / filename
     bundle = {
-        "version": "stcm.v2",
+        "version": "stcm.v3" if scan_mode == "3d" else "stcm.v2",
+        "scan_mode": scan_mode,
         "notes": req.notes,
         "created_at": time.time(),
         "source": "ros" if ros.enabled else "sim",
-        "map_source": "occupancy_grid" if CONFIG.ros.topics.occupancy_grid else "laser_accumulation",
+        "map_source": _current_map_source(),
         "pose": pose,
         "gps": gps,
         "imu": imu,
@@ -486,8 +520,11 @@ async def save_map(req: SaveMapRequest) -> dict:
         "chassis_track": sim.state.chassis_track,
         "scan_summary": _scan_summary(),
         "ros_diag": _ros_diag(),
-        "radar_points": points_to_save,
     }
+    if scan_mode == "3d":
+        bundle["point_cloud"] = points_to_save
+    else:
+        bundle["radar_points"] = points_to_save
     save_stcm(target, bundle)
     response = {
         "ok": True,
@@ -498,10 +535,12 @@ async def save_map(req: SaveMapRequest) -> dict:
             "trajectory": len(sim.state.trajectory),
             "gps_track": len(sim.state.gps_track),
             "chassis_track": len(sim.state.chassis_track),
-            "radar_points": len(points_to_save),
+            "radar_points": len(points_to_save) if scan_mode != "3d" else 0,
+            "point_cloud": len(points_to_save) if scan_mode == "3d" else 0,
         },
         "scan_summary": _scan_summary(),
         "ros_enabled": ros.enabled,
+        "scan_mode": scan_mode,
     }
     if getattr(req, "reset_after_save", False):
         _reset_scan_session(voxel_size=float(SCAN_SESSION["voxel_size"]))
@@ -513,7 +552,8 @@ async def load_map(req: LoadMapRequest) -> dict:
     global latest_points
 
     bundle = load_stcm(map_dir / req.filename)
-    latest_points = [tuple(p) for p in bundle.get("radar_points", [])]
+    scan_mode = str(bundle.get("scan_mode") or "2d").strip().lower()
+    latest_points = [tuple(p) for p in bundle.get("point_cloud", [])] if scan_mode == "3d" else [tuple(p) for p in bundle.get("radar_points", [])]
     sim.state.poi = bundle.get("poi", [])
     sim.state.path = bundle.get("path", [])
     sim.state.trajectory = bundle.get("trajectory", [])
@@ -521,18 +561,23 @@ async def load_map(req: LoadMapRequest) -> dict:
     sim.state.chassis_track = bundle.get("chassis_track", [])
 
     _reset_scan_session(keep_points=True)
-    SCAN_SESSION["accumulated"] = {
-        _scan_point_key(float(p[0]), float(p[1]), float(SCAN_SESSION["voxel_size"])): {
-            "x": float(p[0]),
-            "y": float(p[1]),
-            "intensity": float(p[2]),
-            "hits": 1,
-            "source": "load",
+    SCAN_SESSION["accumulated"] = (
+        {
+            _scan_point_key(float(p[0]), float(p[1]), float(SCAN_SESSION["voxel_size"])): {
+                "x": float(p[0]),
+                "y": float(p[1]),
+                "intensity": float(p[2]),
+                "hits": 1,
+                "source": "load",
+            }
+            for p in latest_points
         }
-        for p in latest_points
-    }
+        if scan_mode != "3d"
+        else {}
+    )
     return {
         "ok": True,
+        "scan_mode": scan_mode,
         "point_count": len(latest_points),
         "poi_count": len(sim.state.poi),
         "path_count": len(sim.state.path),
@@ -628,6 +673,10 @@ async def ws_stream(websocket: WebSocket) -> None:
                 ros_points = ros.bridge.latest_map_points()
                 if ros_points:
                     latest_points = ros_points
+            elif topic == "/pointcloud/preview":
+                latest_points = [tuple(point) for point in message["payload"].get("points", [])[:POINTCLOUD_MAX_WS_POINTS]]
+                SCAN_SESSION["raw_points"] += int(message["payload"].get("raw_points", len(latest_points)))
+                SCAN_SESSION["pointcloud_frames"] += 1
 
             outbound_message = message
             if topic in {"/lidar/front", "/lidar/rear"}:
@@ -644,6 +693,16 @@ async def ws_stream(websocket: WebSocket) -> None:
                         "points": thinned,
                         "raw_points": len(points),
                         "keyframe": keyframe,
+                    },
+                }
+            elif topic == "/pointcloud/preview":
+                points = message["payload"].get("points", [])
+                outbound_message = {
+                    **message,
+                    "payload": {
+                        **message["payload"],
+                        "points": _thin_points(points, POINTCLOUD_MAX_WS_POINTS),
+                        "raw_points": int(message["payload"].get("raw_points", len(points))),
                     },
                 }
 
