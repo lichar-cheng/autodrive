@@ -25,6 +25,7 @@ import websocket
 
 try:
     from .logic import (
+        normalize_auth_descriptor,
         SCAN_FUSION_PRESETS,
         Point,
         build_scan_fusion_metadata,
@@ -42,6 +43,7 @@ try:
     )
 except ImportError:
     from logic import (  # type: ignore
+        normalize_auth_descriptor,
         SCAN_FUSION_PRESETS,
         Point,
         build_scan_fusion_metadata,
@@ -89,6 +91,17 @@ def normalize_server_ws_url(raw: str) -> str:
     elif path != "/ws/stream":
         path = f"{path}/ws/stream" if not path.endswith("/ws/stream") else path
     return parsed._replace(path=path).geturl()
+
+
+def derive_backend_transport_bases(descriptor: dict) -> tuple[str, str]:
+    auth_mode = str(descriptor.get("auth_mode", "local")).strip().lower()
+    scheme = "https" if auth_mode == "cloud" else "http"
+    ws_scheme = "wss" if auth_mode == "cloud" else "ws"
+    host = str(descriptor.get("backend_host", "")).strip()
+    port = int(descriptor.get("backend_port", 0) or 0)
+    base = f"{scheme}://{host}:{port}"
+    ws_url = f"{ws_scheme}://{host}:{port}/ws/stream"
+    return base, ws_url
 
 
 def resolve_log_file_path(
@@ -180,6 +193,11 @@ def strip_legacy_trajectory(manifest: dict) -> dict:
 
 KEYUP_STOP_CONFIRM_MS = 50
 HEALTH_POLL_INTERVAL_SEC = 15.0
+DEFAULT_LOCAL_AUTH_PATH = "/login"
+DEFAULT_CLOUD_AUTH_PATH = "/api/auth/login"
+DEFAULT_LOCAL_AUTH_USERNAME = os.environ.get("AUTODRIVE_LOCAL_AUTH_USERNAME", "autodrive")
+DEFAULT_LOCAL_AUTH_PASSWORD = os.environ.get("AUTODRIVE_LOCAL_AUTH_PASSWORD", "autodrive")
+AUTH_REQUEST_TIMEOUT_SEC = 8.0
 
 
 def summarize_mapping_status(health: dict) -> str:
@@ -203,6 +221,44 @@ def mapping_prereq_message(summary: dict) -> str:
     if warnings:
         return "\n".join(warnings)
     return "mapping prerequisites not satisfied"
+
+
+def normalize_auth_http_url(host: str, port: str | int, path: str, default_scheme: str) -> str:
+    raw_host = str(host or "").strip()
+    raw_path = str(path or "").strip() or "/"
+    if not raw_host:
+        raise ValueError("auth host is empty")
+    if "://" in raw_host:
+        parsed = urlparse(raw_host)
+        scheme = parsed.scheme or default_scheme
+        netloc = parsed.netloc or parsed.path
+        base_path = parsed.path if parsed.netloc else ""
+    else:
+        scheme = default_scheme
+        netloc = raw_host
+        base_path = ""
+    if ":" not in netloc:
+        netloc = f"{netloc}:{int(str(port).strip())}"
+    full_path = raw_path if raw_path.startswith("/") else f"/{raw_path}"
+    if base_path and base_path != "/":
+        prefix = base_path.rstrip("/")
+        full_path = f"{prefix}{full_path}"
+    return f"{scheme}://{netloc}{full_path}"
+
+
+def extract_auth_descriptor_payload(payload: dict | None) -> dict:
+    data = dict(payload or {})
+    for key in ("data", "result", "payload"):
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            data = nested
+            break
+    return {
+        "backend_host": data.get("backend_host") or data.get("host") or data.get("ip") or data.get("backend_ip") or "",
+        "backend_port": data.get("backend_port") or data.get("port"),
+        "token": data.get("token") or data.get("access_token") or data.get("auth_token") or "",
+        "expires_at": data.get("expires_at") or data.get("expiry") or data.get("expires"),
+    }
 
 
 def runtime_base_dir() -> Path:
@@ -240,7 +296,7 @@ def compute_log_candidates(
 
 
 class ServerBridge:
-    def __init__(self, ws_url: str, logger: logging.Logger | None = None) -> None:
+    def __init__(self, ws_url: str, auth_token: str = "", logger: logging.Logger | None = None) -> None:
         self.ws_url = normalize_server_ws_url(ws_url)
         self.http_base = self.ws_url.replace("ws://", "http://").replace("wss://", "https://").replace("/ws/stream", "")
         self.ws_host = urlparse(self.ws_url).hostname or ""
@@ -252,6 +308,9 @@ class ServerBridge:
         self.ws: websocket.WebSocketApp | None = None
         self.session = requests.Session()
         self.session.trust_env = False
+        self.auth_token = str(auth_token or "").strip()
+        if self.auth_token:
+            self.session.headers.update({"Authorization": f"Bearer {self.auth_token}"})
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
@@ -289,6 +348,8 @@ class ServerBridge:
         def worker() -> None:
             session = requests.Session()
             session.trust_env = False
+            if self.auth_token:
+                session.headers.update({"Authorization": f"Bearer {self.auth_token}"})
             last_err: Exception | None = None
             try:
                 for index in range(retries + 1):
@@ -314,6 +375,11 @@ class ServerBridge:
         res = self.session.get(f"{self.http_base}{path}", timeout=2)
         res.raise_for_status()
         return res.json()
+
+    def websocket_headers(self) -> list[str]:
+        if not self.auth_token:
+            return []
+        return [f"Authorization: Bearer {self.auth_token}"]
 
     def _loop(self) -> None:
         retry = 0
@@ -347,6 +413,7 @@ class ServerBridge:
                 on_open=on_open,
                 on_close=on_close,
                 on_error=on_error,
+                header=self.websocket_headers(),
             )
             no_proxy_hosts = [self.ws_host, "127.0.0.1", "localhost"]
             self.ws.run_forever(
@@ -376,6 +443,20 @@ class DesktopClient:
                 "language": "Language",
                 "english": "English",
                 "chinese": "中文",
+                "auth": "Authentication",
+                "auth_mode": "Auth Mode",
+                "local_auth": "Local Auth",
+                "cloud_auth": "Cloud Auth",
+                "auth_login": "Login",
+                "auth_ip": "IP",
+                "auth_host": "Host",
+                "auth_username": "Username",
+                "auth_password": "Password",
+                "auth_port": "Port",
+                "auth_path": "Path",
+                "auth_status": "Auth Status",
+                "auth_resolved": "Resolved Backend",
+                "auth_expires_at": "Expires At",
                 "panel_visibility": "Panel Visibility",
                 "move": "Move",
                 "poi": "POI",
@@ -526,6 +607,20 @@ class DesktopClient:
                 "language": "语言",
                 "english": "English",
                 "chinese": "中文",
+                "auth": "认证",
+                "auth_mode": "认证模式",
+                "local_auth": "本地认证",
+                "cloud_auth": "云端认证",
+                "auth_login": "登录",
+                "auth_ip": "IP",
+                "auth_host": "主机",
+                "auth_username": "用户名",
+                "auth_password": "密码",
+                "auth_port": "端口",
+                "auth_path": "路径",
+                "auth_status": "认证状态",
+                "auth_resolved": "解析后后端",
+                "auth_expires_at": "过期时间",
                 "panel_visibility": "面板显示",
                 "move": "移动",
                 "poi": "POI 点",
@@ -679,6 +774,20 @@ class DesktopClient:
         self.root.report_callback_exception = self.report_callback_exception
 
         self.bridge: ServerBridge | None = None
+        self.auth_mode_var = tk.StringVar(value="local")
+        self.backend_auth_descriptor: dict | None = None
+        self.backend_http_base = ""
+        self.backend_ws_url = ""
+        self.auth_local_ip_var = tk.StringVar(value="127.0.0.1")
+        self.auth_local_port_var = tk.StringVar(value="8080")
+        self.auth_local_path_var = tk.StringVar(value=DEFAULT_LOCAL_AUTH_PATH)
+        self.auth_cloud_host_var = tk.StringVar(value="")
+        self.auth_cloud_port_var = tk.StringVar(value="8443")
+        self.auth_cloud_path_var = tk.StringVar(value=DEFAULT_CLOUD_AUTH_PATH)
+        self.auth_cloud_username_var = tk.StringVar(value="")
+        self.auth_cloud_password_var = tk.StringVar(value="")
+        self.auth_cloud_expires_var = tk.StringVar(value="")
+        self.auth_status_var = tk.StringVar(value="")
         self.pose = {"x": 0.0, "y": 0.0, "yaw": 0.0, "vx": 0.0, "wz": 0.0}
         self.gps = {"lat": 0.0, "lon": 0.0}
         self.odom = {"x": 0.0, "y": 0.0, "yaw": 0.0, "vx": 0.0, "wz": 0.0}
@@ -706,12 +815,15 @@ class DesktopClient:
         self.scan = {
             "active": False,
             "started_ms": 0,
+            "scan_mode": "2d",
             "voxel": 0.08,
             "front_frames": 0,
             "rear_frames": 0,
+            "pointcloud_frames": 0,
             "raw_points": 0,
             "occupied": {},
             "free": {},
+            "point_cloud_preview": [],
             "last_saved_file": "",
             "saved_point_count": 0,
         }
@@ -744,6 +856,7 @@ class DesktopClient:
         self.camera_refresh_var = tk.StringVar(value="No buffered frame")
         self.map_name_var = tk.StringVar(value="desktop_map")
         self.map_notes_var = tk.StringVar(value="Desktop scan session")
+        self.scan_mode_var = tk.StringVar(value="2d")
         self.voxel_var = tk.StringVar(value=f"{float(self.scan_fusion['voxel_size']):.2f}")
         self.scan_fusion_preset_var = tk.StringVar(value=str(self.scan_fusion["preset"]))
         self.occupied_min_hits_var = tk.StringVar(value=str(int(self.scan_fusion["occupied_min_hits"])))
@@ -886,6 +999,8 @@ class DesktopClient:
         self.status_var.set(self.tr("ws_offline") if not (self.bridge and self.bridge.connected) else self.status_var.get())
         if not self.poi_status_var.get():
             self.poi_status_var.set(self.tr("poi_idle"))
+        if hasattr(self, "auth_local_frame") and hasattr(self, "auth_cloud_frame"):
+            self.sync_auth_mode_ui()
         self.sync_scan_badges()
         self.sync_path_panel()
         self.update_left_panel_notice()
@@ -934,6 +1049,8 @@ class DesktopClient:
         ttk.Label(top, textvariable=self.conn_var).pack(side=tk.LEFT, padx=(14, 4))
         ttk.Label(top, textvariable=self.status_var, style="Muted.TLabel").pack(side=tk.LEFT, padx=(4, 8))
         ttk.Label(top, textvariable=self.status_detail_var, style="Muted.TLabel").pack(side=tk.LEFT)
+
+        self._auth_controls(shell)
 
         paned = ttk.Panedwindow(shell, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
@@ -998,6 +1115,12 @@ class DesktopClient:
         )
         scan_row.pack(fill=tk.X, pady=(0, 6))
         self._entry(card, self.tr("map_name"), self.map_name_var)
+        mode_row = ttk.Frame(card)
+        mode_row.pack(fill=tk.X, pady=2)
+        ttk.Label(mode_row, text="Scan Mode", width=18).pack(side=tk.LEFT)
+        mode_box = ttk.Combobox(mode_row, textvariable=self.scan_mode_var, state="readonly", values=["2d", "3d"], width=18)
+        mode_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        mode_box.bind("<<ComboboxSelected>>", lambda _e: self.on_scan_mode_change())
         preset_row = ttk.Frame(card)
         preset_row.pack(fill=tk.X, pady=2)
         ttk.Label(preset_row, text="Fusion Preset", width=18).pack(side=tk.LEFT)
@@ -1196,6 +1319,35 @@ class DesktopClient:
         ttk.Label(row, text=label, width=18).pack(side=tk.LEFT)
         ttk.Entry(row, textvariable=var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
 
+    def _auth_controls(self, parent: ttk.Frame) -> None:
+        card = ttk.LabelFrame(parent, text=self.tr("auth"), padding=8)
+        card.pack(fill=tk.X, pady=(0, 10))
+        selector = ttk.Frame(card)
+        selector.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(selector, text=self.tr("auth_mode")).pack(side=tk.LEFT)
+        mode_box = ttk.Combobox(selector, textvariable=self.auth_mode_var, state="readonly", width=12, values=["local", "cloud"])
+        mode_box.pack(side=tk.LEFT, padx=6)
+        mode_box.bind("<<ComboboxSelected>>", lambda _e: self.sync_auth_mode_ui())
+
+        self.auth_local_frame = ttk.Frame(card)
+        self._entry(self.auth_local_frame, self.tr("auth_ip"), self.auth_local_ip_var)
+        self._entry(self.auth_local_frame, self.tr("auth_port"), self.auth_local_port_var)
+        self._entry(self.auth_local_frame, self.tr("auth_path"), self.auth_local_path_var)
+        ttk.Button(self.auth_local_frame, text=self.tr("auth_login"), command=self.login_local_auth).pack(anchor=tk.W, pady=(4, 0))
+
+        self.auth_cloud_frame = ttk.Frame(card)
+        self._entry(self.auth_cloud_frame, self.tr("auth_host"), self.auth_cloud_host_var)
+        self._entry(self.auth_cloud_frame, self.tr("auth_port"), self.auth_cloud_port_var)
+        self._entry(self.auth_cloud_frame, self.tr("auth_path"), self.auth_cloud_path_var)
+        self._entry(self.auth_cloud_frame, self.tr("auth_username"), self.auth_cloud_username_var)
+        self._entry(self.auth_cloud_frame, self.tr("auth_password"), self.auth_cloud_password_var)
+        self._entry(self.auth_cloud_frame, self.tr("auth_expires_at"), self.auth_cloud_expires_var)
+        ttk.Button(self.auth_cloud_frame, text=self.tr("auth_login"), command=self.login_cloud_auth).pack(anchor=tk.W, pady=(4, 0))
+
+        ttk.Label(card, textvariable=self.auth_status_var, style="Muted.TLabel", wraplength=520, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 0))
+
+        self.sync_auth_mode_ui()
+
     def _responsive_button_row(self, parent: ttk.Frame, buttons: list[tuple[str, object]], min_button_width: int = 120) -> tuple[ttk.Frame, list[ttk.Button]]:
         frame = ttk.Frame(parent)
         created: list[ttk.Button] = []
@@ -1295,6 +1447,17 @@ class DesktopClient:
         target.pack(fill=tk.X, pady=(0, 6))
         self.batch_action_btn.configure(text=self.tr("start_batch_add") if self.pending_poi is None and not self.pending_poi_queue else self.tr("cancel_batch", count=len(self.pending_poi_queue) + (1 if self.pending_poi else 0)))
 
+    def sync_auth_mode_ui(self) -> None:
+        mode = str(self.auth_mode_var.get() or "local").strip().lower()
+        if mode not in ("local", "cloud"):
+            mode = "local"
+            self.auth_mode_var.set(mode)
+        for frame in (self.auth_local_frame, self.auth_cloud_frame):
+            if frame.winfo_manager():
+                frame.pack_forget()
+        target = self.auth_local_frame if mode == "local" else self.auth_cloud_frame
+        target.pack(fill=tk.X, pady=(0, 6))
+
     def update_health_status_detail(self, health: dict) -> None:
         self.status_detail_var.set(
             self.tr(
@@ -1306,18 +1469,124 @@ class DesktopClient:
             )
         )
 
+    def auth_payload(self, auth_mode: str | None = None) -> dict:
+        mode = str(auth_mode or self.auth_mode_var.get() or "local").strip().lower()
+        if mode == "cloud":
+            return {
+                "host": self.auth_cloud_host_var.get().strip(),
+                "port": self.auth_cloud_port_var.get().strip(),
+                "path": self.auth_cloud_path_var.get().strip(),
+                "username": self.auth_cloud_username_var.get().strip(),
+                "password": self.auth_cloud_password_var.get().strip(),
+            }
+        return {
+            "ip": self.auth_local_ip_var.get().strip(),
+            "port": self.auth_local_port_var.get().strip(),
+            "path": self.auth_local_path_var.get().strip(),
+            "username": DEFAULT_LOCAL_AUTH_USERNAME,
+            "password": DEFAULT_LOCAL_AUTH_PASSWORD,
+        }
+
+    def backend_auth_token(self) -> str:
+        descriptor = self.backend_auth_descriptor or {}
+        return str(descriptor.get("token", "")).strip()
+
+    def backend_request_headers(self) -> dict[str, str]:
+        token = self.backend_auth_token()
+        return {"Authorization": f"Bearer {token}"} if token else {}
+
+    def apply_auth_result(self, auth_mode: str, payload: dict | None = None) -> dict:
+        descriptor = normalize_auth_descriptor(auth_mode, payload)
+        self.backend_auth_descriptor = descriptor
+        self.backend_http_base, self.backend_ws_url = derive_backend_transport_bases(descriptor)
+        resolved_host = str(descriptor.get("backend_host", "")).strip()
+        resolved_port = descriptor.get("backend_port")
+        expires_at = descriptor.get("expires_at")
+        auth_status = f"{self.tr('auth_resolved')}: {resolved_host}:{resolved_port}"
+        if expires_at:
+            if hasattr(self, "auth_cloud_expires_var") and self.auth_cloud_expires_var is not None:
+                self.auth_cloud_expires_var.set(str(expires_at))
+            auth_status = f"{auth_status} | {self.tr('auth_expires_at')}: {expires_at}"
+        if hasattr(self, "auth_status_var") and self.auth_status_var is not None:
+            self.auth_status_var.set(auth_status)
+        if hasattr(self, "auth_mode_var") and self.auth_mode_var is not None:
+            self.auth_mode_var.set(descriptor["auth_mode"])
+        if hasattr(self, "server_var") and self.server_var is not None:
+            self.server_var.set(self.backend_ws_url)
+        return descriptor
+
+    def auth_request(self, url: str, payload: dict) -> dict:
+        response = requests.post(url, json=payload, timeout=AUTH_REQUEST_TIMEOUT_SEC)
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict):
+            raise ValueError("auth response must be an object")
+        return body
+
+    def perform_local_auth(self) -> dict:
+        payload = self.auth_payload("local")
+        url = normalize_auth_http_url(payload["ip"], payload["port"], payload["path"], default_scheme="http")
+        body = self.auth_request(
+            url,
+            {
+                "username": payload["username"],
+                "password": payload["password"],
+            },
+        )
+        return self.apply_auth_result("local", extract_auth_descriptor_payload(body))
+
+    def perform_cloud_auth(self) -> dict:
+        payload = self.auth_payload("cloud")
+        url = normalize_auth_http_url(payload["host"], payload["port"], payload["path"], default_scheme="https")
+        body = self.auth_request(
+            url,
+            {
+                "username": payload["username"],
+                "password": payload["password"],
+            },
+        )
+        return self.apply_auth_result("cloud", extract_auth_descriptor_payload(body))
+
+    def login_local_auth(self) -> dict | None:
+        try:
+            return self.perform_local_auth()
+        except Exception as exc:
+            self.logger.exception("local auth failed")
+            messagebox.showerror(self.tr("auth"), str(exc))
+            return None
+
+    def login_cloud_auth(self) -> dict | None:
+        try:
+            return self.perform_cloud_auth()
+        except Exception as exc:
+            self.logger.exception("cloud auth failed")
+            messagebox.showerror(self.tr("auth"), str(exc))
+            return None
+
     def connect(self) -> None:
         try:
             self.disconnect()
-            raw_url = self.server_var.get().strip()
-            normalized_url = normalize_server_ws_url(raw_url)
-            self.server_var.set(normalized_url)
-            self.logger.info("connect clicked ws_url=%s", normalized_url)
-            if not normalized_url:
-                raise ValueError("server address is empty")
-            self.bridge = ServerBridge(normalized_url, logger=self.logger)
+            if self.backend_auth_descriptor:
+                ws_url = self.backend_ws_url or derive_backend_transport_bases(self.backend_auth_descriptor)[1]
+                self.server_var.set(ws_url)
+                auth_token = self.backend_auth_token()
+                self.logger.info("connect clicked auth_mode=%s ws_url=%s", self.backend_auth_descriptor.get("auth_mode"), ws_url)
+            else:
+                raw_url = self.server_var.get().strip()
+                ws_url = normalize_server_ws_url(raw_url)
+                self.server_var.set(ws_url)
+                auth_token = ""
+                self.logger.info("connect clicked ws_url=%s", ws_url)
+                if not ws_url:
+                    raise ValueError("server address is empty")
+            self.backend_ws_url = ws_url
+            self.backend_http_base = ws_url.replace("ws://", "http://").replace("wss://", "https://").replace("/ws/stream", "")
+            self.bridge = ServerBridge(ws_url, auth_token=auth_token, logger=self.logger)
             health = self.bridge.get("/health")
             self.health = health
+            scan_mode = self.health.get("scan_summary", {}).get("scan_mode")
+            if scan_mode:
+                self.apply_scan_mode(str(scan_mode), clear_existing=False)
             self.update_health_status_detail(health)
             self.logger.info("connect preflight ok ws_clients=%s", health.get("ws_clients"))
             self.bridge.start()
@@ -1368,6 +1637,9 @@ class DesktopClient:
         self.last_health_poll_at = now
         try:
             self.health = self.bridge.get("/health")
+            scan_mode = self.health.get("scan_summary", {}).get("scan_mode")
+            if scan_mode:
+                self.apply_scan_mode(str(scan_mode), clear_existing=False)
             self.update_health_status_detail(self.health)
         except Exception as exc:
             self.stream_health["last_api_error"] = str(exc)
@@ -1449,13 +1721,43 @@ class DesktopClient:
                 self.scan["rear_frames"] += 1
                 self.last_scan["rear"] = {"raw_points": int(payload.get("raw_points", len(payload.get("points", [])))), "keyframe": bool(payload.get("keyframe")), "stamp": float(msg.get("stamp", 0))}
                 self.accumulate_points(payload.get("points", []), float(msg.get("stamp", 0)), bool(payload.get("keyframe")))
+            elif topic == "/pointcloud/preview":
+                self.scan["pointcloud_frames"] += 1
+                self.scan["raw_points"] += int(payload.get("raw_points", len(payload.get("points", []))))
+                self.scan["point_cloud_preview"] = [
+                    [float(point[0]), float(point[1]), float(point[2]), float(point[3] if len(point) > 3 else 1.0)]
+                    for point in payload.get("points", [])
+                    if isinstance(point, (list, tuple)) and len(point) >= 3
+                ]
+                self.sync_scan_badges()
             elif topic and topic.startswith("/camera/"):
                 cam_id = parse_camera_topic_id(topic)
                 if cam_id is not None and cam_id in self.camera_inbox:
                     self.camera_inbox[cam_id] = {"objects": payload.get("objects", []), "meta": {"seq": msg.get("seq"), "stamp": msg.get("stamp"), "received_at_ms": int(time.time() * 1000)}}
         self.camera_refresh_var.set(build_camera_refresh_text(self.camera_inbox))
 
+    def apply_scan_mode(self, mode: str, clear_existing: bool = False) -> str:
+        resolved = "3d" if str(mode).strip().lower() == "3d" else "2d"
+        self.scan["scan_mode"] = resolved
+        self.scan_mode_var.set(resolved)
+        if clear_existing:
+            self.clear_scan()
+        else:
+            self.sync_scan_badges()
+        return resolved
+
+    def on_scan_mode_change(self) -> None:
+        resolved = self.apply_scan_mode(self.scan_mode_var.get(), clear_existing=False)
+        if getattr(self, "bridge", None):
+            response = self.call_api("/scan/mode", {"scan_mode": resolved})
+            if response is not None:
+                self.apply_scan_mode(str(response.get("scan_mode", resolved)), clear_existing=True)
+
     def start_scan(self) -> None:
+        if getattr(self, "bridge", None):
+            response = self.call_api("/scan/mode", {"scan_mode": self.scan_mode_var.get()})
+            if response is not None:
+                self.apply_scan_mode(str(response.get("scan_mode", self.scan_mode_var.get())), clear_existing=True)
         response = self.call_api("/scan/start", {})
         if response is None:
             return
@@ -1481,7 +1783,9 @@ class DesktopClient:
         self.scan["free"] = {}
         self.scan["front_frames"] = 0
         self.scan["rear_frames"] = 0
+        self.scan["pointcloud_frames"] = 0
         self.scan["raw_points"] = 0
+        self.scan["point_cloud_preview"] = []
         self.scan["saved_point_count"] = 0
         self.scan["last_saved_file"] = ""
         self.sync_scan_badges()
@@ -1489,17 +1793,21 @@ class DesktopClient:
     def sync_scan_badges(self) -> None:
         occ = len(self.scan["occupied"])
         free = len(self.scan["free"])
+        preview = len(self.scan["point_cloud_preview"])
         if self.scan["active"]:
-            self.scan_state_var.set(self.tr("recording_obstacles", count=occ))
+            self.scan_state_var.set(f"Recording {preview} preview points" if self.scan["scan_mode"] == "3d" else self.tr("recording_obstacles", count=occ))
+        elif self.scan["scan_mode"] == "3d" and preview:
+            self.scan_state_var.set(f"Stopped | {preview} preview points")
         elif occ or free:
             self.scan_state_var.set(self.tr("stopped_summary", obs=occ, free=free))
         else:
             self.scan_state_var.set(self.tr("idle"))
-        self.map_badge_var.set(self.tr("loaded_badge", name=self.edit["loaded_map_name"]) if self.edit["loaded_from_stcm"] else self.tr("scan_session"))
+        loaded = self.tr("loaded_badge", name=self.edit["loaded_map_name"]) if self.edit["loaded_from_stcm"] else self.tr("scan_session")
+        self.map_badge_var.set(f"{loaded} | {self.scan['scan_mode'].upper()}")
         tool_map = {"view": self.tr("tool_view_select"), "erase": self.tr("tool_erase_noise"), "obstacle": self.tr("tool_draw_obstacle")}
         suffix = " | Pick end point" if self.edit["tool"] == "obstacle" and self.edit["pending_obstacle_start"] else ""
         self.tool_badge_var.set(self.tr("tool_badge", name=tool_map.get(self.edit["tool"], self.tr("tool_view_select")), suffix=suffix))
-        self.stats_badge_var.set(self.tr("stats_badge", occ=occ, poi=len(self.poi_nodes), path=len(self.path_segments)))
+        self.stats_badge_var.set(f"{preview} preview points | {len(self.poi_nodes)} POI | {len(self.path_segments)} paths" if self.scan["scan_mode"] == "3d" else self.tr("stats_badge", occ=occ, poi=len(self.poi_nodes), path=len(self.path_segments)))
 
     def cell_key(self, ix: int, iy: int) -> str:
         return f"{ix}:{iy}"
@@ -1593,6 +1901,8 @@ class DesktopClient:
         self.sync_scan_badges()
 
     def occupied_points(self) -> list[list[float]]:
+        if self.scan["scan_mode"] == "3d":
+            return [list(point) for point in self.scan["point_cloud_preview"]] or [[0.0, 0.0, 0.0, 1.0]]
         config = self.effective_scan_fusion_config()
         points = []
         for cell in self.scan["occupied"].values():
@@ -2102,6 +2412,9 @@ class DesktopClient:
     def canvas_press(self, event: tk.Event) -> None:
         self.view["last_xy"] = (event.x, event.y)
         self.view["moved"] = False
+        if self.scan["scan_mode"] == "3d":
+            self.view["dragging"] = True
+            return
         x, y = self.screen_to_world(event.x, event.y)
         if self.pending_poi is not None:
             self.place_poi(x, y)
@@ -2147,6 +2460,9 @@ class DesktopClient:
         self.view["dragging"] = False
         if self.view["moved"]:
             return
+        if self.scan["scan_mode"] == "3d":
+            self.map_edit_status_var.set("3D preview is read-only in this version. Switch to 2D mode to edit occupancy.")
+            return
         x, y = self.screen_to_world(event.x, event.y)
         if self.path_mode_var.get() == "free":
             point = Point(x=x, y=y, lat=self.gps.get("lat"), lon=self.gps.get("lon"))
@@ -2169,8 +2485,13 @@ class DesktopClient:
                 if math.hypot(dx, dy) * float(self.scan["voxel"]) > radius:
                     continue
                 key = self.cell_key(cx + dx, cy + dy)
-                self.scan["occupied"].pop(key, None)
-                self.scan["free"].pop(key, None)
+                removed = self.scan["occupied"].pop(key, None)
+                if removed is not None:
+                    self.scan["free"][key] = {
+                        "ix": int(removed["ix"]),
+                        "iy": int(removed["iy"]),
+                        "hits": max(1, int(self.scan["free"].get(key, {}).get("hits", 0))),
+                    }
         self.sync_scan_badges()
 
     def draw_obstacle_line(self, start: tuple[float, float], end: tuple[float, float]) -> None:
@@ -2196,7 +2517,13 @@ class DesktopClient:
             if neighbors <= 1:
                 removable.append(key)
         for key in removable:
-            self.scan["occupied"].pop(key, None)
+            removed = self.scan["occupied"].pop(key, None)
+            if removed is not None:
+                self.scan["free"][key] = {
+                    "ix": int(removed["ix"]),
+                    "iy": int(removed["iy"]),
+                    "hits": max(1, int(self.scan["free"].get(key, {}).get("hits", 0))),
+                }
         self.map_edit_status_var.set(self.tr("noise_cleared", count=len(removable)) if removable else self.tr("noise_none"))
         self.sync_scan_badges()
 
@@ -2250,12 +2577,23 @@ class DesktopClient:
         self.update_view_metrics()
 
     def center_loaded_map(self) -> None:
-        cells = list(self.scan["occupied"].values())
-        if not cells:
+        if self.scan["scan_mode"] == "3d":
+            points = self.scan["point_cloud_preview"]
+            if not points:
+                self.center_robot()
+                return
+            xs = [float(point[0]) for point in points]
+            ys = [float(point[1]) for point in points]
+        else:
+            cells = list(self.scan["occupied"].values())
+            if not cells:
+                self.center_robot()
+                return
+            xs = [float(cell["ix"]) * float(self.scan["voxel"]) for cell in cells]
+            ys = [float(cell["iy"]) * float(self.scan["voxel"]) for cell in cells]
+        if not xs or not ys:
             self.center_robot()
             return
-        xs = [float(cell["ix"]) * float(self.scan["voxel"]) for cell in cells]
-        ys = [float(cell["iy"]) * float(self.scan["voxel"]) for cell in cells]
         self.view["pan_x"] = -((min(xs) + max(xs)) / 2) * self.view["scale"]
         self.view["pan_y"] = ((min(ys) + max(ys)) / 2) * self.view["scale"]
         self.update_view_metrics()
@@ -2275,7 +2613,10 @@ class DesktopClient:
         height = max(1, self.canvas.winfo_height())
         self.canvas.create_rectangle(0, 0, width, height, fill="#8f969c", outline="")
         self.draw_grid()
-        self.draw_cells()
+        if self.scan["scan_mode"] == "3d":
+            self.draw_pointcloud_preview()
+        else:
+            self.draw_cells()
         self.draw_pending_obstacle()
         self.draw_paths()
         self.draw_pois()
@@ -2317,6 +2658,27 @@ class DesktopClient:
                 continue
             sx, sy = self.world_to_screen(float(cell["ix"]) * float(self.scan["voxel"]), float(cell["iy"]) * float(self.scan["voxel"]))
             self.canvas.create_rectangle(sx - size / 2, sy - size / 2, sx + size / 2, sy + size / 2, fill="#0c0f12", outline="")
+
+    def pointcloud_to_screen(self, point: list[float] | tuple[float, ...]) -> tuple[float, float]:
+        width = max(1, self.canvas.winfo_width())
+        height = max(1, self.canvas.winfo_height())
+        x = float(point[0])
+        y = float(point[1])
+        z = float(point[2]) if len(point) > 2 else 0.0
+        return (
+            width / 2 + self.view["pan_x"] + (x * 0.92 - y * 0.35) * self.view["scale"],
+            height / 2 + self.view["pan_y"] - (z * 0.95 + x * 0.18 + y * 0.18) * self.view["scale"],
+        )
+
+    def draw_pointcloud_preview(self) -> None:
+        preview = sorted(self.scan["point_cloud_preview"], key=lambda point: float(point[2] if len(point) > 2 else 0.0))
+        for point in preview:
+            sx, sy = self.pointcloud_to_screen(point)
+            z = float(point[2]) if len(point) > 2 else 0.0
+            intensity = float(point[3]) if len(point) > 3 else 1.0
+            radius = max(1.5, min(5.0, 1.5 + z * 0.8 + intensity))
+            color = "#4dc7d7" if z <= 0.2 else "#78d64b" if z <= 1.0 else "#f3b441"
+            self.canvas.create_oval(sx - radius, sy - radius, sx + radius, sy + radius, fill=color, outline="")
 
     def draw_pending_obstacle(self) -> None:
         start = self.edit["pending_obstacle_start"]
@@ -2440,6 +2802,7 @@ class DesktopClient:
         yaml_text = self.build_yaml_export(file_name, resolution, pgm["origin"])
         export_manifest = strip_legacy_trajectory(manifest)
         export_manifest.pop("browser_occupancy", None)
+        scan_mode = "3d" if str(manifest.get("scan_mode", "2d")).strip().lower() == "3d" else "2d"
         self.inspector = {
             "file": file_name,
             "manifest": manifest,
@@ -2447,7 +2810,7 @@ class DesktopClient:
             "pgm": pgm["pgm"],
             "yaml": yaml_text,
             "json": json.dumps(export_manifest, ensure_ascii=False, indent=2),
-            "meta": pgm,
+            "meta": {**pgm, "scan_mode": scan_mode},
         }
 
     def save_stcm(self) -> None:
@@ -2456,6 +2819,7 @@ class DesktopClient:
         voxel_size = float(self.scan["voxel"])
         notes = {
             "text": self.map_notes_var.get().strip(),
+            "scanMode": self.scan["scan_mode"],
             "voxelSize": voxel_size,
             "scanFusionPreset": config["preset"],
             "loadedFromStcm": self.edit["loaded_from_stcm"],
@@ -2464,13 +2828,13 @@ class DesktopClient:
             "editTool": self.edit["tool"],
         }
         bundle = {
-            "version": "stcm.v2",
+            "version": "stcm.v3" if self.scan["scan_mode"] == "3d" else "stcm.v2",
+            "scan_mode": self.scan["scan_mode"],
             "notes": json.dumps(notes, ensure_ascii=False, indent=2),
             "created_at": time.time(),
             "source": "desktop",
-            "map_source": "stcm_editor" if self.edit["loaded_from_stcm"] else "laser_accumulation",
+            "map_source": "stcm_editor" if self.edit["loaded_from_stcm"] else "point_cloud" if self.scan["scan_mode"] == "3d" else "laser_accumulation",
             "scan_fusion": build_scan_fusion_metadata(config),
-            "browser_occupancy": self.browser_occupancy(),
             "pose": self.pose,
             "gps": self.gps,
             "chassis": self.chassis,
@@ -2496,22 +2860,32 @@ class DesktopClient:
                 "rawLidarPoints": self.scan["raw_points"],
                 "frontFrames": self.scan["front_frames"],
                 "rearFrames": self.scan["rear_frames"],
+                "pointcloudFrames": self.scan["pointcloud_frames"],
+                "pointcloudPreviewPoints": len(self.scan["point_cloud_preview"]),
                 "voxelSize": voxel_size,
             },
-            "radar_points": self.occupied_points(),
         }
+        if self.scan["scan_mode"] == "3d":
+            bundle["point_cloud"] = self.occupied_points()
+        else:
+            bundle["browser_occupancy"] = self.browser_occupancy()
+            bundle["radar_points"] = self.occupied_points()
         target = filedialog.asksaveasfilename(parent=self.root, defaultextension=".slam", filetypes=[("SLAM", "*.slam")], initialfile=f"{self.map_name_var.get().strip() or 'desktop_map'}.slam")
         if not target:
             return
-        manifest = strip_legacy_trajectory({k: v for k, v in bundle.items() if k != "radar_points"})
+        payload_key = "point_cloud" if self.scan["scan_mode"] == "3d" else "radar_points"
+        manifest = strip_legacy_trajectory({k: v for k, v in bundle.items() if k != payload_key})
         with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-            zf.writestr("radar_points.bin", b"".join(struct.pack("fff", *point) for point in bundle["radar_points"]))
+            if self.scan["scan_mode"] == "3d":
+                zf.writestr("point_cloud.bin", b"".join(struct.pack("ffff", *point) for point in bundle["point_cloud"]))
+            else:
+                zf.writestr("radar_points.bin", b"".join(struct.pack("fff", *point) for point in bundle["radar_points"]))
         self.scan["last_saved_file"] = target
-        self.scan["saved_point_count"] = len(bundle["radar_points"])
+        self.scan["saved_point_count"] = len(bundle[payload_key])
         self.sync_scan_badges()
-        self.set_inspector_bundle_state(Path(target).name, manifest, bundle["radar_points"])
-        self.logger.info("map saved path=%s points=%s", target, len(bundle["radar_points"]))
+        self.set_inspector_bundle_state(Path(target).name, manifest, bundle[payload_key])
+        self.logger.info("map saved path=%s points=%s scan_mode=%s", target, len(bundle[payload_key]), self.scan["scan_mode"])
         messagebox.showinfo(self.tr("save_title"), self.tr("save_done", path=target))
 
     def load_stcm(self) -> None:
@@ -2520,20 +2894,30 @@ class DesktopClient:
             return
         with zipfile.ZipFile(target, "r") as zf:
             manifest = json.loads(zf.read("manifest.json"))
-            raw = zf.read("radar_points.bin")
-        points = [struct.unpack("fff", raw[i:i + 12]) for i in range(0, len(raw), 12) if i + 12 <= len(raw)]
+            scan_mode = "3d" if str(manifest.get("scan_mode", "2d")).strip().lower() == "3d" else "2d"
+            raw = zf.read("point_cloud.bin" if scan_mode == "3d" else "radar_points.bin")
+        if scan_mode == "3d":
+            points = [struct.unpack("ffff", raw[i:i + 16]) for i in range(0, len(raw), 16) if i + 16 <= len(raw)]
+        else:
+            points = [struct.unpack("fff", raw[i:i + 12]) for i in range(0, len(raw), 12) if i + 12 <= len(raw)]
         self.apply_stcm(Path(target).name, manifest, points)
         self.set_inspector_bundle_state(Path(target).name, manifest, points)
         self.logger.info("map loaded path=%s points=%s", target, len(points))
         messagebox.showinfo(self.tr("load_title"), self.tr("load_done", name=Path(target).name))
 
-    def apply_stcm(self, file_name: str, manifest: dict, points: list[tuple[float, float, float]]) -> None:
+    def apply_stcm(self, file_name: str, manifest: dict, points: list[tuple]) -> None:
         self.clear_scan()
         self.scan["active"] = False
+        self.apply_scan_mode(str(manifest.get("scan_mode", "2d")), clear_existing=False)
         config = extract_scan_fusion_config(manifest, default_preset=self.scan_fusion_preset_var.get())
         self.apply_scan_fusion_config(config, update_vars=True)
         occ = manifest.get("browser_occupancy", {})
-        if isinstance(occ, dict) and isinstance(occ.get("occupied_cells"), list):
+        if self.scan["scan_mode"] == "3d":
+            self.scan["point_cloud_preview"] = [
+                [float(point[0]), float(point[1]), float(point[2]), float(point[3] if len(point) > 3 else 1.0)]
+                for point in points
+            ]
+        elif isinstance(occ, dict) and isinstance(occ.get("occupied_cells"), list):
             self.scan["voxel"] = max(0.02, float(occ.get("voxel_size", float(config["voxel_size"]))))
             for cell in occ.get("occupied_cells", []):
                 self.mark_occupied(int(cell.get("ix", 0)), int(cell.get("iy", 0)), float(cell.get("intensity", 1.0)), int(cell.get("hits", 3)))
@@ -2567,7 +2951,17 @@ class DesktopClient:
             self.segment_seed += 1
         self.edit["loaded_from_stcm"] = True
         self.edit["loaded_map_name"] = file_name
-        self.stcm_summary = {"file": file_name, "mapSource": manifest.get("map_source", "unknown"), "radarPoints": len(points), "poiCount": len(self.poi_nodes), "pathCount": len(self.path_segments), "hasBrowserOccupancy": bool(occ), "restoredFreeCells": len(occ.get("free_cells", [])) if isinstance(occ, dict) else 0}
+        self.stcm_summary = {
+            "file": file_name,
+            "scanMode": self.scan["scan_mode"],
+            "mapSource": manifest.get("map_source", "unknown"),
+            "radarPoints": len(points) if self.scan["scan_mode"] != "3d" else 0,
+            "pointCloudPoints": len(points) if self.scan["scan_mode"] == "3d" else 0,
+            "poiCount": len(self.poi_nodes),
+            "pathCount": len(self.path_segments),
+            "hasBrowserOccupancy": bool(occ),
+            "restoredFreeCells": len(occ.get("free_cells", [])) if isinstance(occ, dict) else 0,
+        }
         if manifest.get("notes"):
             try:
                 notes = json.loads(manifest["notes"])
