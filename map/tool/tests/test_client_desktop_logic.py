@@ -1,3 +1,4 @@
+from client_desktop import logic
 from client_desktop.logic import (
     Point,
     build_auto_loop_segments,
@@ -12,6 +13,47 @@ from client_desktop.logic import (
     resolve_scan_fusion_config,
     should_skip_scan_by_turn,
 )
+
+
+def test_normalize_auth_descriptor_local() -> None:
+    normalize_auth_descriptor = getattr(logic, "normalize_auth_descriptor", None)
+    assert normalize_auth_descriptor is not None
+
+    result = normalize_auth_descriptor("local", {"ip": "10.0.0.2", "port": 8080, "token": "abc"})
+    assert result["auth_mode"] == "local"
+    assert result["backend_host"] == "10.0.0.2"
+    assert result["backend_port"] == 8080
+    assert result["token"] == "abc"
+    assert result["expires_at"] is None
+
+
+def test_normalize_auth_descriptor_accepts_string_port_and_rejects_malformed_port() -> None:
+    normalize_auth_descriptor = getattr(logic, "normalize_auth_descriptor", None)
+    assert normalize_auth_descriptor is not None
+
+    result = normalize_auth_descriptor("cloud", {"backend_host": "10.0.0.3", "backend_port": "8081", "token": "abc"})
+    assert result["backend_port"] == 8081
+
+    try:
+        normalize_auth_descriptor("cloud", {"backend_host": "10.0.0.3", "backend_port": "oops", "token": "abc"})
+    except ValueError as exc:
+        assert "backend_port" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_resolve_scan_mode_config_defaults_to_2d() -> None:
+    resolve_scan_mode_config = getattr(logic, "resolve_scan_mode_config", None)
+    assert resolve_scan_mode_config is not None
+
+    result = resolve_scan_mode_config({})
+    assert result["scan_mode"] == "2d"
+
+
+def test_resolve_scan_fusion_config_parses_string_false_values() -> None:
+    config = resolve_scan_fusion_config("indoor_balanced", {"skip_turn_frames": "false"})
+
+    assert config["skip_turn_frames"] is False
 
 
 def test_parse_batch_poi_text_supports_name_geo_and_yaw() -> None:

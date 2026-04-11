@@ -7,7 +7,10 @@
 The desktop client now tracks the browser client feature set closely:
 
 - WebSocket stream connection with reconnect, ping/pong, checksum/seq/lag diagnostics, and `/health` polling
+- `local | cloud` authentication that normalizes into one backend connection descriptor
+- `2d | 3d` scan-mode switching
 - Scan accumulation and map canvas rendering
+- `PointCloud2` 3D preview rendering with bounded save payload
 - Local `.slam` map save and load
 - Map exports for `PGM`, `YAML`, and `JSON`
 - Second-stage map editing
@@ -52,6 +55,54 @@ The desktop client no longer treats `/health` as a high-frequency connection pro
 - WebSocket state, message gap, lag, and API errors are still detected directly by the client.
 - `/health` is polled at a lower frequency and is mainly used to display server-side mapping readiness summary.
 - If the server rejects `/scan/start` because TF, odom, or lidar prerequisites are not ready, the desktop client shows the returned blockers directly.
+
+## Auth Modes
+
+The desktop client supports:
+
+- `local`
+  - posts fixed credentials to a target device login endpoint
+  - resolves backend `host + port + token`
+- `cloud`
+  - posts entered username/password to a cloud auth endpoint
+  - resolves backend `host + port + token`
+
+After auth succeeds, both HTTP and WebSocket traffic use the resolved backend descriptor instead of a manually edited server URL.
+
+Default auth paths:
+
+- local: `/login`
+- cloud: `/api/auth/login`
+
+Local fixed credentials can be overridden with:
+
+- `AUTODRIVE_LOCAL_AUTH_USERNAME`
+- `AUTODRIVE_LOCAL_AUTH_PASSWORD`
+
+## 2D And 3D Mapping
+
+The scan card now supports:
+
+- `2d`
+  - `LaserScan` accumulation
+  - editable occupancy map
+  - `.slam` stores `radar_points.bin`
+- `3d`
+  - `PointCloud2` preview
+  - read-only canvas preview in the current version
+  - `.slam` stores `point_cloud.bin`
+
+Switching scan mode clears the current accumulation so 2D and 3D data do not mix.
+
+## Noise Cleaning Behavior
+
+Noise erase and auto clear now convert removed obstacle cells into white free cells.
+
+This means:
+
+- cleaned regions stay visibly white
+- they are treated as confirmed free space
+- they are preserved as free-space information on later save
 
 ## Run
 

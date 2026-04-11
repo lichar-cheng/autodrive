@@ -9,6 +9,12 @@ let suppressReconnect = false;
 let messageWatchdogTimer = null;
 let lastMessageAtMs = 0;
 
+const DEFAULT_LOCAL_AUTH_PATH = "/login";
+const DEFAULT_CLOUD_AUTH_PATH = "/api/auth/login";
+const DEFAULT_LOCAL_AUTH_USERNAME = "autodrive";
+const DEFAULT_LOCAL_AUTH_PASSWORD = "autodrive";
+const AUTH_REQUEST_TIMEOUT_MS = 8000;
+
 let lastPose = { x: 0, y: 0, yaw: 0, vx: 0, wz: 0 };
 let lastGps = { lat: 0, lon: 0 };
 let lastOdom = { x: 0, y: 0, yaw: 0, vx: 0, wz: 0 };
@@ -34,14 +40,25 @@ let cameraDisplay = new Map();
 const scanSession = {
   active: false,
   startedAtMs: 0,
+  scanMode: "2d",
   frontFrames: 0,
   rearFrames: 0,
+  pointcloudFrames: 0,
   totalLivePoints: 0,
   occupiedCells: new Map(),
   freeCells: new Map(),
+  pointCloudPreview: [],
   lastSavedFile: "",
   savedPointCount: 0,
   voxelSize: 0.08,
+};
+
+const authState = {
+  mode: "local",
+  descriptor: null,
+  httpBase: "",
+  wsUrl: "",
+  status: "Not authenticated",
 };
 
 const SCAN_FUSION_PRESETS = {
@@ -72,6 +89,7 @@ const stcmInspector = {
   file: null,
   bundle: null,
   points: [],
+  scanMode: "2d",
   pgmText: "",
   yamlText: "",
   exportJsonText: "",
@@ -130,9 +148,25 @@ const elements = {
   scanPanel: document.getElementById("scanPanel"),
   status: document.getElementById("status"),
   statusDetail: document.getElementById("statusDetail"),
+  authStatus: document.getElementById("authStatus"),
+  authModeInput: document.getElementById("authModeInput"),
+  localAuthPanel: document.getElementById("localAuthPanel"),
+  cloudAuthPanel: document.getElementById("cloudAuthPanel"),
+  localAuthIpInput: document.getElementById("localAuthIpInput"),
+  localAuthPortInput: document.getElementById("localAuthPortInput"),
+  localAuthPathInput: document.getElementById("localAuthPathInput"),
+  localAuthBtn: document.getElementById("localAuthBtn"),
+  cloudAuthHostInput: document.getElementById("cloudAuthHostInput"),
+  cloudAuthPortInput: document.getElementById("cloudAuthPortInput"),
+  cloudAuthPathInput: document.getElementById("cloudAuthPathInput"),
+  cloudAuthUsernameInput: document.getElementById("cloudAuthUsernameInput"),
+  cloudAuthPasswordInput: document.getElementById("cloudAuthPasswordInput"),
+  cloudAuthBtn: document.getElementById("cloudAuthBtn"),
+  authResolvedHint: document.getElementById("authResolvedHint"),
   scanState: document.getElementById("scanState"),
   keyboardState: document.getElementById("keyboardState"),
   serverUrl: document.getElementById("serverUrl"),
+  scanModeInput: document.getElementById("scanModeInput"),
   mapNameInput: document.getElementById("mapNameInput"),
   mapNotesInput: document.getElementById("mapNotesInput"),
   voxelSizeInput: document.getElementById("voxelSizeInput"),
@@ -233,6 +267,9 @@ const topicHandler = {
     renderOdomScanPanel();
   },
   "/lidar/front": (msg) => {
+    if (scanSession.scanMode !== "2d") {
+      return;
+    }
     scanSession.frontFrames += 1;
     lastScanInfo.front = {
       raw_points: Number(msg.payload.raw_points || (msg.payload.points || []).length || 0),
@@ -247,6 +284,9 @@ const topicHandler = {
     renderOdomScanPanel();
   },
   "/lidar/rear": (msg) => {
+    if (scanSession.scanMode !== "2d") {
+      return;
+    }
     scanSession.rearFrames += 1;
     lastScanInfo.rear = {
       raw_points: Number(msg.payload.raw_points || (msg.payload.points || []).length || 0),
@@ -259,6 +299,21 @@ const topicHandler = {
       keyframe: Boolean(msg.payload.keyframe),
     });
     renderOdomScanPanel();
+  },
+  "/pointcloud/preview": (msg) => {
+    if (scanSession.scanMode !== "3d") {
+      return;
+    }
+    scanSession.pointcloudFrames += 1;
+    scanSession.totalLivePoints += Number(msg.payload.raw_points || (msg.payload.points || []).length || 0);
+    scanSession.pointCloudPreview = Array.isArray(msg.payload.points) ? msg.payload.points.map((point) => [
+      Number(point[0] || 0),
+      Number(point[1] || 0),
+      Number(point[2] || 0),
+      Number(point[3] || 1),
+    ]) : [];
+    renderOdomScanPanel();
+    renderScanState();
   },
   "/map/grid": () => {},
 };
@@ -289,10 +344,13 @@ function stableStringify(obj) {
 function renderOdomScanPanel() {
   elements.posePanel.innerText = JSON.stringify({
     odom: lastOdom,
+    scan_mode: scanSession.scanMode,
     scan: {
       front_frames: scanSession.frontFrames,
       rear_frames: scanSession.rearFrames,
+      pointcloud_frames: scanSession.pointcloudFrames,
       raw_live_points: scanSession.totalLivePoints,
+      pointcloud_preview_points: scanSession.pointCloudPreview.length,
       front: lastScanInfo.front,
       rear: lastScanInfo.rear,
     },
@@ -364,14 +422,207 @@ function wsToHttpBase(url) {
   return url.replace(/^ws/, "http").replace(/\/ws\/stream$/, "");
 }
 
+function normalizeAuthHttpUrl(hostOrUrl, port, path, defaultScheme) {
+  const rawHost = String(hostOrUrl || "").trim();
+  if (!rawHost) {
+    throw new Error("Auth host/IP is empty");
+  }
+  const parsed = rawHost.includes("://") ? new URL(rawHost) : new URL(`${defaultScheme}://${rawHost}`);
+  const effectivePort = String(port || parsed.port || "").trim();
+  if (!effectivePort) {
+    throw new Error("Auth port is empty");
+  }
+  const rawPath = String(path || "").trim() || "/";
+  const normalizedPath = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+  return `${parsed.protocol}//${parsed.hostname}:${effectivePort}${normalizedPath}`;
+}
+
+function unwrapAuthPayload(payload) {
+  let data = payload && typeof payload === "object" ? { ...payload } : {};
+  for (const key of ["data", "result", "payload"]) {
+    if (data[key] && typeof data[key] === "object") {
+      data = { ...data[key] };
+      break;
+    }
+  }
+  return data;
+}
+
+function normalizeAuthDescriptor(authMode, payload = {}) {
+  const data = unwrapAuthPayload(payload);
+  const mode = String(authMode || data.auth_mode || "local").trim().toLowerCase();
+  const resolvedMode = mode === "cloud" ? "cloud" : "local";
+  const backendHost = String(data.backend_host || data.host || data.ip || data.backend_ip || "").trim();
+  const backendPort = Number.parseInt(String(data.backend_port ?? data.port ?? "").trim(), 10);
+  if (!Number.isInteger(backendPort) || backendPort < 1 || backendPort > 65535) {
+    throw new Error("backend_port must be an integer between 1 and 65535");
+  }
+  const token = String(data.token || data.access_token || data.auth_token || "").trim();
+  const expiresAt = data.expires_at ?? data.expiry ?? data.expires ?? null;
+  return {
+    auth_mode: resolvedMode,
+    backend_host: backendHost,
+    backend_port: backendPort,
+    token,
+    expires_at: expiresAt === undefined || expiresAt === null ? null : String(expiresAt),
+  };
+}
+
+function deriveBackendTransportBases(descriptor) {
+  const authMode = String(descriptor?.auth_mode || "local").trim().toLowerCase();
+  const scheme = authMode === "cloud" ? "https" : "http";
+  const wsScheme = authMode === "cloud" ? "wss" : "ws";
+  const host = String(descriptor?.backend_host || "").trim();
+  const port = Number(descriptor?.backend_port || 0);
+  return {
+    httpBase: `${scheme}://${host}:${port}`,
+    wsUrl: `${wsScheme}://${host}:${port}/ws/stream`,
+  };
+}
+
+function authHeaders() {
+  return authState.descriptor && authState.descriptor.token
+    ? { Authorization: `Bearer ${authState.descriptor.token}` }
+    : {};
+}
+
+function backendHttpBase() {
+  return authState.httpBase || wsToHttpBase(elements.serverUrl.value.trim());
+}
+
+function backendWsUrl() {
+  return authState.wsUrl || elements.serverUrl.value.trim();
+}
+
+function wsUrlWithToken(url, token) {
+  const resolved = new URL(url);
+  if (token) {
+    resolved.searchParams.set("token", token);
+  }
+  return resolved.toString();
+}
+
+async function authRequest(url, payload) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), AUTH_REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    if (!data || typeof data !== "object") {
+      throw new Error("Auth response must be an object");
+    }
+    return data;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function authPayload(mode) {
+  if (mode === "cloud") {
+    return {
+      host: elements.cloudAuthHostInput.value.trim(),
+      port: elements.cloudAuthPortInput.value.trim(),
+      path: elements.cloudAuthPathInput.value.trim(),
+      username: elements.cloudAuthUsernameInput.value.trim(),
+      password: elements.cloudAuthPasswordInput.value,
+    };
+  }
+  return {
+    ip: elements.localAuthIpInput.value.trim(),
+    port: elements.localAuthPortInput.value.trim(),
+    path: elements.localAuthPathInput.value.trim(),
+    username: DEFAULT_LOCAL_AUTH_USERNAME,
+    password: DEFAULT_LOCAL_AUTH_PASSWORD,
+  };
+}
+
+function setAuthStatus(text, level = "") {
+  authState.status = text;
+  elements.authStatus.innerText = text;
+  elements.authStatus.className = `view-chip ${level}`.trim();
+  elements.authResolvedHint.innerText = authState.descriptor
+    ? `Resolved backend: ${authState.descriptor.backend_host}:${authState.descriptor.backend_port} | token ${authState.descriptor.token ? "present" : "missing"}${authState.descriptor.expires_at ? ` | expires ${authState.descriptor.expires_at}` : ""}`
+    : "Resolved backend will replace manual WS connect after login.";
+}
+
+function syncAuthModeUi() {
+  const mode = String(elements.authModeInput.value || "local").trim().toLowerCase();
+  authState.mode = mode === "cloud" ? "cloud" : "local";
+  elements.authModeInput.value = authState.mode;
+  elements.localAuthPanel.hidden = authState.mode !== "local";
+  elements.cloudAuthPanel.hidden = authState.mode !== "cloud";
+}
+
+function applyServerScanMode(mode, clearExisting = false) {
+  const resolved = String(mode || "2d").trim().toLowerCase() === "3d" ? "3d" : "2d";
+  scanSession.scanMode = resolved;
+  elements.scanModeInput.value = resolved;
+  if (clearExisting) {
+    clearAccumulation();
+  } else {
+    renderScanState();
+    updateEditorBadges();
+  }
+}
+
+async function setScanMode(mode) {
+  const resolved = String(mode || "2d").trim().toLowerCase() === "3d" ? "3d" : "2d";
+  const response = await callApi("/scan/mode", { scan_mode: resolved });
+  applyServerScanMode(response.scan_mode || resolved, true);
+  return response;
+}
+
+function applyAuthResult(authMode, payload) {
+  const descriptor = normalizeAuthDescriptor(authMode, payload);
+  const transport = deriveBackendTransportBases(descriptor);
+  authState.descriptor = descriptor;
+  authState.httpBase = transport.httpBase;
+  authState.wsUrl = transport.wsUrl;
+  elements.serverUrl.value = transport.wsUrl;
+  setAuthStatus(`Authenticated ${descriptor.backend_host}:${descriptor.backend_port}`, "connected");
+  return descriptor;
+}
+
+async function performLocalAuth() {
+  const payload = authPayload("local");
+  setAuthStatus("Local auth in progress...", "warning");
+  const url = normalizeAuthHttpUrl(payload.ip, payload.port, payload.path || DEFAULT_LOCAL_AUTH_PATH, "http");
+  const response = await authRequest(url, {
+    username: payload.username,
+    password: payload.password,
+  });
+  return applyAuthResult("local", response);
+}
+
+async function performCloudAuth() {
+  const payload = authPayload("cloud");
+  setAuthStatus("Cloud auth in progress...", "warning");
+  const url = normalizeAuthHttpUrl(payload.host, payload.port, payload.path || DEFAULT_CLOUD_AUTH_PATH, "https");
+  const response = await authRequest(url, {
+    username: payload.username,
+    password: payload.password,
+  });
+  return applyAuthResult("cloud", response);
+}
+
 async function callApi(path, body = {}, retries = 3) {
-  const base = wsToHttpBase(elements.serverUrl.value.trim());
+  const base = backendHttpBase();
   let lastErr;
   for (let i = 0; i <= retries; i += 1) {
     try {
       const res = await fetch(`${base}${path}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify(body),
       });
       if (!res.ok) {
@@ -392,8 +643,10 @@ async function callApi(path, body = {}, retries = 3) {
 }
 
 async function fetchJson(path) {
-  const base = wsToHttpBase(elements.serverUrl.value.trim());
-  const res = await fetch(`${base}${path}`);
+  const base = backendHttpBase();
+  const res = await fetch(`${base}${path}`, {
+    headers: authHeaders(),
+  });
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}`);
   }
@@ -479,6 +732,20 @@ function parseRadarPoints(bytes) {
       view.getFloat32(offset, true),
       view.getFloat32(offset + 4, true),
       view.getFloat32(offset + 8, true),
+    ]);
+  }
+  return points;
+}
+
+function parsePointCloudPoints(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const points = [];
+  for (let offset = 0; offset + 16 <= bytes.byteLength; offset += 16) {
+    points.push([
+      view.getFloat32(offset, true),
+      view.getFloat32(offset + 4, true),
+      view.getFloat32(offset + 8, true),
+      view.getFloat32(offset + 12, true),
     ]);
   }
   return points;
@@ -629,18 +896,22 @@ function setInspectorBundleState(fileName, manifest, points, summary = {}) {
   const resolution = Math.max(0.02, numberFromInput(elements.stcmResolutionInput, 0.1));
   const paddingCells = Math.max(0, Math.round(numberFromInput(elements.stcmPaddingInput, 8)));
   const { pgm, yamlText, exportJsonText } = buildStcmExports(fileName, manifest, points, resolution, paddingCells);
+  const scanMode = String(manifest.scan_mode || "2d").trim().toLowerCase() === "3d" ? "3d" : "2d";
 
   stcmInspector.file = { name: fileName };
   stcmInspector.bundle = manifest;
   stcmInspector.points = points;
+  stcmInspector.scanMode = scanMode;
   stcmInspector.pgmText = pgm.pgmText;
   stcmInspector.yamlText = yamlText;
   stcmInspector.exportJsonText = exportJsonText;
   stcmInspector.summary = {
     file: fileName,
     manifestVersion: manifest.version || "unknown",
+    scanMode,
     mapSource: manifest.map_source || "unknown",
-    radarPoints: points.length,
+    radarPoints: scanMode === "2d" ? points.length : 0,
+    pointCloudPoints: scanMode === "3d" ? points.length : 0,
     hasBrowserOccupancy: Boolean(manifest.browser_occupancy),
     restoredFreeCells: Array.isArray(manifest.browser_occupancy?.free_cells) ? manifest.browser_occupancy.free_cells.length : 0,
     poiCount: Array.isArray(manifest.poi) ? manifest.poi.length : 0,
@@ -673,15 +944,19 @@ async function inspectSelectedStcm() {
   const arrayBuffer = await file.arrayBuffer();
   const entries = parseZipEntries(arrayBuffer);
   const manifestEntry = entries.get("manifest.json");
-  const radarEntry = entries.get("radar_points.bin");
-  if (!manifestEntry || !radarEntry) {
-    throw new Error("SLAM must contain manifest.json and radar_points.bin");
+  if (!manifestEntry) {
+    throw new Error("SLAM must contain manifest.json");
   }
 
   const manifestBytes = await decompressZipEntry(manifestEntry);
-  const radarBytes = await decompressZipEntry(radarEntry);
   const manifest = JSON.parse(new TextDecoder().decode(manifestBytes));
-  const points = parseRadarPoints(radarBytes);
+  const scanMode = String(manifest.scan_mode || "2d").trim().toLowerCase() === "3d" ? "3d" : "2d";
+  const payloadEntry = entries.get(scanMode === "3d" ? "point_cloud.bin" : "radar_points.bin");
+  if (!payloadEntry) {
+    throw new Error(`SLAM must contain ${scanMode === "3d" ? "point_cloud.bin" : "radar_points.bin"}`);
+  }
+  const payloadBytes = await decompressZipEntry(payloadEntry);
+  const points = scanMode === "3d" ? parsePointCloudPoints(payloadBytes) : parseRadarPoints(payloadBytes);
   setInspectorBundleState(file.name, manifest, points);
 }
 
@@ -712,7 +987,9 @@ function updateEditorBadges() {
       ? `Tool: Draw Obstacle${editState.pendingObstacleStart ? " | Pick end point" : ""}`
       : "Tool: View / Select";
   elements.editorToolBadge.innerText = toolLabel;
-  elements.editorStatsBadge.innerText = `${scanSession.occupiedCells.size} obstacle cells | ${poiNodes.length} POI | ${pathSegments.length} paths`;
+  elements.editorStatsBadge.innerText = scanSession.scanMode === "3d"
+    ? `${scanSession.pointCloudPreview.length} preview points | ${poiNodes.length} POI | ${pathSegments.length} paths`
+    : `${scanSession.occupiedCells.size} obstacle cells | ${poiNodes.length} POI | ${pathSegments.length} paths`;
 }
 
 function setOccupiedCell(ix, iy, hits = effectiveScanFusionConfig().occupied_min_hits, intensity = 1) {
@@ -729,8 +1006,13 @@ function removeCellsInRadius(worldX, worldY, radiusMeters) {
         continue;
       }
       const key = cellKey(cx + dx, cy + dy);
+      const removed = scanSession.occupiedCells.get(key);
       scanSession.occupiedCells.delete(key);
-      scanSession.freeCells.delete(key);
+      if (removed) {
+        const free = scanSession.freeCells.get(key) || { ix: removed.ix, iy: removed.iy, hits: 0 };
+        free.hits = Math.max(1, Number(free.hits || 0));
+        scanSession.freeCells.set(key, free);
+      }
     }
   }
   renderScanState();
@@ -770,7 +1052,15 @@ function autoClearNoise() {
       removable.push(cellKey(cell.ix, cell.iy));
     }
   }
-  removable.forEach((key) => scanSession.occupiedCells.delete(key));
+  removable.forEach((key) => {
+    const removed = scanSession.occupiedCells.get(key);
+    scanSession.occupiedCells.delete(key);
+    if (removed) {
+      const free = scanSession.freeCells.get(key) || { ix: removed.ix, iy: removed.iy, hits: 0 };
+      free.hits = Math.max(1, Number(free.hits || 0));
+      scanSession.freeCells.set(key, free);
+    }
+  });
   renderScanState();
   updateEditorBadges();
   setMapEditStatus(removable.length ? `Auto cleared ${removable.length} noisy cells` : "No isolated noise found", removable.length ? "active" : "");
@@ -810,34 +1100,45 @@ function loadStcmIntoEditor() {
 
   clearAccumulation();
   scanSession.active = false;
+  scanSession.scanMode = stcmInspector.scanMode === "3d" ? "3d" : "2d";
+  elements.scanModeInput.value = scanSession.scanMode;
   const config = extractScanFusionConfig(stcmInspector.bundle, elements.scanFusionPresetInput.value);
   applyScanFusionConfig(config);
   scanSession.voxelSize = Math.max(0.02, Number(config.voxel_size || scanSession.voxelSize));
-  const browserOccupancy = stcmInspector.bundle.browser_occupancy;
-  if (browserOccupancy && Array.isArray(browserOccupancy.occupied_cells)) {
-    scanSession.voxelSize = Math.max(0.02, Number(browserOccupancy.voxel_size || scanSession.voxelSize));
-    browserOccupancy.occupied_cells.forEach((cell) => {
-      setOccupiedCell(
-        Number(cell.ix || 0),
-        Number(cell.iy || 0),
-        Number(cell.hits || effectiveScanFusionConfig().occupied_min_hits),
-        Number(cell.intensity || 1),
-      );
-    });
-    if (Array.isArray(browserOccupancy.free_cells)) {
-      browserOccupancy.free_cells.forEach((cell) => {
-        scanSession.freeCells.set(cellKey(Number(cell.ix || 0), Number(cell.iy || 0)), {
-          ix: Number(cell.ix || 0),
-          iy: Number(cell.iy || 0),
-          hits: Number(cell.hits || 1),
+  if (scanSession.scanMode === "3d") {
+    scanSession.pointCloudPreview = stcmInspector.points.map((point) => [
+      Number(point[0] || 0),
+      Number(point[1] || 0),
+      Number(point[2] || 0),
+      Number(point[3] || 1),
+    ]);
+  } else {
+    const browserOccupancy = stcmInspector.bundle.browser_occupancy;
+    if (browserOccupancy && Array.isArray(browserOccupancy.occupied_cells)) {
+      scanSession.voxelSize = Math.max(0.02, Number(browserOccupancy.voxel_size || scanSession.voxelSize));
+      browserOccupancy.occupied_cells.forEach((cell) => {
+        setOccupiedCell(
+          Number(cell.ix || 0),
+          Number(cell.iy || 0),
+          Number(cell.hits || effectiveScanFusionConfig().occupied_min_hits),
+          Number(cell.intensity || 1),
+        );
+      });
+      if (Array.isArray(browserOccupancy.free_cells)) {
+        browserOccupancy.free_cells.forEach((cell) => {
+          scanSession.freeCells.set(cellKey(Number(cell.ix || 0), Number(cell.iy || 0)), {
+            ix: Number(cell.ix || 0),
+            iy: Number(cell.iy || 0),
+            hits: Number(cell.hits || 1),
+          });
         });
+      }
+    } else {
+      stcmInspector.points.forEach((point) => {
+        const [ix, iy] = worldToCell(Number(point[0] || 0), Number(point[1] || 0));
+        setOccupiedCell(ix, iy, effectiveScanFusionConfig().occupied_min_hits, Number(point[2] || 1));
       });
     }
-  } else {
-    stcmInspector.points.forEach((point) => {
-      const [ix, iy] = worldToCell(Number(point[0] || 0), Number(point[1] || 0));
-      setOccupiedCell(ix, iy, effectiveScanFusionConfig().occupied_min_hits, Number(point[2] || 1));
-    });
   }
 
   poiIdSeed = 1;
@@ -879,22 +1180,22 @@ function loadStcmIntoEditor() {
 }
 
 function centerViewOnLoadedMap() {
-  const points = Array.from(scanSession.occupiedCells.values());
+  const points = scanSession.scanMode === "3d"
+    ? scanSession.pointCloudPreview.map((point) => ({ x: Number(point[0] || 0), y: Number(point[1] || 0) }))
+    : Array.from(scanSession.occupiedCells.values()).map((cell) => ({ x: cell.ix * scanSession.voxelSize, y: cell.iy * scanSession.voxelSize }));
   if (!points.length) {
     centerViewOnRobot();
     return;
   }
-  let minX = points[0].ix * scanSession.voxelSize;
+  let minX = points[0].x;
   let maxX = minX;
-  let minY = points[0].iy * scanSession.voxelSize;
+  let minY = points[0].y;
   let maxY = minY;
-  points.forEach((cell) => {
-    const x = cell.ix * scanSession.voxelSize;
-    const y = cell.iy * scanSession.voxelSize;
-    minX = Math.min(minX, x);
-    maxX = Math.max(maxX, x);
-    minY = Math.min(minY, y);
-    maxY = Math.max(maxY, y);
+  points.forEach((point) => {
+    minX = Math.min(minX, point.x);
+    maxX = Math.max(maxX, point.x);
+    minY = Math.min(minY, point.y);
+    maxY = Math.max(maxY, point.y);
   });
   viewState.panX = -((minX + maxX) / 2) * viewState.scale;
   viewState.panY = ((minY + maxY) / 2) * viewState.scale;
@@ -1032,16 +1333,39 @@ function serializeRadarPoints(points) {
   return bytes;
 }
 
+function serializePointCloud(points) {
+  const bytes = new Uint8Array(points.length * 16);
+  const view = new DataView(bytes.buffer);
+  points.forEach((point, index) => {
+    const offset = index * 16;
+    view.setFloat32(offset, Number(point[0] || 0), true);
+    view.setFloat32(offset + 4, Number(point[1] || 0), true);
+    view.setFloat32(offset + 8, Number(point[2] || 0), true);
+    view.setFloat32(offset + 12, Number(point[3] || 1), true);
+  });
+  return bytes;
+}
+
 function buildClientStcmBundle() {
   rebuildPathNodes();
   const config = effectiveScanFusionConfig();
   const voxelSize = Math.max(0.02, Number(config.voxel_size));
-  const pointsToSave = occupiedPointsForSave();
+  const scanMode = scanSession.scanMode === "3d" ? "3d" : "2d";
+  const pointsToSave = scanMode === "3d"
+    ? (scanSession.pointCloudPreview.length ? scanSession.pointCloudPreview.map((point) => [
+      Number(point[0] || 0),
+      Number(point[1] || 0),
+      Number(point[2] || 0),
+      Number(point[3] || 1),
+    ]) : [[0, 0, 0, 1]])
+    : occupiedPointsForSave();
   const notes = {
     text: elements.mapNotesInput.value.trim(),
+    scanMode,
     browserObstacleCells: scanSession.occupiedCells.size,
     browserSafeCells: scanSession.freeCells.size,
     browserRawLidarPoints: scanSession.totalLivePoints,
+    browserPointCloudPreview: scanSession.pointCloudPreview.length,
     voxelSize,
     scanFusionPreset: config.preset,
     manualCameraSnapshotAt: elements.cameraRefreshStatus.innerText,
@@ -1066,14 +1390,14 @@ function buildClientStcmBundle() {
     })),
   };
 
-  return {
-    version: "stcm.v2",
+  const bundle = {
+    version: scanMode === "3d" ? "stcm.v3" : "stcm.v2",
+    scan_mode: scanMode,
     notes: JSON.stringify(notes, null, 2),
     created_at: Date.now() / 1000,
     source: "browser",
-    map_source: editState.loadedFromStcm ? "stcm_editor" : "laser_accumulation",
+    map_source: editState.loadedFromStcm ? "stcm_editor" : scanMode === "3d" ? "point_cloud" : "laser_accumulation",
     scan_fusion: buildScanFusionMetadata(config),
-    browser_occupancy: browserOccupancy,
     pose: lastPose,
     gps: lastGps,
     chassis: lastChassis,
@@ -1090,16 +1414,25 @@ function buildClientStcmBundle() {
     chassis_track: [],
     scan_summary: {
       scanActive: scanSession.active,
+      scanMode,
       elapsedSec: scanSession.startedAtMs ? Number(((Date.now() - scanSession.startedAtMs) / 1000).toFixed(1)) : 0,
       obstacleCells: scanSession.occupiedCells.size,
       safeCells: scanSession.freeCells.size,
       rawLidarPoints: scanSession.totalLivePoints,
       frontFrames: scanSession.frontFrames,
       rearFrames: scanSession.rearFrames,
+      pointcloudFrames: scanSession.pointcloudFrames,
+      pointcloudPreviewPoints: scanSession.pointCloudPreview.length,
       voxelSize,
     },
-    radar_points: pointsToSave.length ? pointsToSave : [[0, 0, 1]],
   };
+  if (scanMode === "3d") {
+    bundle.point_cloud = pointsToSave;
+  } else {
+    bundle.browser_occupancy = browserOccupancy;
+    bundle.radar_points = pointsToSave.length ? pointsToSave : [[0, 0, 1]];
+  }
+  return bundle;
 }
 
 async function saveBlobWithPicker(fileName, blob) {
@@ -1158,6 +1491,10 @@ function startHealthPolling() {
   healthTimer = setInterval(async () => {
     try {
       streamHealth.lastHealth = await fetchJson("/health");
+      const healthMode = streamHealth.lastHealth?.scan_summary?.scan_mode;
+      if (healthMode) {
+        applyServerScanMode(healthMode, false);
+      }
     } catch (err) {
       streamHealth.lastApiError = err.message;
     }
@@ -1223,12 +1560,14 @@ function connect() {
     ws = null;
     return;
   }
-  const url = elements.serverUrl.value.trim();
-  if (!url) {
+  const descriptor = authState.descriptor;
+  const rawUrl = descriptor ? backendWsUrl() : elements.serverUrl.value.trim();
+  if (!rawUrl) {
     setStatus("Missing WS URL", "error");
     elements.statusDetail.innerText = "WS URL empty";
     return;
   }
+  const url = descriptor ? wsUrlWithToken(rawUrl, descriptor.token) : rawUrl;
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
   suppressReconnect = false;
@@ -1240,7 +1579,7 @@ function connect() {
   }
   ws = new WebSocket(url);
   setStatus("Connecting...", "warning");
-  elements.statusDetail.innerText = "WS connecting";
+  elements.statusDetail.innerText = descriptor ? "WS connecting with auth descriptor" : "WS connecting";
 
   ws.onopen = () => {
     if (generation !== connectGeneration) {
@@ -1250,7 +1589,7 @@ function connect() {
     suppressReconnect = false;
     reconnectAttempts = 0;
     setStatus("Connected", "connected");
-    elements.statusDetail.innerText = "WS connected";
+    elements.statusDetail.innerText = descriptor ? "WS connected with auth descriptor" : "WS connected";
     startPing();
     startHealthPolling();
     startMessageWatchdog(generation);
@@ -1502,7 +1841,9 @@ function clearAccumulation() {
   scanSession.freeCells.clear();
   scanSession.frontFrames = 0;
   scanSession.rearFrames = 0;
+  scanSession.pointcloudFrames = 0;
   scanSession.totalLivePoints = 0;
+  scanSession.pointCloudPreview = [];
   scanSession.savedPointCount = 0;
   scanSession.lastSavedFile = "";
   renderScanState();
@@ -1527,6 +1868,16 @@ function stopScanSession() {
 function worldToCell(x, y) {
   const size = scanSession.voxelSize;
   return [Math.round(x / size), Math.round(y / size)];
+}
+
+function pointCloudProjection(point) {
+  const x = Number(point[0] || 0);
+  const y = Number(point[1] || 0);
+  const z = Number(point[2] || 0);
+  return [
+    canvas.width / 2 + viewState.panX + (x * 0.92 - y * 0.35) * viewState.scale,
+    canvas.height / 2 + viewState.panY - (z * 0.95 + x * 0.18 + y * 0.18) * viewState.scale,
+  ];
 }
 
 function cellKey(ix, iy) {
@@ -1627,16 +1978,20 @@ function renderScanState() {
   const elapsedSec = scanSession.startedAtMs ? Math.max(0, (Date.now() - scanSession.startedAtMs) / 1000) : 0;
   const occupiedCount = scanSession.occupiedCells.size;
   const freeCount = scanSession.freeCells.size;
+  const pointCloudCount = scanSession.pointCloudPreview.length;
   const payload = {
     scanActive: scanSession.active,
+    scanMode: scanSession.scanMode,
     mapSource: editState.loadedFromStcm ? "loaded_stcm" : "live_scan",
     chassisMode: lastChassis.mode || "-",
     elapsedSec: Number(elapsedSec.toFixed(1)),
     obstacleCells: occupiedCount,
     safeCells: freeCount,
+    pointCloudPreview: pointCloudCount,
     rawLidarPoints: scanSession.totalLivePoints,
     frontFrames: scanSession.frontFrames,
     rearFrames: scanSession.rearFrames,
+    pointcloudFrames: scanSession.pointcloudFrames,
     voxelSize: scanSession.voxelSize,
     fusionPreset: effectiveScanFusionConfig().preset,
     lastSavedFile: scanSession.lastSavedFile || "-",
@@ -1645,7 +2000,12 @@ function renderScanState() {
   elements.scanPanel.innerText = JSON.stringify(payload, null, 2);
 
   if (scanSession.active) {
-    setScanState(`Recording ${occupiedCount} obstacle cells`, "active");
+    setScanState(scanSession.scanMode === "3d" ? `Recording ${pointCloudCount} preview points` : `Recording ${occupiedCount} obstacle cells`, "active");
+    updateEditorBadges();
+    return;
+  }
+  if (scanSession.scanMode === "3d" && pointCloudCount > 0) {
+    setScanState(`Stopped | ${pointCloudCount} preview points`, "warning");
     updateEditorBadges();
     return;
   }
@@ -2712,21 +3072,33 @@ async function saveMap() {
   const name = elements.mapNameInput.value.trim() || "demo_map";
   const bundle = buildClientStcmBundle();
   const manifest = { ...bundle };
-  delete manifest.radar_points;
-  const zipBytes = createStoredZip([
+  if (bundle.scan_mode === "3d") {
+    delete manifest.point_cloud;
+  } else {
+    delete manifest.radar_points;
+  }
+  const files = [
     {
       name: "manifest.json",
       data: JSON.stringify(manifest, null, 2),
     },
-    {
+  ];
+  if (bundle.scan_mode === "3d") {
+    files.push({
+      name: "point_cloud.bin",
+      data: serializePointCloud(bundle.point_cloud),
+    });
+  } else {
+    files.push({
       name: "radar_points.bin",
       data: serializeRadarPoints(bundle.radar_points),
-    },
-  ]);
+    });
+  }
+  const zipBytes = createStoredZip(files);
   const savedName = await saveBlobWithPicker(`${name}.slam`, new Blob([zipBytes], { type: "application/octet-stream" }));
   scanSession.lastSavedFile = savedName;
-  scanSession.savedPointCount = bundle.radar_points.length;
-  setInspectorBundleState(savedName.endsWith(".slam") ? savedName : `${name}.slam`, manifest, bundle.radar_points, {
+  scanSession.savedPointCount = bundle.scan_mode === "3d" ? bundle.point_cloud.length : bundle.radar_points.length;
+  setInspectorBundleState(savedName.endsWith(".slam") ? savedName : `${name}.slam`, manifest, bundle.scan_mode === "3d" ? bundle.point_cloud : bundle.radar_points, {
     source: "current_map_save",
   });
   updateSavePathHint(scanSession.lastSavedFile);
@@ -2772,6 +3144,10 @@ function clientToWorld(clientX, clientY) {
 }
 
 function handleCanvasClick(clientX, clientY) {
+  if (scanSession.scanMode === "3d") {
+    setMapEditStatus("3D preview is read-only in this version. Switch to 2D mode to edit occupancy.", "warning");
+    return;
+  }
   const [x, y] = clientToWorld(clientX, clientY);
 
   if (pendingPoiDraft) {
@@ -3033,6 +3409,24 @@ function drawOccupancy() {
   }
 }
 
+function drawPointCloudPreview() {
+  if (!scanSession.pointCloudPreview.length) {
+    return;
+  }
+  const sorted = [...scanSession.pointCloudPreview].sort((a, b) => Number(a[2] || 0) - Number(b[2] || 0));
+  sorted.forEach((point) => {
+    const [sx, sy] = pointCloudProjection(point);
+    const z = Number(point[2] || 0);
+    const intensity = Math.max(0.15, Math.min(1, Number(point[3] || 1)));
+    const radius = Math.max(1.5, Math.min(5, 1.5 + z * 0.8 + intensity));
+    const hue = 190 + Math.max(-40, Math.min(80, z * 35));
+    ctx.fillStyle = `hsla(${hue}, 80%, 60%, ${Math.min(0.95, 0.35 + intensity * 0.45)})`;
+    ctx.beginPath();
+    ctx.arc(sx, sy, radius, 0, Math.PI * 2);
+    ctx.fill();
+  });
+}
+
 function drawEditorOverlay() {
   if (editState.tool !== "obstacle" || !editState.pendingObstacleStart) {
     return;
@@ -3198,7 +3592,11 @@ function draw() {
   ctx.fillStyle = "#8f969c";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   drawGrid();
-  drawOccupancy();
+  if (scanSession.scanMode === "3d") {
+    drawPointCloudPreview();
+  } else {
+    drawOccupancy();
+  }
   drawEditorOverlay();
   drawPathOverlay();
   drawPoiOverlay();
@@ -3209,6 +3607,30 @@ function draw() {
 
 function bindUi() {
   document.getElementById("connectBtn").onclick = connect;
+  elements.authModeInput.addEventListener("change", () => {
+    syncAuthModeUi();
+    setAuthStatus(authState.descriptor ? authState.status : "Not authenticated");
+  });
+  elements.localAuthBtn.onclick = () => {
+    performLocalAuth().catch((err) => {
+      setAuthStatus(`Local auth failed: ${err.message}`, "error");
+      streamHealth.lastApiError = err.message;
+      alert(`Local auth failed: ${err.message}`);
+    });
+  };
+  elements.cloudAuthBtn.onclick = () => {
+    performCloudAuth().catch((err) => {
+      setAuthStatus(`Cloud auth failed: ${err.message}`, "error");
+      streamHealth.lastApiError = err.message;
+      alert(`Cloud auth failed: ${err.message}`);
+    });
+  };
+  elements.scanModeInput.addEventListener("change", () => {
+    setScanMode(elements.scanModeInput.value).catch((err) => {
+      streamHealth.lastApiError = err.message;
+      alert(`Scan mode switch failed: ${err.message}`);
+    });
+  });
   document.getElementById("startScanBtn").onclick = () => startScan().catch((err) => alert(err.message));
   document.getElementById("stopScanBtn").onclick = () => stopScan().catch((err) => alert(err.message));
   document.getElementById("clearAccumBtn").onclick = clearAccumulation;
@@ -3363,6 +3785,9 @@ function bindUi() {
 
 bindUi();
 bindCanvasInteractions();
+syncAuthModeUi();
+applyServerScanMode(elements.scanModeInput.value, false);
+setAuthStatus("Not authenticated");
 applyScanFusionConfig(SCAN_FUSION_PRESETS.indoor_balanced);
 syncDrawControls();
 syncTrajectoryPanel();
