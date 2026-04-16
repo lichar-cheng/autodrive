@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AutoDrive Mapping Console</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Browser Version</p>
+        <h1>AutoDrive Map Tool</h1>
+      </div>
+      <div class="connection-bar">
+        <label class="field grow">
+          <span>Server WS</span>
+          <input id="serverUrl" value="ws://192.168.3.56:8080/ws/stream" />
+        </label>
+        <button id="connectBtn" class="primary">Connect</button>
+        <div class="status-chip" id="status">Disconnected</div>
+        <div class="status-detail" id="statusDetail">WS offline</div>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="panel left-panel">
+        <section class="card">
+          <div class="section-head">
+            <h2>Scan Session</h2>
+            <div class="scan-state" id="scanState">Idle</div>
+          </div>
+          <div class="action-row">
+            <button id="startScanBtn" class="primary">Start Scan</button>
+            <button id="stopScanBtn">Stop Scan</button>
+            <button id="clearAccumBtn">Clear Accumulation</button>
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>Map Name</span>
+              <input id="mapNameInput" value="demo_map" />
+            </label>
+            <label class="field">
+              <span>Fusion Preset</span>
+              <select id="scanFusionPresetInput">
+                <option value="sim_clean">sim_clean</option>
+                <option value="indoor_balanced" selected>indoor_balanced</option>
+                <option value="indoor_sensitive">indoor_sensitive</option>
+                <option value="warehouse_sparse">warehouse_sparse</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Voxel (m)</span>
+              <input id="voxelSizeInput" type="number" min="0.02" max="1" step="0.01" value="0.08" />
+            </label>
+            <label class="field">
+              <span>Min Occupied Hits</span>
+              <input id="occupiedMinHitsInput" type="number" min="1" max="20" step="1" value="2" />
+            </label>
+            <label class="field">
+              <span>Occ/Free Ratio</span>
+              <input id="occupiedOverFreeRatioInput" type="number" min="0" max="2" step="0.05" value="0.75" />
+            </label>
+            <label class="field">
+              <span>Turn Skip Wz</span>
+              <input id="turnSkipWzInput" type="number" min="0" max="5" step="0.05" value="0.45" />
+            </label>
+            <label class="field inline checkbox-field">
+              <input id="skipTurnFramesInput" type="checkbox" checked />
+              <span>Skip Turn Frames</span>
+            </label>
+          </div>
+          <label class="field">
+            <span>Notes</span>
+            <textarea id="mapNotesInput" rows="4">Browser scan session</textarea>
+          </label>
+          <pre id="scanPanel">-</pre>
+        </section>
+
+        <section class="card visibility-card">
+          <div class="section-head">
+            <h2>Panel Visibility</h2>
+          </div>
+          <div class="action-row">
+            <label class="toggle"><input id="showMotionControlCardToggle" type="checkbox" />Move</label>
+            <label class="toggle"><input id="showPoiCardToggle" type="checkbox" />POI</label>
+            <label class="toggle"><input id="showTrajectoryCardToggle" type="checkbox" />Path</label>
+            <label class="toggle"><input id="showStcmInspectorCardToggle" type="checkbox" />Map</label>
+          </div>
+        </section>
+
+        <section class="card" id="motionControlCard">
+          <div class="section-head">
+            <h2>Move</h2>
+            <div class="kbd-state" id="keyboardState">Keyboard inactive</div>
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>Forward Speed (m/s)</span>
+              <input id="forwardSpeedInput" type="number" min="0.1" max="2" step="0.1" value="0.8" />
+            </label>
+            <label class="field">
+              <span>Reverse Speed (m/s)</span>
+              <input id="reverseSpeedInput" type="number" min="0.1" max="2" step="0.1" value="0.5" />
+            </label>
+            <label class="field">
+              <span>Turn Rate (rad/s)</span>
+              <input id="turnRateInput" type="number" min="0.1" max="2" step="0.1" value="1.0" />
+            </label>
+            <label class="field">
+              <span>Cmd Duration (s)</span>
+              <input id="cmdDurationInput" type="number" min="0.05" max="1" step="0.05" value="0.15" />
+            </label>
+          </div>
+          <div class="field-grid compact">
+            <label class="field inline">
+              <span>Repeat (ms)</span>
+              <input id="repeatMsInput" type="number" min="60" max="1000" step="20" value="120" />
+            </label>
+            <label class="field inline checkbox-field">
+              <input id="stopOnKeyupInput" type="checkbox" checked />
+              <span>Stop on keyup</span>
+            </label>
+          </div>
+          <div class="drive-pad">
+            <button data-move="forward">W Forward</button>
+            <button data-move="left">A Left</button>
+            <button data-move="stop" class="danger">Space Stop</button>
+            <button data-move="right">D Right</button>
+            <button data-move="backward">S Reverse</button>
+          </div>
+          <div class="hint">
+            Click on the page once before using the keyboard. Supported keys: W/A/S/D, arrow keys, Space.
+          </div>
+        </section>
+
+        <section class="card" id="poiCard">
+          <div class="section-head">
+            <h2>POI</h2>
+            <div class="view-chip" id="poiCountBadge">0 POI</div>
+          </div>
+          <div class="hint">
+            Enter one POI name or batch POI lines, then click Add POI and place them on the canvas one by one. Manual geo format is lon,lat. Each POI records name, x, y, yaw, lat, and lon.
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>POI Name</span>
+              <input id="poiNameInput" placeholder="Input POI name" />
+            </label>
+            <label class="field">
+              <span>Manual Geo</span>
+              <input id="poiGeoInput" placeholder="lon,lat" />
+            </label>
+          </div>
+          <div class="hint" id="poiStatus">POI idle</div>
+          <div class="action-row">
+            <label class="toggle"><input id="showPoiToggle" type="checkbox" checked />Show POI</label>
+          </div>
+          <div class="action-row">
+            <button id="addPoiBtn" class="primary">Add POI</button>
+            <button id="applyPoiGeoBtn">Apply Geo To Selected</button>
+            <button id="copyPoiBtn">Copy POI Data</button>
+            <button id="clearPoiBtn" class="danger">Clear POI</button>
+          </div>
+          <label class="field">
+            <span>Batch POI Input</span>
+            <textarea id="poiBatchCreateInput" rows="5" placeholder="One per line: name&#10;or: name,lon,lat&#10;or: name,lon,lat,yaw"></textarea>
+          </label>
+          <div>
+            <div class="list-title">POI List</div>
+            <ul id="poiList" class="data-list"></ul>
+          </div>
+        </section>
+
+        <section class="card" id="trajectoryCard">
+          <div class="section-head">
+            <h2>Path</h2>
+            <div class="view-chip" id="drawModeBadge">Line</div>
+          </div>
+          <div class="hint">
+            Build paths by POI name or by clicking any two map points. New segments keep obstacle clearance and save turning key points.
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>Path Tool</span>
+              <select id="trajectoryToolMode">
+                <option value="idle" selected>Browse Only</option>
+                <option value="poi">Use POI</option>
+                <option value="free">Free Points</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Safe Clearance (m)</span>
+              <input id="pathSafetyMarginInput" type="number" min="0" max="5" step="0.05" value="0.30" />
+            </label>
+          </div>
+          <div class="field-grid">
+            <label class="field" id="pathStartPoiField">
+              <span>Start POI Name</span>
+              <input id="pathStartPoiInput" placeholder="a" />
+            </label>
+            <label class="field" id="pathEndPoiField">
+              <span>End POI Name</span>
+              <input id="pathEndPoiInput" placeholder="b" />
+            </label>
+            <label class="field" id="pathApplyField">
+              <span>Path Apply</span>
+              <button id="connectNamedPoiBtn" type="button">Apply Path</button>
+            </label>
+          </div>
+          <div class="hint" id="freeConnectHint">Use POI mode: input start/end POI then click Apply Path. Free Points mode: click two points on the map.</div>
+          <div class="hint" id="trajectoryStatus">No segments yet</div>
+          <div class="action-row">
+            <label class="toggle"><input id="showPathToggle" type="checkbox" checked />Show Path</label>
+          </div>
+          <div class="action-row">
+            <button id="autoConnectBtn" class="primary">Auto Loop</button>
+            <button id="validatePathBtn">Closed-Loop Check</button>
+            <button id="clearSelectionBtn">Clear Selection</button>
+            <button id="deleteSegmentBtn" class="danger">Delete Segment</button>
+          </div>
+          <div>
+            <div class="list-title">Path Segment List</div>
+            <ul id="pathList" class="data-list"></ul>
+          </div>
+        </section>
+
+        <section class="card" id="stcmInspectorCard" hidden>
+          <div class="section-head">
+            <h2>Map</h2>
+            <div class="view-chip" id="stcmInspectorStatus">Idle</div>
+          </div>
+          <div class="hint">
+            Load a local <code>.slam</code> file into the main map canvas for second-stage editing. After loading, you can keep editing POI, path, remove unwanted noise, and draw black obstacle lines directly on the map.
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>SLAM File</span>
+              <input id="stcmFileInput" type="file" accept=".slam,.zip" />
+            </label>
+            <label class="field">
+              <span>Resolution (m/pixel)</span>
+              <input id="stcmResolutionInput" type="number" min="0.02" max="2" step="0.01" value="0.10" />
+            </label>
+            <label class="field">
+              <span>Padding (cells)</span>
+              <input id="stcmPaddingInput" type="number" min="0" max="200" step="1" value="8" />
+            </label>
+          </div>
+          <div class="action-row">
+            <button id="inspectStcmBtn">Inspect SLAM</button>
+            <button id="loadStcmToCanvasBtn" class="primary">Load To Main View</button>
+            <button id="saveMapBtn">Save Map</button>
+            <button id="downloadPgmBtn">Download PGM</button>
+            <button id="downloadYamlBtn">Download YAML</button>
+            <button id="downloadStcmJsonBtn">Download JSON</button>
+          </div>
+          <div class="hint" id="savePathHint">
+            Map save/export uses the local browser save dialog. You choose the destination folder and filename.
+          </div>
+          <div class="camera-meta">
+            <span id="stcmFileMeta">No file selected</span>
+            <span id="stcmGridMeta">No grid generated</span>
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>Edit Tool</span>
+              <select id="mapEditToolMode">
+                <option value="view" selected>View / Select</option>
+                <option value="erase">Erase Noise</option>
+                <option value="obstacle">Draw Obstacle Line</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Brush Radius (m)</span>
+              <input id="editBrushRadiusInput" type="number" min="0.05" max="3" step="0.05" value="0.25" />
+            </label>
+          </div>
+          <div class="action-row">
+            <button id="autoClearNoiseBtn">Auto Clear Noise</button>
+            <button id="clearEditorMapBtn" class="danger">Clear Loaded Map</button>
+          </div>
+          <div class="hint" id="mapEditStatus">
+            Tool ready. Use View / Select to pan and choose path or POI. Use Erase Noise to drag-clear cells. Use Draw Obstacle Line to click two points and add a black wall.
+          </div>
+          <pre id="stcmSummaryPanel">-</pre>
+          <pre id="stcmManifestPanel">-</pre>
+        </section>
+      </aside>
+
+      <section class="panel center-panel">
+        <div class="card canvas-card">
+          <div class="section-head">
+            <h2>Map View</h2>
+            <div class="legend">
+              <span><i class="legend-dot occ"></i>Obstacle</span>
+              <span><i class="legend-dot free"></i>Safe</span>
+              <span><i class="legend-dot unknown"></i>Unknown</span>
+            </div>
+          </div>
+          <div class="canvas-toolbar">
+            <div class="action-row">
+              <button id="centerViewBtn">Center Robot</button>
+              <button id="resetViewBtn">Reset View</button>
+              <label class="toggle"><input id="showRobotToggle" type="checkbox" checked />Show Robot</label>
+            </div>
+            <div class="view-metrics" id="viewMetrics">Pan 0,0 | Zoom 25 px/m</div>
+          </div>
+          <div class="editor-toolbar">
+            <div class="view-chip" id="mapLoadedBadge">Scan Session</div>
+            <div class="view-chip" id="editorToolBadge">Tool: View / Select</div>
+            <div class="view-chip" id="editorStatsBadge">0 obstacle cells</div>
+          </div>
+          <canvas id="lidarCanvas" width="1040" height="720"></canvas>
+          <div class="hint">
+            View / Select mode supports pan and selection. Erase Noise mode clears unwanted points by click or drag. Draw Obstacle Line mode adds black obstacles with two clicks.
+          </div>
+        </div>
+      </section>
+
+      <aside class="panel right-panel">
+        <section class="card">
+          <h2>Odom And Scan</h2>
+          <pre id="posePanel">-</pre>
+        </section>
+        <section class="card">
+          <div class="section-head">
+            <h2>Cameras</h2>
+            <button id="refreshCameraBtn">Refresh Latest</button>
+          </div>
+          <div class="camera-meta">
+            <span>Manual display refresh</span>
+            <span id="cameraRefreshStatus">No snapshot yet</span>
+          </div>
+          <div id="cameraGrid" class="camera-grid"></div>
+        </section>
+        <section class="card">
+          <h2>Communication</h2>
+          <pre id="commPanel">-</pre>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <script src="main.js?v=20260324-10"></script>
+</body>
+</html>
