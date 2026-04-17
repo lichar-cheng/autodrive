@@ -17,9 +17,9 @@ SCAN_FUSION_PRESETS: dict[str, dict[str, Any]] = {
     },
     "indoor_balanced": {
         "preset": "indoor_balanced",
-        "voxel_size": 0.08,
-        "occupied_min_hits": 2,
-        "occupied_over_free_ratio": 0.75,
+        "voxel_size": 0.15,
+        "occupied_min_hits": 1,
+        "occupied_over_free_ratio": 0.6,
         "turn_skip_wz": 0.45,
         "skip_turn_frames": True,
     },

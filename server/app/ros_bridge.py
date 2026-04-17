@@ -9,6 +9,8 @@ from typing import Any
 
 MAPPING_TOPIC_MAX_AGE_SEC = 2.5
 MAPPING_TF_MAX_AGE_SEC = 2.5
+LIDAR_NEAR_CLIP_M = 0.45
+LIDAR_NEIGHBOR_RANGE_TOLERANCE_M = 0.25
 
 
 @dataclass
@@ -23,6 +25,7 @@ class RosBridgeState:
     connected_topics: list[str] = field(default_factory=list)
     last_message_time_by_topic: dict[str, float] = field(default_factory=dict)
     last_pose: dict[str, float] = field(default_factory=lambda: {"x": 0.0, "y": 0.0, "yaw": 0.0, "vx": 0.0, "wz": 0.0})
+    pose_history: list[dict[str, Any]] = field(default_factory=list)
     last_gps: dict[str, float] = field(default_factory=lambda: {"lat": 0.0, "lon": 0.0})
     last_imu: dict[str, float] = field(default_factory=lambda: {"ax": 0.0, "ay": 0.0, "az": 0.0, "gx": 0.0, "gy": 0.0, "gz": 0.0})
     last_chassis: dict[str, float | str] = field(
@@ -46,6 +49,13 @@ def _yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
 
 def _normalize_frame(frame_id: str) -> str:
     return str(frame_id).lstrip("/")
+
+
+def _stamp_to_seconds(stamp: Any) -> float:
+    try:
+        return float(getattr(stamp, "sec", 0)) + float(getattr(stamp, "nanosec", 0)) / 1_000_000_000.0
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def _build_tf_static_qos(qos_module: Any, sensor_profile: Any) -> Any:
@@ -268,6 +278,19 @@ class RosBridge:
         with self._lock:
             return dict(self.state.last_pose)
 
+    def pose_for_stamp(self, stamp: float) -> dict[str, float]:
+        with self._lock:
+            if not self.state.pose_history:
+                return dict(self.state.last_pose)
+            best = self.state.pose_history[-1]
+            best_delta = abs(float(best.get("stamp", 0.0)) - float(stamp))
+            for item in self.state.pose_history:
+                delta = abs(float(item.get("stamp", 0.0)) - float(stamp))
+                if delta < best_delta:
+                    best = item
+                    best_delta = delta
+            return dict(best["pose"])
+
     def latest_gps(self) -> dict[str, float]:
         with self._lock:
             return dict(self.state.last_gps)
@@ -390,6 +413,7 @@ class RosBridge:
         pose = msg.pose.pose
         twist = msg.twist.twist
         yaw = _yaw_from_quaternion(pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w)
+        stamp = _stamp_to_seconds(getattr(getattr(msg, "header", None), "stamp", None)) or time.time()
         payload = {
             "x": float(pose.position.x),
             "y": float(pose.position.y),
@@ -405,8 +429,9 @@ class RosBridge:
         }
         with self._lock:
             self.state.last_pose = dict(payload)
+            self.state.pose_history.append({"stamp": float(stamp), "pose": dict(payload)})
+            self.state.pose_history = self.state.pose_history[-240:]
             self.state.last_chassis.update(chassis_payload)
-        stamp = time.time()
         self._mark_topic(self.config.topics.odom)
         self._publish_async("/robot/pose", payload, stamp)
         self._publish_async("/chassis/odom", payload, stamp)
@@ -475,7 +500,8 @@ class RosBridge:
         angle = float(msg.angle_min)
         step = float(msg.angle_increment)
         max_points = int(self.config.lidar_max_points_per_scan)
-        pose = self.latest_pose()
+        scan_stamp = _stamp_to_seconds(getattr(getattr(msg, "header", None), "stamp", None)) or time.time()
+        pose = self.pose_for_stamp(scan_stamp)
         scan_frame = _normalize_frame(msg.header.frame_id) if getattr(msg, "header", None) else _normalize_frame(self.config.topics.lidar_frame)
         with self._lock:
             self.state.last_scan_frame_by_side[side] = scan_frame
@@ -488,13 +514,31 @@ class RosBridge:
                 mount_tx = float(lidar_mount["tx"])
                 mount_ty = float(lidar_mount["ty"])
                 mount_yaw = float(lidar_mount["yaw"])
-        for index, distance in enumerate(msg.ranges):
+        sanitized_ranges: list[float | None] = []
+        for distance in msg.ranges:
+            if not math.isfinite(distance):
+                sanitized_ranges.append(None)
+                continue
+            if distance < max(float(msg.range_min), LIDAR_NEAR_CLIP_M) or distance > float(msg.range_max):
+                sanitized_ranges.append(None)
+                continue
+            sanitized_ranges.append(float(distance))
+        for index, distance in enumerate(sanitized_ranges):
             if len(points) >= max_points:
                 break
-            if not math.isfinite(distance):
+            if distance is None:
                 angle += step
                 continue
-            if distance < float(msg.range_min) or distance > float(msg.range_max):
+            prev_distance = sanitized_ranges[index - 1] if index > 0 else None
+            next_distance = sanitized_ranges[index + 1] if index + 1 < len(sanitized_ranges) else None
+            has_neighbor_support = False
+            for neighbor in (prev_distance, next_distance):
+                if neighbor is None:
+                    continue
+                if abs(neighbor - distance) <= LIDAR_NEIGHBOR_RANGE_TOLERANCE_M:
+                    has_neighbor_support = True
+                    break
+            if not has_neighbor_support:
                 angle += step
                 continue
             local_x = distance * math.cos(angle)
@@ -519,11 +563,12 @@ class RosBridge:
             f"/lidar/{side}",
             {
                 "points": points,
+                "point_frame": "world",
                 "scan_frame": scan_frame,
                 "base_frame": self.config.topics.robot_base_frame,
                 "mount": {"tx": mount_tx, "ty": mount_ty, "yaw": mount_yaw},
             },
-            time.time(),
+            scan_stamp,
         )
 
     def _on_occupancy_grid(self, msg) -> None:  # noqa: ANN001

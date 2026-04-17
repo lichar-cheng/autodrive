@@ -1,0 +1,8 @@
+{
+  "login_required": true,
+  "gateway_ip": "192.168.3.56",
+  "gateway_port": 28080,
+  "server_ip": "127.0.0.1",
+  "server_port": 8080,
+  "username": "admin"
+}

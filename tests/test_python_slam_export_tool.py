@@ -3,7 +3,7 @@ import struct
 import zipfile
 from pathlib import Path
 
-from tool.slam_export_tool import SlamExportTool
+from tools.slam_export_tool import SlamExportTool
 
 
 def write_slam(path: Path, manifest: dict, points: list[tuple[float, float, float]]) -> None:
@@ -69,3 +69,55 @@ def test_export_writes_pgm_yaml_and_json(tmp_path: Path) -> None:
     assert (output_dir / "demo.yaml").exists()
     assert (output_dir / "demo.json").exists()
     assert artifacts.pgm_meta["width"] >= 1
+
+
+def test_import_native_map_reads_yaml_and_pgm_into_browser_occupancy(tmp_path: Path) -> None:
+    yaml_path = tmp_path / "native.yaml"
+    pgm_path = tmp_path / "native.pgm"
+    pgm_path.write_text("P2\n3 2\n255\n0 205 254\n254 0 205\n", encoding="utf-8")
+    yaml_path.write_text(
+        "\n".join(
+            [
+                "image: native.pgm",
+                "mode: trinary",
+                "resolution: 0.5",
+                "origin: [1.0, 2.0, 0.0]",
+                "negate: 0",
+                "occupied_thresh: 0.65",
+                "free_thresh: 0.196",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = SlamExportTool.import_native_map(yaml_path)
+
+    assert loaded.manifest["map_source"] == "native_pgm_yaml"
+    assert loaded.manifest["browser_occupancy"]["voxel_size"] == 0.5
+    assert len(loaded.manifest["browser_occupancy"]["occupied_cells"]) == 2
+    assert len(loaded.manifest["browser_occupancy"]["free_cells"]) == 2
+    assert len(loaded.radar_points) == 2
+    assert loaded.radar_points[0][0] >= 1.0
+
+
+def test_import_native_map_supports_yaml_referenced_from_pgm_selection(tmp_path: Path) -> None:
+    yaml_path = tmp_path / "demo.yaml"
+    pgm_path = tmp_path / "demo.pgm"
+    pgm_path.write_text("P2\n1 1\n255\n0\n", encoding="utf-8")
+    yaml_path.write_text(
+        "\n".join(
+            [
+                "image: demo.pgm",
+                "resolution: 0.2",
+                "origin: [0.0, 0.0, 0.0]",
+                "negate: 0",
+                "occupied_thresh: 0.65",
+                "free_thresh: 0.196",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = SlamExportTool.resolve_native_map_yaml_path(pgm_path)
+
+    assert resolved == yaml_path

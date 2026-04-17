@@ -1,12 +1,23 @@
 from pathlib import Path
 
 from client_desktop.app import (
+    AuthFlowError,
     DesktopClient,
+    LatestScanFrameBuffer,
+    MAX_MESSAGES_DRAIN_PER_TICK,
+    bootstrap_authenticated_bridge,
     build_camera_refresh_text,
+    build_direct_ws_url,
     can_zoom_from_widget,
+    coalesce_stream_messages,
+    compose_http_base_url,
     compute_log_candidates,
+    load_desktop_client_config,
+    normalize_http_base_url,
     normalize_server_ws_url,
     parse_camera_topic_id,
+    process_scan_frame,
+    redact_sensitive_text,
     resolve_log_file_path,
     safe_focus_widget,
     safe_mode_translation_key,
@@ -22,6 +33,46 @@ def test_normalize_server_ws_url_accepts_host_only_and_adds_stream_path() -> Non
     assert normalize_server_ws_url("http://192.168.3.56:8080") == "ws://192.168.3.56:8080/ws/stream"
 
 
+def test_normalize_http_base_url_accepts_host_only() -> None:
+    assert normalize_http_base_url("192.168.3.56:8080") == "http://192.168.3.56:8080"
+    assert normalize_http_base_url("https://demo.local/api") == "https://demo.local/api"
+
+
+def test_compose_http_base_url_uses_host_and_port() -> None:
+    assert compose_http_base_url("192.168.3.56", "28080") == "http://192.168.3.56:28080"
+    assert compose_http_base_url("192.168.3.56", "") == "http://192.168.3.56"
+
+
+def test_build_direct_ws_url_uses_host_and_port() -> None:
+    assert build_direct_ws_url("192.168.3.56", "28080") == "ws://192.168.3.56:28080/ws/stream"
+
+
+def test_redact_sensitive_text_hides_urls_and_hosts() -> None:
+    redacted = redact_sensitive_text("connect failed to ws://192.168.3.56:8080/ws/stream token TOKEN-ABC-1234567890")
+
+    assert "192.168.3.56:8080" not in redacted
+    assert "ws://" not in redacted
+
+
+def test_auth_flow_error_keeps_user_message_but_redacts_sensitive_values() -> None:
+    err = AuthFlowError("网关错误: ws://192.168.3.56:28080/ws/stream token TOKEN-ABC-1234567890")
+
+    assert "网关错误" in err.user_message
+    assert "192.168.3.56" not in err.user_message
+    assert "TOKEN-ABC-1234567890" not in err.user_message
+
+
+def test_load_desktop_client_config_reads_local_override(tmp_path: Path) -> None:
+    config_path = tmp_path / "client_config.json"
+    config_path.write_text('{"login_required": false, "gateway_ip": "10.0.0.8", "gateway_port": 28080, "server_ip": "10.0.0.9", "server_port": 18080, "username": "debug"}', encoding="utf-8")
+
+    config = load_desktop_client_config(config_path)
+
+    assert config["login_required"] is False
+    assert config["gateway_ip"] == "10.0.0.8"
+    assert config["server_ip"] == "10.0.0.9"
+
+
 def test_resolve_log_file_path_falls_back_to_second_candidate(tmp_path: Path) -> None:
     first = tmp_path / "missing-parent" / "nested" / "client_desktop.log"
     second = tmp_path / "fallback" / "client_desktop.log"
@@ -35,6 +86,63 @@ def test_resolve_log_file_path_falls_back_to_second_candidate(tmp_path: Path) ->
 
     assert chosen == second
     assert second.exists()
+
+
+def test_bootstrap_authenticated_bridge_logs_in_and_fetches_vcu_urls() -> None:
+    calls = []
+
+    class Response:
+        def __init__(self, payload) -> None:
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Session:
+        trust_env = True
+
+        def post(self, url, json=None, headers=None, timeout=None):
+            calls.append((url, json, headers, timeout))
+            if url.endswith("/sysUser/userLogin"):
+                return Response({"retCode": 200, "retMsg": "Success", "retData": {"tokenID": "TOKEN-1", "userName": "admin"}})
+            return Response({"retCode": 200, "retMsg": "Success", "retData": {"http": "http://192.168.3.56:8080/health", "ws": "ws://192.168.3.56:8080/ws/stream"}})
+
+        def close(self) -> None:
+            return None
+
+    result = bootstrap_authenticated_bridge("192.168.3.99", "admin", "123456", session=Session(), timeout_sec=2.0)
+
+    assert result["token"] == "TOKEN-1"
+    assert result["ws_url"] == "ws://192.168.3.56:8080/ws/stream"
+    assert calls[1][2] == {"Authorization": "TOKEN-1"}
+
+
+def test_bootstrap_authenticated_bridge_surfaces_login_failure() -> None:
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {"retCode": 401, "retMsg": "Bad credentials"}
+
+    class Session:
+        trust_env = True
+
+        def post(self, *_args, **_kwargs):
+            return Response()
+
+        def close(self) -> None:
+            return None
+
+    try:
+        bootstrap_authenticated_bridge("192.168.3.99", "admin", "bad", session=Session())
+    except RuntimeError as exc:
+        assert "Bad credentials" in str(exc)
+    else:
+        raise AssertionError("expected login failure")
 
 
 def test_build_camera_refresh_text_handles_empty_inbox() -> None:
@@ -90,6 +198,19 @@ def test_zoom_scale_factor_supports_mousewheel_and_linux_buttons() -> None:
     assert zoom_scale_factor(Event(delta=-120)) < 1.0
     assert zoom_scale_factor(Event(num=4)) > 1.0
     assert zoom_scale_factor(Event(num=5)) < 1.0
+
+
+def test_zoom_view_clamps_scale_and_refreshes_metrics() -> None:
+    client = DesktopClient.__new__(DesktopClient)
+    client.view = {"scale": 25.0, "pan_x": 0.0, "pan_y": 0.0}
+    refreshed: list[float] = []
+    client.update_view_metrics = lambda: refreshed.append(client.view["scale"])
+
+    DesktopClient.zoom_view(client, 1.2)
+    DesktopClient.zoom_view(client, 0.01)
+    DesktopClient.zoom_view(client, 100.0)
+
+    assert refreshed == [30.0, 8.0, 80.0]
 
 
 def test_strip_legacy_trajectory_removes_exported_trajectory() -> None:
@@ -160,6 +281,78 @@ def test_move_click_uses_async_api_for_stop() -> None:
     assert calls == [("async", "/control/stop", {})]
 
 
+def test_send_control_command_now_uses_fast_timeout_without_retries() -> None:
+    client = DesktopClient.__new__(DesktopClient)
+    seen = []
+
+    class Bridge:
+        connected = True
+
+        def post(self, path, body, retries=3, timeout_sec=4.0, backoff_base_sec=0.2):
+            seen.append((path, body, retries, timeout_sec, backoff_base_sec))
+            return {}
+
+    client.bridge = Bridge()
+
+    DesktopClient.send_control_command_now(client, "/control/move", {"velocity": 0.8})
+
+    assert seen == [("/control/move", {"velocity": 0.8}, 0, 0.35, 0.0)]
+
+
+def test_connect_uses_direct_ws_url_when_login_is_disabled() -> None:
+    class Var:
+        def __init__(self, value) -> None:
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value) -> None:
+            self.value = value
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.client_config = {"login_required": False}
+    client.direct_server_ip_var = Var("192.168.3.56")
+    client.direct_server_port_var = Var("28080")
+    client.auth_status_var = Var("")
+    client.server_var = Var("")
+    client.stream_health = {"last_api_error": ""}
+    client.conn_var = Var("")
+    client.status_var = Var("")
+    client.status_detail_var = Var("")
+    client.health = {}
+    client.logger = type("Logger", (), {"info": lambda *args, **kwargs: None, "exception": lambda *args, **kwargs: None})()
+    client.tr = lambda key, **kwargs: key if not kwargs else key
+    client.disconnect = lambda: None
+    client.update_health_status_detail = lambda health: None
+
+    class Bridge:
+        def __init__(self, ws_url, logger=None) -> None:
+            self.ws_url = ws_url
+            self.connected = False
+
+        def get(self, path):
+            assert path == "/health"
+            return {"ws_clients": 0}
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+    import client_desktop.app as app_module
+
+    original_bridge = app_module.ServerBridge
+    app_module.ServerBridge = Bridge
+    try:
+        DesktopClient.connect(client)
+    finally:
+        app_module.ServerBridge = original_bridge
+
+    assert client.server_var.get() == "ws://192.168.3.56:28080/ws/stream"
+
+
 def test_on_key_release_delays_stop_until_after_confirmation_window() -> None:
     class Root:
         def __init__(self) -> None:
@@ -195,6 +388,7 @@ def test_on_key_release_delays_stop_until_after_confirmation_window() -> None:
     client.stop_on_keyup_var = Var(True)
     client.keyboard_var = Var("")
     client.pending_keyup_stop_id = None
+    client.clear_control_target = lambda: None
     client.move_click = lambda name: (_ for _ in ()).throw(AssertionError(f"unexpected immediate move_click({name})"))
     client.tr = lambda key, **_kwargs: key
 
@@ -244,6 +438,59 @@ def test_on_key_press_cancels_pending_keyup_stop_before_it_fires() -> None:
     assert ensured == ["loop"]
 
 
+def test_ensure_drive_loop_updates_control_target_immediately() -> None:
+    class Var:
+        def __init__(self, value) -> None:
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value) -> None:
+            self.value = value
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.keys_down = {"w"}
+    client.keyboard_var = Var("")
+    client.tr = lambda key, **kwargs: kwargs.get("cmd", key)
+    seen = []
+    client.update_control_target = lambda name: seen.append(name)
+
+    DesktopClient.ensure_drive_loop(client)
+
+    assert seen == ["forward"]
+    assert client.keyboard_var.get() == "forward"
+
+
+def test_on_key_release_updates_control_target_for_remaining_keys() -> None:
+    class Root:
+        def focus_get(self):
+            return None
+
+    class Var:
+        def __init__(self, value) -> None:
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    class Event:
+        keysym = "a"
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.root = Root()
+    client.keys_down = {"w", "a"}
+    client.stop_on_keyup_var = Var(True)
+    client.clear_control_target = lambda: (_ for _ in ()).throw(AssertionError("should not clear target when keys remain"))
+    ensured = []
+    client.ensure_drive_loop = lambda: ensured.append("loop")
+
+    DesktopClient.on_key_release(client, Event())
+
+    assert client.keys_down == {"w"}
+    assert ensured == ["loop"]
+
+
 def test_browser_occupancy_includes_scan_fusion_metadata() -> None:
     class Var:
         def __init__(self, value) -> None:
@@ -271,6 +518,82 @@ def test_browser_occupancy_includes_scan_fusion_metadata() -> None:
 
     assert payload["scan_fusion"]["preset"] == "indoor_sensitive"
     assert payload["scan_fusion"]["occupied_min_hits"] == 1
+    assert payload["occupied_cells"] == [{"ix": 1, "iy": 2, "hits": 1, "intensity": 0.8}]
+
+
+def test_browser_occupancy_filters_out_non_occupied_cells() -> None:
+    class Var:
+        def __init__(self, value) -> None:
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value) -> None:
+            self.value = value
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.scan = {
+        "voxel": 0.2,
+        "occupied": {
+            "1:1": {"ix": 1, "iy": 1, "hits": 1, "intensity": 0.4},
+            "2:2": {"ix": 2, "iy": 2, "hits": 4, "intensity": 0.9},
+        },
+        "free": {"1:1": {"ix": 1, "iy": 1, "hits": 3}},
+    }
+    client.scan_fusion = {"preset": "indoor_balanced", "voxel_size": 0.2, "occupied_min_hits": 3, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
+    client.scan_fusion_preset_var = Var("indoor_balanced")
+    client.voxel_var = Var("0.20")
+    client.occupied_min_hits_var = Var("3")
+    client.occupied_over_free_ratio_var = Var("0.75")
+    client.turn_skip_wz_var = Var("0.45")
+    client.skip_turn_frames_var = Var(True)
+    client.number = DesktopClient.number.__get__(client, DesktopClient)
+    client.effective_scan_fusion_config = DesktopClient.effective_scan_fusion_config.__get__(client, DesktopClient)
+    client.filtered_occupancy_cells = DesktopClient.filtered_occupancy_cells.__get__(client, DesktopClient)
+
+    payload = DesktopClient.browser_occupancy(client)
+
+    assert payload["occupied_cells"] == [{"ix": 2, "iy": 2, "hits": 4, "intensity": 0.9}]
+
+
+def test_browser_occupancy_filters_out_hidden_free_cells() -> None:
+    class Var:
+        def __init__(self, value) -> None:
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value) -> None:
+            self.value = value
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.scan = {
+        "voxel": 0.2,
+        "occupied": {
+            "1:1": {"ix": 1, "iy": 1, "hits": 5, "intensity": 0.9},
+        },
+        "free": {
+            "1:1": {"ix": 1, "iy": 1, "hits": 3},
+            "2:2": {"ix": 2, "iy": 2, "hits": 4},
+        },
+    }
+    client.scan_fusion = {"preset": "indoor_balanced", "voxel_size": 0.2, "occupied_min_hits": 3, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
+    client.scan_fusion_preset_var = Var("indoor_balanced")
+    client.voxel_var = Var("0.20")
+    client.occupied_min_hits_var = Var("3")
+    client.occupied_over_free_ratio_var = Var("0.75")
+    client.turn_skip_wz_var = Var("0.45")
+    client.skip_turn_frames_var = Var(True)
+    client.number = DesktopClient.number.__get__(client, DesktopClient)
+    client.effective_scan_fusion_config = DesktopClient.effective_scan_fusion_config.__get__(client, DesktopClient)
+
+    payload = DesktopClient.browser_occupancy(client)
+
+    assert payload["free_cells"] == [{"ix": 2, "iy": 2, "hits": 4}]
+
+
 
 
 def test_apply_scan_fusion_config_updates_runtime_and_vars() -> None:
@@ -301,6 +624,37 @@ def test_apply_scan_fusion_config_updates_runtime_and_vars() -> None:
     assert client.occupied_min_hits_var.get() == "4"
 
 
+def test_on_scan_fusion_preset_selected_loads_preset_defaults() -> None:
+    class Var:
+        def __init__(self, value) -> None:
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value) -> None:
+            self.value = value
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.scan = {"voxel": 0.2}
+    client.scan_fusion = {"preset": "indoor_balanced", "voxel_size": 0.2, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
+    client.scan_fusion_preset_var = Var("warehouse_sparse")
+    client.voxel_var = Var("0.20")
+    client.occupied_min_hits_var = Var("2")
+    client.occupied_over_free_ratio_var = Var("0.75")
+    client.turn_skip_wz_var = Var("0.45")
+    client.skip_turn_frames_var = Var(True)
+    client.apply_scan_fusion_config = DesktopClient.apply_scan_fusion_config.__get__(client, DesktopClient)
+
+    DesktopClient.on_scan_fusion_preset_selected(client)
+
+    assert client.scan["voxel"] == 0.10
+    assert client.voxel_var.get() == "0.10"
+    assert client.occupied_min_hits_var.get() == "2"
+    assert client.occupied_over_free_ratio_var.get() == "0.65"
+    assert client.turn_skip_wz_var.get() == "0.50"
+
+
 def test_start_scan_does_not_activate_local_scan_when_server_rejects_prereq(monkeypatch) -> None:
     warnings = []
     monkeypatch.setattr("client_desktop.app.messagebox.showwarning", lambda title, message: warnings.append((title, message)))
@@ -321,3 +675,256 @@ def test_start_scan_does_not_activate_local_scan_when_server_rejects_prereq(monk
 
     assert client.scan["active"] is False
     assert warnings
+
+
+def test_latest_scan_frame_buffer_keeps_only_latest_frame() -> None:
+    buffer = LatestScanFrameBuffer()
+
+    buffer.submit({"seq": 1})
+    buffer.submit({"seq": 2})
+
+    assert buffer.pop_latest()["seq"] == 2
+    assert buffer.pop_latest() is None
+
+
+def test_process_scan_frame_skips_stationary_pose() -> None:
+    scan = {
+        "active": True,
+        "raw_points": 0,
+        "voxel": 0.2,
+        "occupied": {},
+        "free": {},
+        "last_accum_pose": {"x": 0.0, "y": 0.0, "yaw": 0.0},
+    }
+    changed = process_scan_frame(
+        scan,
+        points=[[1.0, 0.0, 1.0]],
+        pose={"x": 0.01, "y": 0.0, "yaw": 0.01, "wz": 0.0},
+        keyframe=False,
+        config={"voxel_size": 0.2, "occupied_min_hits": 1, "occupied_over_free_ratio": 0.0, "turn_skip_wz": 0.2, "skip_turn_frames": True},
+    )
+
+    assert changed is False
+    assert scan["raw_points"] == 0
+    assert scan["occupied"] == {}
+
+
+def test_process_scan_frame_updates_scan_and_prunes_noise() -> None:
+    scan = {
+        "active": True,
+        "raw_points": 0,
+        "voxel": 0.2,
+        "occupied": {},
+        "free": {},
+        "last_accum_pose": None,
+    }
+    changed = process_scan_frame(
+        scan,
+        points=[[1.0, 0.0, 0.9]],
+        pose={"x": 0.0, "y": 0.0, "yaw": 0.0, "wz": 0.0},
+        keyframe=True,
+        config={"voxel_size": 0.2, "occupied_min_hits": 1, "occupied_over_free_ratio": 0.0, "turn_skip_wz": 0.2, "skip_turn_frames": True},
+    )
+
+    assert changed is True
+    assert scan["raw_points"] == 1
+    assert scan["occupied"]
+    assert scan["last_accum_pose"]["x"] == 0.0
+    assert scan["free"]
+
+
+def test_process_scan_frame_uses_world_points_without_reapplying_pose_transform() -> None:
+    scan = {
+        "active": True,
+        "raw_points": 0,
+        "voxel": 0.2,
+        "occupied": {},
+        "free": {},
+        "last_accum_pose": None,
+    }
+    changed = process_scan_frame(
+        scan,
+        points=[[3.0, 3.0, 0.9]],
+        pose={"x": 2.0, "y": 3.0, "yaw": 0.0, "wz": 0.0},
+        keyframe=False,
+        config={"voxel_size": 0.2, "occupied_min_hits": 1, "occupied_over_free_ratio": 0.0, "turn_skip_wz": 0.2, "skip_turn_frames": True},
+    )
+
+    assert changed is True
+    assert "15:15" in scan["occupied"]
+
+
+def test_process_scan_frame_does_not_rotate_world_points_by_robot_yaw() -> None:
+    scan = {
+        "active": True,
+        "raw_points": 0,
+        "voxel": 0.2,
+        "occupied": {},
+        "free": {},
+        "last_accum_pose": None,
+    }
+    changed = process_scan_frame(
+        scan,
+        points=[[2.0, 4.0, 0.9]],
+        pose={"x": 8.0, "y": 9.0, "yaw": 1.57079632679, "wz": 0.0},
+        keyframe=False,
+        config={"voxel_size": 0.2, "occupied_min_hits": 1, "occupied_over_free_ratio": 0.0, "turn_skip_wz": 0.2, "skip_turn_frames": True},
+    )
+
+    assert changed is True
+    assert "10:20" in scan["occupied"]
+
+
+def test_process_scan_frame_only_updates_free_cells_for_keyframes() -> None:
+    scan = {
+        "active": True,
+        "raw_points": 0,
+        "voxel": 0.2,
+        "occupied": {},
+        "free": {},
+        "last_accum_pose": None,
+    }
+    non_keyframe = process_scan_frame(
+        scan,
+        points=[[2.0, 0.0, 1.0]],
+        pose={"x": 0.0, "y": 0.0, "yaw": 0.0, "wz": 0.0},
+        keyframe=False,
+        config={"voxel_size": 0.2, "occupied_min_hits": 1, "occupied_over_free_ratio": 0.0, "turn_skip_wz": 0.2, "skip_turn_frames": True},
+    )
+
+    assert non_keyframe is True
+    assert scan["free"] == {}
+
+    scan["last_accum_pose"] = None
+    keyframe = process_scan_frame(
+        scan,
+        points=[[2.0, 0.0, 1.0]],
+        pose={"x": 0.0, "y": 0.0, "yaw": 0.0, "wz": 0.0},
+        keyframe=True,
+        config={"voxel_size": 0.2, "occupied_min_hits": 1, "occupied_over_free_ratio": 0.0, "turn_skip_wz": 0.2, "skip_turn_frames": True},
+    )
+
+    assert keyframe is True
+    assert scan["free"]
+
+def test_process_scan_frame_keeps_free_history_after_robot_moves() -> None:
+    scan = {
+        "active": True,
+        "raw_points": 0,
+        "voxel": 0.2,
+        "occupied": {},
+        "free": {},
+        "last_accum_pose": None,
+    }
+    config = {
+        "voxel_size": 0.2,
+        "occupied_min_hits": 1,
+        "occupied_over_free_ratio": 0.0,
+        "turn_skip_wz": 0.2,
+        "skip_turn_frames": True,
+    }
+
+    first = process_scan_frame(
+        scan,
+        points=[[2.0, 0.0, 1.0]],
+        pose={"x": 0.0, "y": 0.0, "yaw": 0.0, "wz": 0.0},
+        keyframe=True,
+        config=config,
+    )
+    second = process_scan_frame(
+        scan,
+        points=[[4.0, 0.0, 1.0]],
+        pose={"x": 1.0, "y": 0.0, "yaw": 0.0, "wz": 0.0},
+        keyframe=True,
+        config=config,
+    )
+
+    assert first is True
+    assert second is True
+    assert any(int(cell["ix"]) < 5 for cell in scan["free"].values())
+
+
+def test_coalesce_stream_messages_prefers_latest_pose_and_lidar() -> None:
+    messages = [
+        {"topic": "/robot/pose", "stamp": 1.0, "payload": {"x": 1}},
+        {"topic": "/lidar/front", "stamp": 1.0, "payload": {"points": [[0, 0, 1]]}},
+        {"topic": "/robot/pose", "stamp": 2.0, "payload": {"x": 2}},
+        {"topic": "/lidar/front", "stamp": 2.0, "payload": {"points": [[1, 0, 1]]}},
+    ]
+
+    merged = coalesce_stream_messages(messages)
+
+    assert [item["topic"] for item in merged] == ["/robot/pose", "/lidar/front"]
+    assert merged[0]["payload"]["x"] == 2
+    assert merged[1]["payload"]["points"] == [[1, 0, 1]]
+
+
+def test_consume_messages_coalesces_and_prioritizes_pose_updates() -> None:
+    class Bridge:
+        def __init__(self) -> None:
+            self.queue = __import__("queue").Queue()
+
+    class Var:
+        def __init__(self, value) -> None:
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value) -> None:
+            self.value = value
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.bridge = Bridge()
+    client.camera_inbox = {1: {"objects": [], "meta": {}}}
+    client.camera_refresh_var = Var("")
+    client.pose = {}
+    client.gps = {}
+    client.odom = {}
+    client.chassis = {}
+    client.pose_history = []
+    client.scan = {"front_frames": 0, "rear_frames": 0, "active": True}
+    client.last_scan = {"front": {}, "rear": {}}
+    client.validate_message = lambda msg: True
+    queued = []
+    client.queue_scan_frame = lambda points, stamp, keyframe: queued.append((points, stamp, keyframe))
+    dirty = []
+    client.mark_canvas_dirty = lambda: dirty.append("dirty")
+
+    for index in range(MAX_MESSAGES_DRAIN_PER_TICK):
+        client.bridge.queue.put({"topic": "/lidar/front", "stamp": float(index), "payload": {"points": [[index, 0, 1]], "raw_points": 1, "keyframe": False}})
+    client.bridge.queue.put({"topic": "/robot/pose", "stamp": 99.0, "payload": {"x": 9.0}})
+
+    DesktopClient.consume_messages(client)
+
+    assert client.pose == {"x": 9.0}
+    assert queued[-1][0] == [[MAX_MESSAGES_DRAIN_PER_TICK - 1, 0, 1]]
+    assert dirty
+
+
+def test_render_canvas_if_needed_skips_when_not_dirty() -> None:
+    client = DesktopClient.__new__(DesktopClient)
+    client.canvas_dirty = False
+    client.canvas_revision = 3
+    client.last_render_revision = 3
+    calls = []
+    client.render_canvas_contents = lambda: calls.append("render")
+
+    DesktopClient.render_canvas_if_needed(client)
+
+    assert calls == []
+
+
+def test_render_canvas_if_needed_renders_when_dirty() -> None:
+    client = DesktopClient.__new__(DesktopClient)
+    client.canvas_dirty = True
+    client.canvas_revision = 4
+    client.last_render_revision = 3
+    calls = []
+    client.render_canvas_contents = lambda: calls.append("render")
+
+    DesktopClient.render_canvas_if_needed(client)
+
+    assert calls == ["render"]
+    assert client.canvas_dirty is False
+    assert client.last_render_revision == 4

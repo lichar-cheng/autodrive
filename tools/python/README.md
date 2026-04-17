@@ -13,7 +13,7 @@
 ```python
 from pathlib import Path
 
-from tool.slam_export_tool import SlamExportTool
+from tools.slam_export_tool import SlamExportTool
 
 artifacts = SlamExportTool.export(
     Path("demo.slam"),

@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import queue
+import re
 import struct
 import sys
 import tempfile
@@ -24,6 +25,7 @@ import requests
 import websocket
 
 try:
+    from .native_map_import import NativeMapImportTool
     from .logic import (
         SCAN_FUSION_PRESETS,
         Point,
@@ -41,6 +43,7 @@ try:
         solve_nearest_loop,
     )
 except ImportError:
+    from native_map_import import NativeMapImportTool  # type: ignore
     from logic import (  # type: ignore
         SCAN_FUSION_PRESETS,
         Point,
@@ -89,6 +92,150 @@ def normalize_server_ws_url(raw: str) -> str:
     elif path != "/ws/stream":
         path = f"{path}/ws/stream" if not path.endswith("/ws/stream") else path
     return parsed._replace(path=path).geturl()
+
+
+def normalize_http_base_url(raw: str) -> str:
+    text = raw.strip()
+    if not text:
+        return ""
+    if "://" not in text:
+        text = f"http://{text}"
+    parsed = urlparse(text)
+    scheme = "https" if parsed.scheme == "https" else "http"
+    if parsed.netloc:
+        netloc = parsed.netloc
+        path = parsed.path.rstrip("/")
+    else:
+        netloc = parsed.path.rstrip("/")
+        path = ""
+    return parsed._replace(scheme=scheme, netloc=netloc, path=path, params="", query="", fragment="").geturl().rstrip("/")
+
+
+def compose_http_base_url(host: str, port: str) -> str:
+    normalized_host = host.strip()
+    normalized_port = port.strip()
+    if not normalized_host:
+        return ""
+    if normalized_port:
+        return normalize_http_base_url(f"{normalized_host}:{normalized_port}")
+    return normalize_http_base_url(normalized_host)
+
+
+def build_direct_ws_url(host: str, port: str) -> str:
+    normalized_host = host.strip()
+    normalized_port = port.strip()
+    if not normalized_host:
+        return ""
+    if normalized_port:
+        return normalize_server_ws_url(f"{normalized_host}:{normalized_port}")
+    return normalize_server_ws_url(normalized_host)
+
+
+def redact_sensitive_text(text: str) -> str:
+    redacted = str(text)
+    redacted = re.sub(r"(https?|wss?)://[^\s\"']+", "<redacted-url>", redacted, flags=re.IGNORECASE)
+    redacted = re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b", "<redacted-host>", redacted)
+    redacted = re.sub(r"\b(?:[A-Za-z0-9_-]{16,}|[A-Fa-f0-9]{24,})\b", "<redacted-token>", redacted)
+    return redacted
+
+
+class AuthFlowError(RuntimeError):
+    def __init__(self, user_message: str, detail: str | None = None) -> None:
+        super().__init__(detail or user_message)
+        self.user_message = redact_sensitive_text(user_message)
+        self.detail = detail or user_message
+
+
+def load_desktop_client_config(config_path: Path | None = None) -> dict[str, Any]:
+    defaults = {
+        "login_required": True,
+        "gateway_ip": "192.168.3.56",
+        "gateway_port": 28080,
+        "server_ip": "127.0.0.1",
+        "server_port": 8080,
+        "username": "admin",
+    }
+    candidates = [config_path] if config_path is not None else [
+        runtime_base_dir() / "client_config.json",
+        Path.cwd() / "client_config.json",
+    ]
+    for candidate in candidates:
+        if candidate is None or not candidate.exists():
+            continue
+        try:
+            parsed = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            merged = dict(defaults)
+            merged.update(parsed)
+            return merged
+    return defaults
+
+
+def _extract_json_payload(response: Any, action: str) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except Exception as exc:  # noqa: BLE001
+        raise AuthFlowError(f"{action} returned invalid JSON", f"{action} returned invalid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise AuthFlowError(f"{action} returned invalid payload")
+    ret_code = payload.get("retCode", 200)
+    if int(ret_code) != 200:
+        raise AuthFlowError(str(payload.get("retMsg", f"{action} failed")), f"{action} failed: {payload.get('retMsg', 'unknown error')}")
+    return payload
+
+
+def bootstrap_authenticated_bridge(
+    base_url: str,
+    username: str,
+    password: str,
+    session: requests.Session | None = None,
+    timeout_sec: float = 3.0,
+) -> dict[str, str]:
+    owned_session = session is None
+    http = session or requests.Session()
+    if hasattr(http, "trust_env"):
+        http.trust_env = False
+    try:
+        login_response = http.post(
+            f"{normalize_http_base_url(base_url)}/sysUser/userLogin",
+            json={"userName": username, "userPwd": password},
+            timeout=timeout_sec,
+        )
+        login_response.raise_for_status()
+        login_payload = _extract_json_payload(login_response, "login")
+        login_data = login_payload.get("retData") or {}
+        if not isinstance(login_data, dict) or not str(login_data.get("tokenID", "")).strip():
+            raise AuthFlowError("login succeeded but tokenID is missing")
+        token = str(login_data["tokenID"]).strip()
+        url_response = http.post(
+            f"{normalize_http_base_url(base_url)}/sys/getVcuUrl",
+            json={},
+            headers={"Authorization": token},
+            timeout=timeout_sec,
+        )
+        url_response.raise_for_status()
+        url_payload = _extract_json_payload(url_response, "getVcuUrl")
+        url_data = url_payload.get("retData") or {}
+        if not isinstance(url_data, dict):
+            raise AuthFlowError("getVcuUrl returned invalid retData")
+        ws_url = normalize_server_ws_url(str(url_data.get("ws", "")).strip())
+        http_url = str(url_data.get("http", "")).strip()
+        if not ws_url:
+            raise AuthFlowError("getVcuUrl succeeded but ws address is missing")
+        if not http_url:
+            raise AuthFlowError("getVcuUrl succeeded but http address is missing")
+        return {
+            "base_url": normalize_http_base_url(base_url),
+            "user_name": str(login_data.get("userName") or username).strip(),
+            "token": token,
+            "http_url": http_url,
+            "ws_url": ws_url,
+        }
+    finally:
+        if owned_session:
+            http.close()
 
 
 def resolve_log_file_path(
@@ -180,6 +327,11 @@ def strip_legacy_trajectory(manifest: dict) -> dict:
 
 KEYUP_STOP_CONFIRM_MS = 50
 HEALTH_POLL_INTERVAL_SEC = 15.0
+MAX_MESSAGES_PER_TICK = 12
+MAX_MESSAGES_DRAIN_PER_TICK = 256
+MIN_SCAN_TRANSLATION_DELTA_M = 0.05
+MIN_SCAN_ROTATION_DELTA_RAD = 0.03
+MAX_FREE_DISPLAY_CELLS = 12000
 
 
 def summarize_mapping_status(health: dict) -> str:
@@ -203,6 +355,162 @@ def mapping_prereq_message(summary: dict) -> str:
     if warnings:
         return "\n".join(warnings)
     return "mapping prerequisites not satisfied"
+
+
+def _normalize_angle_delta(value: float) -> float:
+    return math.atan2(math.sin(value), math.cos(value))
+
+
+def pose_progress_exceeds_threshold(
+    previous_pose: dict[str, float] | None,
+    current_pose: dict[str, float] | None,
+    min_translation_m: float = MIN_SCAN_TRANSLATION_DELTA_M,
+    min_rotation_rad: float = MIN_SCAN_ROTATION_DELTA_RAD,
+) -> bool:
+    if previous_pose is None or current_pose is None:
+        return True
+    dx = float(current_pose.get("x", 0.0)) - float(previous_pose.get("x", 0.0))
+    dy = float(current_pose.get("y", 0.0)) - float(previous_pose.get("y", 0.0))
+    if math.hypot(dx, dy) >= float(min_translation_m):
+        return True
+    yaw_delta = _normalize_angle_delta(float(current_pose.get("yaw", 0.0)) - float(previous_pose.get("yaw", 0.0)))
+    return abs(yaw_delta) >= float(min_rotation_rad)
+
+
+class LatestScanFrameBuffer:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._latest: dict[str, Any] | None = None
+
+    def submit(self, frame: dict[str, Any]) -> None:
+        with self._lock:
+            self._latest = frame
+
+    def pop_latest(self) -> dict[str, Any] | None:
+        with self._lock:
+            frame = self._latest
+            self._latest = None
+            return frame
+
+
+def prune_scan_cache(scan: dict[str, Any], config: dict[str, Any]) -> None:
+    occupied = scan.get("occupied")
+    free = scan.get("free")
+    if not isinstance(occupied, dict) or not isinstance(free, dict):
+        return
+    retained_occupied: dict[str, dict[str, Any]] = {}
+    for key, cell in occupied.items():
+        free_cell = free.get(key)
+        if not is_occupied_scan_cell(cell, free_cell, config):
+            continue
+        retained_occupied[key] = cell
+    retained_free_items = sorted(
+        (dict(item) for item in free.values()),
+        key=lambda item: (int(item.get("hits", 0)), -abs(int(item.get("ix", 0))) - abs(int(item.get("iy", 0)))),
+        reverse=True,
+    )[:MAX_FREE_DISPLAY_CELLS]
+    retained_free = {_cell_key(int(item["ix"]), int(item["iy"])): item for item in retained_free_items}
+    scan["occupied"] = retained_occupied
+    scan["free"] = retained_free
+
+
+def coalesce_stream_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    latest_by_topic: dict[str, dict[str, Any]] = {}
+    passthrough: list[dict[str, Any]] = []
+    for msg in messages:
+        topic = str(msg.get("topic", ""))
+        if topic in {"/robot/pose", "/robot/gps", "/chassis/odom", "/chassis/status", "/lidar/front", "/lidar/rear"} or topic.startswith("/camera/"):
+            latest_by_topic[topic] = msg
+        else:
+            passthrough.append(msg)
+    ordered_topics = [
+        "/robot/pose",
+        "/chassis/odom",
+        "/chassis/status",
+        "/robot/gps",
+        "/lidar/front",
+        "/lidar/rear",
+    ]
+    ordered_topics.extend(sorted(topic for topic in latest_by_topic if topic.startswith("/camera/")))
+    coalesced = [latest_by_topic[topic] for topic in ordered_topics if topic in latest_by_topic]
+    return coalesced + passthrough
+
+
+def _cell_key(ix: int, iy: int) -> str:
+    return f"{ix}:{iy}"
+
+
+def _mark_free(scan: dict[str, Any], ix: int, iy: int) -> None:
+    key = _cell_key(ix, iy)
+    slot = scan["free"].get(key, {"ix": ix, "iy": iy, "hits": 0})
+    slot["hits"] += 1
+    scan["free"][key] = slot
+
+
+def _mark_occupied(scan: dict[str, Any], ix: int, iy: int, intensity: float, hits: int = 1) -> None:
+    key = _cell_key(ix, iy)
+    slot = scan["occupied"].get(key, {"ix": ix, "iy": iy, "hits": 0, "intensity": 0.0})
+    slot["hits"] = max(int(slot["hits"]) + hits, hits)
+    slot["intensity"] = max(float(slot["intensity"]), float(intensity))
+    scan["occupied"][key] = slot
+
+
+def _world_to_cell(scan: dict[str, Any], x: float, y: float) -> tuple[int, int]:
+    voxel = float(scan["voxel"])
+    return round(x / voxel), round(y / voxel)
+
+
+def _raytrace(scan: dict[str, Any], start_x: int, start_y: int, end_x: int, end_y: int) -> None:
+    dx = end_x - start_x
+    dy = end_y - start_y
+    steps = max(abs(dx), abs(dy))
+    if steps <= 1:
+        return
+    for step in range(steps):
+        t = step / steps
+        _mark_free(scan, round(start_x + dx * t), round(start_y + dy * t))
+
+
+def process_scan_frame(
+    scan: dict[str, Any],
+    points: list[Any],
+    pose: dict[str, Any],
+    keyframe: bool,
+    config: dict[str, Any],
+    logger: logging.Logger | None = None,
+) -> bool:
+    if not scan.get("active") or not points:
+        return False
+    if should_skip_scan_by_turn(float(pose.get("wz", 0.0)), keyframe, config):
+        return False
+    if not pose_progress_exceeds_threshold(scan.get("last_accum_pose"), pose):
+        return False
+    scan["raw_points"] += len(points)
+    pose_x = float(pose.get("x", 0.0))
+    pose_y = float(pose.get("y", 0.0))
+    robot_ix, robot_iy = _world_to_cell(scan, pose_x, pose_y)
+    changed = False
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            if logger is not None:
+                logger.warning("skip invalid lidar point payload=%s", point)
+            continue
+        world_x, world_y = float(point[0]), float(point[1])
+        intensity = float(point[2]) if len(point) > 2 else 1.0
+        ix, iy = _world_to_cell(scan, world_x, world_y)
+        if keyframe:
+            _raytrace(scan, robot_ix, robot_iy, ix, iy)
+        _mark_occupied(scan, ix, iy, intensity)
+        changed = True
+    if not changed:
+        return False
+    scan["last_accum_pose"] = {
+        "x": float(pose.get("x", 0.0)),
+        "y": float(pose.get("y", 0.0)),
+        "yaw": float(pose.get("yaw", 0.0)),
+    }
+    prune_scan_cache(scan, config)
+    return True
 
 
 def runtime_base_dir() -> Path:
@@ -271,18 +579,19 @@ class ServerBridge:
             except Exception:
                 self.logger.exception("bridge ws close failed")
 
-    def post(self, path: str, body: dict, retries: int = 3) -> dict:
+    def post(self, path: str, body: dict, retries: int = 3, timeout_sec: float = 4.0, backoff_base_sec: float = 0.2) -> dict:
         last_err: Exception | None = None
         for index in range(retries + 1):
             try:
                 self.logger.info("http post path=%s try=%s", path, index + 1)
-                res = self.session.post(f"{self.http_base}{path}", json=body, timeout=4)
+                res = self.session.post(f"{self.http_base}{path}", json=body, timeout=timeout_sec)
                 res.raise_for_status()
                 return res.json()
             except Exception as exc:
                 last_err = exc
                 self.logger.warning("http post failed path=%s try=%s err=%s", path, index + 1, exc)
-                time.sleep(0.2 * (2**index))
+                if index < retries and backoff_base_sec > 0:
+                    time.sleep(backoff_base_sec * (2**index))
         raise RuntimeError(str(last_err))
 
     def post_async(self, path: str, body: dict, retries: int = 1) -> None:
@@ -370,6 +679,22 @@ class DesktopClient:
             "en": {
                 "title": "AutoDrive Desktop Map Tool",
                 "server_ws": "Server WS",
+                "login": "Login",
+                "relogin": "Re-login",
+                "login_title": "Login",
+                "login_ip": "Gateway IP",
+                "login_port": "Port",
+                "server_ip": "Server IP",
+                "server_port": "Server Port",
+                "password": "Password",
+                "auth_missing": "Not logged in",
+                "auth_ready": "Logged in as {user}",
+                "auth_bypass": "Debug direct mode",
+                "connect_need_login": "Please log in first.",
+                "login_empty_fields": "IP, username, and password are required.",
+                "login_failed": "Login bootstrap failed",
+                "login_failed_safe": "Login failed. Check credentials or gateway reachability.",
+                "connect_failed_safe": "Connection failed. See log for details.",
                 "connect": "Connect",
                 "disconnect": "Disconnect",
                 "refresh_cameras": "Refresh Cameras",
@@ -445,6 +770,8 @@ class DesktopClient:
                 "center_robot": "Center Robot",
                 "center_loaded_map": "Center Loaded Map",
                 "reset_view": "Reset View",
+                "zoom_out": "Zoom Out",
+                "zoom_in": "Zoom In",
                 "show_robot": "Show Robot",
                 "odom_scan": "Odom And Scan",
                 "cameras": "Cameras",
@@ -520,6 +847,22 @@ class DesktopClient:
             "zh": {
                 "title": "AutoDrive 桌面扫图工具",
                 "server_ws": "服务端 WS",
+                "login": "登录",
+                "relogin": "重新登录",
+                "login_title": "登录",
+                "login_ip": "网关 IP",
+                "login_port": "端口",
+                "server_ip": "服务端 IP",
+                "server_port": "服务端端口",
+                "password": "密码",
+                "auth_missing": "未登录",
+                "auth_ready": "已登录 {user}",
+                "auth_bypass": "调试直连模式",
+                "connect_need_login": "请先登录。",
+                "login_empty_fields": "IP、用户名、密码都必须填写。",
+                "login_failed": "登录引导失败",
+                "login_failed_safe": "登录失败。请检查账号、密码或网关连通性。",
+                "connect_failed_safe": "连接失败。详细信息见日志。",
                 "connect": "连接",
                 "disconnect": "断开",
                 "refresh_cameras": "刷新相机",
@@ -595,6 +938,8 @@ class DesktopClient:
                 "center_robot": "居中机器人",
                 "center_loaded_map": "居中已加载地图",
                 "reset_view": "重置视图",
+                "zoom_out": "缩小",
+                "zoom_in": "放大",
                 "show_robot": "显示机器人",
                 "odom_scan": "里程计和扫描",
                 "cameras": "相机",
@@ -674,6 +1019,7 @@ class DesktopClient:
         self.root.title(self.tr("title"))
         self.root.geometry("1760x980")
         self.root.minsize(1380, 860)
+        self.client_config = load_desktop_client_config()
         self.log_path = self.setup_logging()
         self.logger = logging.getLogger("autodrive.client_desktop")
         self.root.report_callback_exception = self.report_callback_exception
@@ -712,9 +1058,18 @@ class DesktopClient:
             "raw_points": 0,
             "occupied": {},
             "free": {},
+            "last_accum_pose": None,
             "last_saved_file": "",
             "saved_point_count": 0,
         }
+        self.scan_lock = threading.Lock()
+        self.scan_frame_buffer = LatestScanFrameBuffer()
+        self.scan_worker_event = threading.Event()
+        self.scan_worker_stop = threading.Event()
+        self.canvas_dirty = True
+        self.canvas_revision = 0
+        self.last_render_revision = -1
+        self.scan_badges_dirty = False
         self.scan_fusion = resolve_scan_fusion_config("indoor_balanced")
         self.edit = {
             "tool": "view",
@@ -725,7 +1080,10 @@ class DesktopClient:
         }
         self.view = {"scale": 25.0, "pan_x": 0.0, "pan_y": 0.0, "dragging": False, "moved": False, "last_xy": (0, 0)}
         self.keys_down: set[str] = set()
-        self.drive_loop_scheduled = False
+        self.control_lock = threading.Lock()
+        self.control_target: tuple[str, dict, str] | None = None
+        self.control_sender_event = threading.Event()
+        self.control_sender_stop = threading.Event()
         self.pending_keyup_stop_id = None
         self.last_message_at_ms = 0
         self.last_health_poll_at = 0.0
@@ -735,7 +1093,14 @@ class DesktopClient:
         self.text_cache: dict[int, str] = {}
         self.responsive_rows: list[dict] = []
 
-        self.server_var = tk.StringVar(value="ws://127.0.0.1:8080/ws/stream")
+        self.server_var = tk.StringVar(value="")
+        self.login_ip_var = tk.StringVar(value=str(self.client_config.get("gateway_ip", "192.168.3.56")))
+        self.login_port_var = tk.StringVar(value=str(self.client_config.get("gateway_port", 28080)))
+        self.direct_server_ip_var = tk.StringVar(value=str(self.client_config.get("server_ip", "127.0.0.1")))
+        self.direct_server_port_var = tk.StringVar(value=str(self.client_config.get("server_port", 8080)))
+        self.login_user_var = tk.StringVar(value=str(self.client_config.get("username", "admin")))
+        self.login_password_var = tk.StringVar(value="")
+        self.auth_status_var = tk.StringVar(value=self.tr("auth_missing"))
         self.conn_var = tk.StringVar(value="Disconnected")
         self.status_var = tk.StringVar(value=self.tr("ws_offline"))
         self.status_detail_var = tk.StringVar(value=self.tr("no_health"))
@@ -805,6 +1170,7 @@ class DesktopClient:
             "last_api_error": "",
             "last_seq": {},
         }
+        self.auth_context = {"base_url": "", "user_name": "", "token": "", "http_url": "", "ws_url": ""}
 
         self._style()
         self._ui()
@@ -816,6 +1182,10 @@ class DesktopClient:
         self.root.bind("<Button-5>", self.on_mousewheel)
         self.root.bind("<Button-1>", self.on_root_click, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.scan_worker = threading.Thread(target=self._scan_worker_loop, daemon=True, name="scan-worker")
+        self.scan_worker.start()
+        self.control_sender_thread = threading.Thread(target=self._control_sender_loop, daemon=True, name="control-sender")
+        self.control_sender_thread.start()
         self.tick()
 
     def setup_logging(self) -> str:
@@ -884,6 +1254,10 @@ class DesktopClient:
             )
         )
         self.status_var.set(self.tr("ws_offline") if not (self.bridge and self.bridge.connected) else self.status_var.get())
+        if not bool(self.client_config.get("login_required", True)):
+            self.auth_status_var.set(self.tr("auth_bypass"))
+        else:
+            self.auth_status_var.set(self.tr("auth_ready", user=self.auth_context["user_name"]) if self.auth_context.get("user_name") else self.tr("auth_missing"))
         if not self.poi_status_var.get():
             self.poi_status_var.set(self.tr("poi_idle"))
         self.sync_scan_badges()
@@ -922,8 +1296,7 @@ class DesktopClient:
 
         top = ttk.Frame(shell, padding=8)
         top.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(top, text=self.tr("server_ws")).pack(side=tk.LEFT)
-        ttk.Entry(top, textvariable=self.server_var, width=42).pack(side=tk.LEFT, padx=6)
+        ttk.Button(top, text=self.tr("login"), command=self.open_login_dialog).pack(side=tk.LEFT, padx=4)
         ttk.Button(top, text=self.tr("connect"), command=self.connect).pack(side=tk.LEFT, padx=4)
         ttk.Button(top, text=self.tr("disconnect"), command=self.disconnect).pack(side=tk.LEFT, padx=4)
         ttk.Button(top, text=self.tr("refresh_cameras"), command=self.refresh_camera_snapshot).pack(side=tk.LEFT, padx=4)
@@ -931,6 +1304,7 @@ class DesktopClient:
         lang_box = ttk.Combobox(top, textvariable=self.lang_choice_var, state="readonly", width=10, values=[self.tr("english"), self.tr("chinese")])
         lang_box.pack(side=tk.LEFT, padx=(0, 8))
         lang_box.bind("<<ComboboxSelected>>", self.on_language_change)
+        ttk.Label(top, textvariable=self.auth_status_var, style="Muted.TLabel").pack(side=tk.LEFT, padx=(14, 8))
         ttk.Label(top, textvariable=self.conn_var).pack(side=tk.LEFT, padx=(14, 4))
         ttk.Label(top, textvariable=self.status_var, style="Muted.TLabel").pack(side=tk.LEFT, padx=(4, 8))
         ttk.Label(top, textvariable=self.status_detail_var, style="Muted.TLabel").pack(side=tk.LEFT)
@@ -1009,7 +1383,7 @@ class DesktopClient:
             width=18,
         )
         preset_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-        preset_box.bind("<<ComboboxSelected>>", lambda _e: self.apply_scan_fusion_config_from_ui())
+        preset_box.bind("<<ComboboxSelected>>", lambda _e: self.on_scan_fusion_preset_selected())
         self._entry(card, self.tr("voxel"), self.voxel_var)
         self._entry(card, "Min Occupied Hits", self.occupied_min_hits_var)
         self._entry(card, "Occ/Free Ratio", self.occupied_over_free_ratio_var)
@@ -1165,6 +1539,8 @@ class DesktopClient:
         ttk.Button(row, text=self.tr("center_robot"), command=self.center_robot).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(row, text=self.tr("center_loaded_map"), command=self.center_loaded_map).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text=self.tr("reset_view"), command=self.reset_view).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text="-", width=3, command=lambda: self.zoom_view(1 / 1.2), takefocus=False).pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Button(row, text="+", width=3, command=lambda: self.zoom_view(1.2), takefocus=False).pack(side=tk.LEFT, padx=4)
         ttk.Checkbutton(row, text=self.tr("show_robot"), variable=self.show_robot_var).pack(side=tk.LEFT, padx=8)
         ttk.Label(row, textvariable=self.view_metrics_var, style="Muted.TLabel").pack(side=tk.RIGHT)
         badges = ttk.Frame(card)
@@ -1306,10 +1682,71 @@ class DesktopClient:
             )
         )
 
+    def open_login_dialog(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(self.tr("login_title"))
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        body = ttk.Frame(dialog, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        if bool(self.client_config.get("login_required", True)):
+            self._entry(body, self.tr("login_ip"), self.login_ip_var)
+            self._entry(body, self.tr("login_port"), self.login_port_var)
+            self._entry(body, self.tr("name"), self.login_user_var)
+            row = ttk.Frame(body)
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=self.tr("password"), width=18).pack(side=tk.LEFT)
+            ttk.Entry(row, textvariable=self.login_password_var, show="*").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        else:
+            self._entry(body, self.tr("server_ip"), self.direct_server_ip_var)
+            self._entry(body, self.tr("server_port"), self.direct_server_port_var)
+        actions = ttk.Frame(body)
+        actions.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(actions, text=self.tr("connect"), command=lambda: self.login_and_connect(dialog)).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(actions, text=self.tr("disconnect"), command=dialog.destroy).pack(side=tk.LEFT)
+        dialog.bind("<Return>", lambda _e: self.login_and_connect(dialog))
+        dialog.wait_visibility()
+        dialog.focus_set()
+
+    def login_and_connect(self, dialog: tk.Toplevel | None = None) -> None:
+        if not bool(self.client_config.get("login_required", True)):
+            if dialog is not None:
+                dialog.destroy()
+            self.connect()
+            return
+        base_url = compose_http_base_url(self.login_ip_var.get().strip(), self.login_port_var.get().strip())
+        username = self.login_user_var.get().strip()
+        password = self.login_password_var.get().strip()
+        if not base_url or not username or not password:
+            messagebox.showwarning(self.tr("login_title"), self.tr("login_empty_fields"))
+            return
+        try:
+            context = bootstrap_authenticated_bridge(base_url, username, password)
+            self.auth_context = dict(context)
+            self.auth_status_var.set(self.tr("auth_ready", user=context["user_name"]))
+            self.server_var.set(context["ws_url"])
+            if dialog is not None:
+                dialog.destroy()
+            self.connect()
+        except Exception as exc:
+            self.stream_health["last_api_error"] = str(exc)
+            self.logger.exception("login bootstrap failed")
+            user_message = exc.user_message if isinstance(exc, AuthFlowError) else self.tr("login_failed_safe")
+            messagebox.showerror(self.tr("login_failed"), user_message)
+
     def connect(self) -> None:
         try:
             self.disconnect()
-            raw_url = self.server_var.get().strip()
+            if not bool(self.client_config.get("login_required", True)):
+                raw_url = build_direct_ws_url(self.direct_server_ip_var.get().strip(), self.direct_server_port_var.get().strip())
+                self.auth_status_var.set(self.tr("auth_bypass"))
+            else:
+                raw_url = self.auth_context.get("ws_url", "").strip()
+                if not raw_url:
+                    messagebox.showwarning(self.tr("connect"), self.tr("connect_need_login"))
+                    self.open_login_dialog()
+                    return
             normalized_url = normalize_server_ws_url(raw_url)
             self.server_var.set(normalized_url)
             self.logger.info("connect clicked ws_url=%s", normalized_url)
@@ -1325,11 +1762,11 @@ class DesktopClient:
         except Exception as exc:
             self.stream_health["last_api_error"] = str(exc)
             self.logger.exception("connect preflight failed")
-            messagebox.showerror(self.tr("api_error"), f"Connect preflight failed:\n{exc}")
+            messagebox.showerror(self.tr("api_error"), self.tr("connect_failed_safe"))
             self.bridge = None
             self.conn_var.set(self.tr("disconnected"))
             self.status_var.set(self.tr("ws_offline"))
-            self.status_detail_var.set(str(exc))
+            self.status_detail_var.set(redact_sensitive_text(str(exc)))
 
     def disconnect(self) -> None:
         self.logger.info("disconnect clicked")
@@ -1351,7 +1788,7 @@ class DesktopClient:
             self.stream_health["retries_http"] += 1
             self.stream_health["last_api_error"] = str(exc)
             self.logger.exception("call_api failed path=%s", path)
-            messagebox.showerror(self.tr("api_error"), str(exc))
+            messagebox.showerror(self.tr("api_error"), self.tr("connect_failed_safe"))
             return None
 
     def call_api_async(self, path: str, body: dict) -> None:
@@ -1375,8 +1812,11 @@ class DesktopClient:
 
     def tick(self) -> None:
         self.consume_messages()
+        if self.scan_badges_dirty:
+            self.scan_badges_dirty = False
+            self.sync_scan_badges()
         self.poll_health()
-        self.render_canvas()
+        self.render_canvas_if_needed()
         self.render_text_panels()
         self.conn_var.set(self.tr("connected") if self.bridge and self.bridge.connected else self.tr("disconnected"))
         self.status_var.set(
@@ -1422,6 +1862,7 @@ class DesktopClient:
     def consume_messages(self) -> None:
         if not self.bridge:
             return
+        drained: list[dict[str, Any]] = []
         while True:
             try:
                 msg = self.bridge.queue.get_nowait()
@@ -1429,31 +1870,77 @@ class DesktopClient:
                 break
             if not self.validate_message(msg):
                 continue
+            if len(drained) < MAX_MESSAGES_DRAIN_PER_TICK:
+                drained.append(msg)
+            else:
+                drained.pop(0)
+                drained.append(msg)
+        processed = 0
+        for msg in coalesce_stream_messages(drained):
+            if processed >= MAX_MESSAGES_PER_TICK:
+                break
+            processed += 1
             topic = msg.get("topic")
             payload = msg.get("payload", {})
             if topic == "/robot/pose":
                 self.pose = payload
+                self.mark_canvas_dirty()
             elif topic == "/robot/gps":
                 self.gps = payload
             elif topic == "/chassis/odom":
                 self.odom = payload
                 self.pose_history.append({"stamp": float(msg.get("stamp", time.time())), "pose": dict(payload)})
                 self.pose_history = self.pose_history[-240:]
+                self.mark_canvas_dirty()
             elif topic == "/chassis/status":
                 self.chassis = payload
             elif topic == "/lidar/front":
                 self.scan["front_frames"] += 1
                 self.last_scan["front"] = {"raw_points": int(payload.get("raw_points", len(payload.get("points", [])))), "keyframe": bool(payload.get("keyframe")), "stamp": float(msg.get("stamp", 0))}
-                self.accumulate_points(payload.get("points", []), float(msg.get("stamp", 0)), bool(payload.get("keyframe")))
+                self.queue_scan_frame(payload.get("points", []), float(msg.get("stamp", 0)), bool(payload.get("keyframe")))
             elif topic == "/lidar/rear":
                 self.scan["rear_frames"] += 1
                 self.last_scan["rear"] = {"raw_points": int(payload.get("raw_points", len(payload.get("points", [])))), "keyframe": bool(payload.get("keyframe")), "stamp": float(msg.get("stamp", 0))}
-                self.accumulate_points(payload.get("points", []), float(msg.get("stamp", 0)), bool(payload.get("keyframe")))
+                self.queue_scan_frame(payload.get("points", []), float(msg.get("stamp", 0)), bool(payload.get("keyframe")))
             elif topic and topic.startswith("/camera/"):
                 cam_id = parse_camera_topic_id(topic)
                 if cam_id is not None and cam_id in self.camera_inbox:
                     self.camera_inbox[cam_id] = {"objects": payload.get("objects", []), "meta": {"seq": msg.get("seq"), "stamp": msg.get("stamp"), "received_at_ms": int(time.time() * 1000)}}
         self.camera_refresh_var.set(build_camera_refresh_text(self.camera_inbox))
+
+    def queue_scan_frame(self, points: list[Any], stamp: float, keyframe: bool) -> None:
+        if not self.scan["active"] or not points:
+            return
+        frame = {
+            "points": points,
+            "stamp": float(stamp),
+            "keyframe": bool(keyframe),
+            "pose": dict(self.pose_for_stamp(stamp)),
+            "config": self.effective_scan_fusion_config(),
+        }
+        self.scan_frame_buffer.submit(frame)
+        self.scan_worker_event.set()
+
+    def _scan_worker_loop(self) -> None:
+        while not self.scan_worker_stop.is_set():
+            self.scan_worker_event.wait(timeout=0.2)
+            self.scan_worker_event.clear()
+            while True:
+                frame = self.scan_frame_buffer.pop_latest()
+                if frame is None:
+                    break
+                with self.scan_lock:
+                    changed = process_scan_frame(
+                        self.scan,
+                        points=frame["points"],
+                        pose=frame["pose"],
+                        keyframe=bool(frame["keyframe"]),
+                        config=frame["config"],
+                        logger=self.logger if hasattr(self, "logger") else None,
+                    )
+                if changed:
+                    self.scan_badges_dirty = True
+                    self.mark_canvas_dirty()
 
     def start_scan(self) -> None:
         response = self.call_api("/scan/start", {})
@@ -1477,13 +1964,15 @@ class DesktopClient:
             self.sync_scan_badges()
 
     def clear_scan(self) -> None:
-        self.scan["occupied"] = {}
-        self.scan["free"] = {}
-        self.scan["front_frames"] = 0
-        self.scan["rear_frames"] = 0
-        self.scan["raw_points"] = 0
-        self.scan["saved_point_count"] = 0
-        self.scan["last_saved_file"] = ""
+        with self.scan_lock:
+            self.scan["occupied"] = {}
+            self.scan["free"] = {}
+            self.scan["front_frames"] = 0
+            self.scan["rear_frames"] = 0
+            self.scan["raw_points"] = 0
+            self.scan["last_accum_pose"] = None
+            self.scan["saved_point_count"] = 0
+            self.scan["last_saved_file"] = ""
         self.sync_scan_badges()
 
     def sync_scan_badges(self) -> None:
@@ -1500,6 +1989,11 @@ class DesktopClient:
         suffix = " | Pick end point" if self.edit["tool"] == "obstacle" and self.edit["pending_obstacle_start"] else ""
         self.tool_badge_var.set(self.tr("tool_badge", name=tool_map.get(self.edit["tool"], self.tr("tool_view_select")), suffix=suffix))
         self.stats_badge_var.set(self.tr("stats_badge", occ=occ, poi=len(self.poi_nodes), path=len(self.path_segments)))
+        self.mark_canvas_dirty()
+
+    def mark_canvas_dirty(self) -> None:
+        self.canvas_dirty = True
+        self.canvas_revision += 1
 
     def cell_key(self, ix: int, iy: int) -> str:
         return f"{ix}:{iy}"
@@ -1534,31 +2028,20 @@ class DesktopClient:
     def apply_scan_fusion_config_from_ui(self) -> dict:
         return self.apply_scan_fusion_config(self.effective_scan_fusion_config(), update_vars=True)
 
+    def on_scan_fusion_preset_selected(self) -> dict:
+        return self.apply_scan_fusion_config({"preset": self.scan_fusion_preset_var.get()}, update_vars=True)
+
     def occupied_lookup(self) -> dict[tuple[int, int], dict]:
         return {(int(cell["ix"]), int(cell["iy"])): cell for cell in self.scan["occupied"].values()}
 
     def mark_free(self, ix: int, iy: int) -> None:
-        key = self.cell_key(ix, iy)
-        slot = self.scan["free"].get(key, {"ix": ix, "iy": iy, "hits": 0})
-        slot["hits"] += 1
-        self.scan["free"][key] = slot
+        _mark_free(self.scan, ix, iy)
 
     def mark_occupied(self, ix: int, iy: int, intensity: float, hits: int = 1) -> None:
-        key = self.cell_key(ix, iy)
-        slot = self.scan["occupied"].get(key, {"ix": ix, "iy": iy, "hits": 0, "intensity": 0.0})
-        slot["hits"] = max(int(slot["hits"]) + hits, hits)
-        slot["intensity"] = max(float(slot["intensity"]), float(intensity))
-        self.scan["occupied"][key] = slot
+        _mark_occupied(self.scan, ix, iy, intensity, hits)
 
     def raytrace(self, start_x: int, start_y: int, end_x: int, end_y: int) -> None:
-        dx = end_x - start_x
-        dy = end_y - start_y
-        steps = max(abs(dx), abs(dy))
-        if steps <= 1:
-            return
-        for step in range(steps):
-            t = step / steps
-            self.mark_free(round(start_x + dx * t), round(start_y + dy * t))
+        _raytrace(self.scan, start_x, start_y, end_x, end_y)
 
     def pose_for_stamp(self, stamp: float) -> dict:
         if not self.pose_history:
@@ -1573,32 +2056,42 @@ class DesktopClient:
         return best["pose"]
 
     def accumulate_points(self, points: list, stamp: float, keyframe: bool) -> None:
-        if not self.scan["active"] or not points:
-            return
-        config = self.apply_scan_fusion_config_from_ui()
-        pose = self.pose_for_stamp(stamp)
-        if should_skip_scan_by_turn(float(pose.get("wz", 0.0)), keyframe, config):
-            return
-        self.scan["raw_points"] += len(points)
-        robot_ix, robot_iy = self.world_to_cell(float(pose.get("x", 0.0)), float(pose.get("y", 0.0)))
-        for point in points:
-            if not isinstance(point, (list, tuple)) or len(point) < 2:
-                self.logger.warning("skip invalid lidar point payload=%s", point)
-                continue
-            x, y = float(point[0]), float(point[1])
-            intensity = float(point[2]) if len(point) > 2 else 1.0
-            ix, iy = self.world_to_cell(x, y)
-            self.raytrace(robot_ix, robot_iy, ix, iy)
-            self.mark_occupied(ix, iy, intensity)
-        self.sync_scan_badges()
+        with self.scan_lock:
+            changed = process_scan_frame(
+                self.scan,
+                points=points,
+                pose=self.pose_for_stamp(stamp),
+                keyframe=keyframe,
+                config=self.apply_scan_fusion_config_from_ui(),
+                logger=self.logger,
+            )
+        if changed:
+            self.sync_scan_badges()
 
-    def occupied_points(self) -> list[list[float]]:
+    def filtered_occupancy_cells(self) -> list[dict]:
         config = self.effective_scan_fusion_config()
-        points = []
+        cells: list[dict] = []
         for cell in self.scan["occupied"].values():
             free = self.scan["free"].get(self.cell_key(int(cell["ix"]), int(cell["iy"])))
             if not is_occupied_scan_cell(cell, free, config):
                 continue
+            cells.append({"ix": int(cell["ix"]), "iy": int(cell["iy"]), "hits": int(cell["hits"]), "intensity": float(cell["intensity"])})
+        return cells
+
+    def filtered_free_cells(self) -> list[dict]:
+        occupied_by_key = {self.cell_key(int(cell["ix"]), int(cell["iy"])): cell for cell in self.scan["occupied"].values()}
+        cells: list[dict] = []
+        for cell in self.scan["free"].values():
+            occ = occupied_by_key.get(self.cell_key(int(cell["ix"]), int(cell["iy"])))
+            occ_hits = int(occ["hits"]) if occ else 0
+            if int(cell["hits"]) <= occ_hits * 0.8:
+                continue
+            cells.append({"ix": int(cell["ix"]), "iy": int(cell["iy"]), "hits": int(cell["hits"])})
+        return cells
+
+    def occupied_points(self) -> list[list[float]]:
+        points = []
+        for cell in self.filtered_occupancy_cells():
             points.append([float(cell["ix"]) * float(self.scan["voxel"]), float(cell["iy"]) * float(self.scan["voxel"]), float(cell["intensity"])])
         return points or [[0.0, 0.0, 1.0]]
 
@@ -1607,8 +2100,8 @@ class DesktopClient:
         return {
             "voxel_size": float(self.scan["voxel"]),
             "scan_fusion": build_scan_fusion_metadata(config),
-            "occupied_cells": [{"ix": int(c["ix"]), "iy": int(c["iy"]), "hits": int(c["hits"]), "intensity": float(c["intensity"])} for c in self.scan["occupied"].values()],
-            "free_cells": [{"ix": int(c["ix"]), "iy": int(c["iy"]), "hits": int(c["hits"])} for c in self.scan["free"].values()],
+            "occupied_cells": self.filtered_occupancy_cells(),
+            "free_cells": self.filtered_free_cells(),
         }
 
     def point_from_poi(self, poi: Poi) -> Point:
@@ -2002,13 +2495,19 @@ class DesktopClient:
         self.camera_refresh_var.set(self.camera_refresh_var.get().replace("Buffered", "Displayed", 1) if "Buffered" in self.camera_refresh_var.get() else self.camera_refresh_var.get())
 
     def move_click(self, name: str) -> None:
+        command = self.build_control_command(name)
+        if command is None:
+            return
+        path, body, _label = command
+        self.call_api_async(path, body)
+
+    def build_control_command(self, name: str) -> tuple[str, dict, str] | None:
         fwd = self.number(self.forward_var, 0.8)
         rev = self.number(self.reverse_var, 0.5)
         turn = self.number(self.turn_var, 1.0)
         dur = self.number(self.duration_var, 0.15)
         if name == "stop":
-            self.call_api_async("/control/stop", {})
-            return
+            return ("/control/stop", {}, "stop")
         if name == "forward":
             body = {"velocity": fwd, "yaw_rate": 0.0, "duration": dur}
         elif name == "reverse":
@@ -2017,7 +2516,7 @@ class DesktopClient:
             body = {"velocity": 0.0, "yaw_rate": turn, "duration": dur}
         else:
             body = {"velocity": 0.0, "yaw_rate": -turn, "duration": dur}
-        self.call_api_async("/control/move", body)
+        return ("/control/move", body, name)
 
     def keyboard_command(self) -> str | None:
         if "space" in self.keys_down:
@@ -2032,21 +2531,55 @@ class DesktopClient:
             return "right"
         return None
 
-    def drive_loop(self) -> None:
-        self.drive_loop_scheduled = False
-        cmd = self.keyboard_command()
-        if cmd is None:
+    def clear_control_target(self) -> None:
+        with self.control_lock:
+            self.control_target = None
+        self.control_sender_event.set()
+
+    def update_control_target(self, name: str | None) -> None:
+        if name is None:
+            self.clear_control_target()
             return
-        self.move_click(cmd)
-        self.keyboard_var.set(self.tr("keyboard_cmd", cmd=cmd))
-        self.drive_loop_scheduled = True
-        self.root.after(max(60, int(self.number(self.repeat_ms_var, 120))), self.drive_loop)
+        command = self.build_control_command(name)
+        if command is None:
+            return
+        with self.control_lock:
+            self.control_target = command
+        self.control_sender_event.set()
+
+    def send_control_command_now(self, path: str, body: dict) -> None:
+        bridge = self.bridge
+        if bridge is None or not bridge.connected:
+            return
+        bridge.post(path, body, retries=0, timeout_sec=0.35, backoff_base_sec=0.0)
+
+    def _control_sender_loop(self) -> None:
+        while not self.control_sender_stop.is_set():
+            self.control_sender_event.wait(timeout=0.2)
+            self.control_sender_event.clear()
+            while not self.control_sender_stop.is_set():
+                with self.control_lock:
+                    command = self.control_target
+                if command is None:
+                    break
+                path, body, label = command
+                try:
+                    self.send_control_command_now(path, body)
+                except Exception as exc:
+                    if hasattr(self, "stream_health"):
+                        self.stream_health["retries_http"] += 1
+                        self.stream_health["last_api_error"] = str(exc)
+                    if hasattr(self, "logger"):
+                        self.logger.warning("control sender failed path=%s err=%s", path, exc)
+                interval_s = max(0.04, self.number(self.repeat_ms_var, 120) / 1000.0)
+                if self.control_sender_event.wait(timeout=interval_s):
+                    self.control_sender_event.clear()
 
     def ensure_drive_loop(self) -> None:
-        if self.drive_loop_scheduled:
-            return
-        self.drive_loop_scheduled = True
-        self.root.after(0, self.drive_loop)
+        command = self.keyboard_command()
+        self.update_control_target(command)
+        if command is not None:
+            self.keyboard_var.set(self.tr("keyboard_cmd", cmd=command))
 
     def cancel_pending_keyup_stop(self) -> None:
         if self.pending_keyup_stop_id is None:
@@ -2061,6 +2594,7 @@ class DesktopClient:
         self.pending_keyup_stop_id = None
         if not self.stop_on_keyup_var.get() or self.keys_down:
             return
+        self.clear_control_target()
         self.move_click("stop")
         self.keyboard_var.set(self.tr("keyboard_stop_keyup"))
 
@@ -2085,7 +2619,11 @@ class DesktopClient:
             return
         key = event.keysym.lower()
         self.keys_down.discard(key)
-        if self.stop_on_keyup_var.get() and not self.keys_down:
+        if self.keys_down:
+            self.ensure_drive_loop()
+            return
+        self.clear_control_target()
+        if self.stop_on_keyup_var.get():
             self.schedule_keyup_stop()
 
     def edit_tool_changed(self) -> None:
@@ -2234,10 +2772,21 @@ class DesktopClient:
         factor = zoom_scale_factor(event)
         if factor == 1.0:
             return
+        self.zoom_view(factor, anchor=(x, y), screen_xy=(event.x, event.y))
+
+    def zoom_view(
+        self,
+        factor: float,
+        anchor: tuple[float, float] | None = None,
+        screen_xy: tuple[float, float] | None = None,
+    ) -> None:
+        if factor <= 0:
+            return
         self.view["scale"] = max(8.0, min(80.0, self.view["scale"] * factor))
-        sx, sy = self.world_to_screen(x, y)
-        self.view["pan_x"] += event.x - sx
-        self.view["pan_y"] += event.y - sy
+        if anchor is not None and screen_xy is not None:
+            sx, sy = self.world_to_screen(anchor[0], anchor[1])
+            self.view["pan_x"] += screen_xy[0] - sx
+            self.view["pan_y"] += screen_xy[1] - sy
         self.update_view_metrics()
 
     def on_root_click(self, event: tk.Event) -> None:
@@ -2268,8 +2817,16 @@ class DesktopClient:
         pan_x = -self.view["pan_x"] / self.view["scale"]
         pan_y = self.view["pan_y"] / self.view["scale"]
         self.view_metrics_var.set(f"Pan {pan_x:.2f}, {pan_y:.2f} | Zoom {self.view['scale']:.1f} px/m")
+        self.mark_canvas_dirty()
 
-    def render_canvas(self) -> None:
+    def render_canvas_if_needed(self) -> None:
+        if not self.canvas_dirty and self.last_render_revision == self.canvas_revision:
+            return
+        self.render_canvas_contents()
+        self.last_render_revision = self.canvas_revision
+        self.canvas_dirty = False
+
+    def render_canvas_contents(self) -> None:
         self.canvas.delete("all")
         width = max(1, self.canvas.winfo_width())
         height = max(1, self.canvas.winfo_height())
@@ -2304,17 +2861,13 @@ class DesktopClient:
 
     def draw_cells(self) -> None:
         size = max(2.0, float(self.scan["voxel"]) * self.view["scale"])
-        for cell in self.scan["free"].values():
-            occ = self.scan["occupied"].get(self.cell_key(int(cell["ix"]), int(cell["iy"])))
-            occ_hits = int(occ["hits"]) if occ else 0
-            if int(cell["hits"]) <= occ_hits * 0.8:
-                continue
+        with self.scan_lock:
+            free_cells = [dict(cell) for cell in self.filtered_free_cells()]
+            occupied_cells = [dict(cell) for cell in self.filtered_occupancy_cells()]
+        for cell in free_cells:
             sx, sy = self.world_to_screen(float(cell["ix"]) * float(self.scan["voxel"]), float(cell["iy"]) * float(self.scan["voxel"]))
             self.canvas.create_rectangle(sx - size / 2, sy - size / 2, sx + size / 2, sy + size / 2, fill="#ffffff", outline="")
-        for cell in self.scan["occupied"].values():
-            free = self.scan["free"].get(self.cell_key(int(cell["ix"]), int(cell["iy"])))
-            if not is_occupied_scan_cell(cell, free, self.effective_scan_fusion_config()):
-                continue
+        for cell in occupied_cells:
             sx, sy = self.world_to_screen(float(cell["ix"]) * float(self.scan["voxel"]), float(cell["iy"]) * float(self.scan["voxel"]))
             self.canvas.create_rectangle(sx - size / 2, sy - size / 2, sx + size / 2, sy + size / 2, fill="#0c0f12", outline="")
 
@@ -2515,17 +3068,25 @@ class DesktopClient:
         messagebox.showinfo(self.tr("save_title"), self.tr("save_done", path=target))
 
     def load_stcm(self) -> None:
-        target = filedialog.askopenfilename(parent=self.root, filetypes=[("SLAM", "*.slam"), ("ZIP", "*.zip")])
+        target = filedialog.askopenfilename(parent=self.root, filetypes=[("SLAM / ZIP / YAML / PGM", "*.slam *.zip *.yaml *.yml *.pgm"), ("SLAM", "*.slam"), ("ZIP", "*.zip"), ("YAML", "*.yaml *.yml"), ("PGM", "*.pgm")])
         if not target:
             return
-        with zipfile.ZipFile(target, "r") as zf:
-            manifest = json.loads(zf.read("manifest.json"))
-            raw = zf.read("radar_points.bin")
-        points = [struct.unpack("fff", raw[i:i + 12]) for i in range(0, len(raw), 12) if i + 12 <= len(raw)]
-        self.apply_stcm(Path(target).name, manifest, points)
-        self.set_inspector_bundle_state(Path(target).name, manifest, points)
+        suffix = Path(target).suffix.lower()
+        if suffix in {".yaml", ".yml", ".pgm"}:
+            loaded = NativeMapImportTool.import_map(target)
+            file_name = loaded.file_name
+            manifest = loaded.manifest
+            points = loaded.radar_points
+        else:
+            with zipfile.ZipFile(target, "r") as zf:
+                manifest = json.loads(zf.read("manifest.json"))
+                raw = zf.read("radar_points.bin")
+            points = [struct.unpack("fff", raw[i:i + 12]) for i in range(0, len(raw), 12) if i + 12 <= len(raw)]
+            file_name = Path(target).name
+        self.apply_stcm(file_name, manifest, points)
+        self.set_inspector_bundle_state(file_name, manifest, points)
         self.logger.info("map loaded path=%s points=%s", target, len(points))
-        messagebox.showinfo(self.tr("load_title"), self.tr("load_done", name=Path(target).name))
+        messagebox.showinfo(self.tr("load_title"), self.tr("load_done", name=file_name))
 
     def apply_stcm(self, file_name: str, manifest: dict, points: list[tuple[float, float, float]]) -> None:
         self.clear_scan()
@@ -2652,6 +3213,14 @@ class DesktopClient:
 
     def on_close(self) -> None:
         self.disconnect()
+        self.control_sender_stop.set()
+        self.control_sender_event.set()
+        if hasattr(self, "control_sender_thread") and self.control_sender_thread.is_alive():
+            self.control_sender_thread.join(timeout=1.0)
+        self.scan_worker_stop.set()
+        self.scan_worker_event.set()
+        if hasattr(self, "scan_worker") and self.scan_worker.is_alive():
+            self.scan_worker.join(timeout=1.0)
         self.root.destroy()
 
     def run(self) -> None:
