@@ -1062,6 +1062,7 @@ class DesktopClient:
             "last_saved_file": "",
             "saved_point_count": 0,
         }
+        self.server_grid = {"active": False, "resolution": 0.0, "occupied_cells": [], "free_cells": [], "stamp": 0.0}
         self.scan_lock = threading.Lock()
         self.scan_frame_buffer = LatestScanFrameBuffer()
         self.scan_worker_event = threading.Event()
@@ -1902,6 +1903,8 @@ class DesktopClient:
                 self.scan["rear_frames"] += 1
                 self.last_scan["rear"] = {"raw_points": int(payload.get("raw_points", len(payload.get("points", [])))), "keyframe": bool(payload.get("keyframe")), "stamp": float(msg.get("stamp", 0))}
                 self.queue_scan_frame(payload.get("points", []), float(msg.get("stamp", 0)), bool(payload.get("keyframe")))
+            elif topic == "/map/grid":
+                self.update_server_grid(payload, float(msg.get("stamp", 0)))
             elif topic and topic.startswith("/camera/"):
                 cam_id = parse_camera_topic_id(topic)
                 if cam_id is not None and cam_id in self.camera_inbox:
@@ -1976,8 +1979,8 @@ class DesktopClient:
         self.sync_scan_badges()
 
     def sync_scan_badges(self) -> None:
-        occ = len(self.scan["occupied"])
-        free = len(self.scan["free"])
+        occ = len(self.active_occupancy_cells())
+        free = len(self.active_free_cells())
         if self.scan["active"]:
             self.scan_state_var.set(self.tr("recording_obstacles", count=occ))
         elif occ or free:
@@ -2001,6 +2004,49 @@ class DesktopClient:
     def world_to_cell(self, x: float, y: float) -> tuple[int, int]:
         voxel = float(self.scan["voxel"])
         return round(x / voxel), round(y / voxel)
+
+    def world_to_cell_with_resolution(self, x: float, y: float, resolution: float) -> tuple[int, int]:
+        voxel = max(0.02, float(resolution))
+        return round(x / voxel), round(y / voxel)
+
+    def should_use_server_grid(self) -> bool:
+        server_grid = getattr(self, "server_grid", {}) or {}
+        edit = getattr(self, "edit", {}) or {}
+        return bool(server_grid.get("active")) and not bool(edit.get("loaded_from_stcm"))
+
+    def active_voxel_size(self) -> float:
+        if self.should_use_server_grid():
+            return max(0.02, float(getattr(self, "server_grid", {}).get("resolution", self.scan["voxel"])))
+        return float(self.scan["voxel"])
+
+    def active_occupancy_cells(self) -> list[dict]:
+        if self.should_use_server_grid():
+            return [dict(cell) for cell in getattr(self, "server_grid", {}).get("occupied_cells", [])]
+        return self.filtered_occupancy_cells()
+
+    def active_free_cells(self) -> list[dict]:
+        if self.should_use_server_grid():
+            return [dict(cell) for cell in getattr(self, "server_grid", {}).get("free_cells", [])]
+        return self.filtered_free_cells()
+
+    def update_server_grid(self, payload: dict[str, Any], stamp: float) -> None:
+        resolution = max(0.02, float(payload.get("resolution", getattr(self, "scan", {}).get("voxel", 0.08))))
+        occupied_cells: list[dict[str, int | float]] = []
+        free_cells: list[dict[str, int]] = []
+        for cell in payload.get("occupied", []):
+            ix, iy = self.world_to_cell_with_resolution(float(cell.get("x", 0.0)), float(cell.get("y", 0.0)), resolution)
+            occupied_cells.append({"ix": ix, "iy": iy, "hits": 3, "intensity": 1.0})
+        for cell in payload.get("free", []):
+            ix, iy = self.world_to_cell_with_resolution(float(cell.get("x", 0.0)), float(cell.get("y", 0.0)), resolution)
+            free_cells.append({"ix": ix, "iy": iy, "hits": 3})
+        self.server_grid = {
+            "active": True,
+            "resolution": resolution,
+            "occupied_cells": occupied_cells,
+            "free_cells": free_cells,
+            "stamp": float(stamp),
+        }
+        self.sync_scan_badges()
 
     def effective_scan_fusion_config(self) -> dict:
         overrides = {
@@ -2091,17 +2137,18 @@ class DesktopClient:
 
     def occupied_points(self) -> list[list[float]]:
         points = []
-        for cell in self.filtered_occupancy_cells():
-            points.append([float(cell["ix"]) * float(self.scan["voxel"]), float(cell["iy"]) * float(self.scan["voxel"]), float(cell["intensity"])])
+        voxel = self.active_voxel_size()
+        for cell in self.active_occupancy_cells():
+            points.append([float(cell["ix"]) * voxel, float(cell["iy"]) * voxel, float(cell.get("intensity", 1.0))])
         return points or [[0.0, 0.0, 1.0]]
 
     def browser_occupancy(self) -> dict:
         config = self.effective_scan_fusion_config()
         return {
-            "voxel_size": float(self.scan["voxel"]),
+            "voxel_size": self.active_voxel_size(),
             "scan_fusion": build_scan_fusion_metadata(config),
-            "occupied_cells": self.filtered_occupancy_cells(),
-            "free_cells": self.filtered_free_cells(),
+            "occupied_cells": self.active_occupancy_cells(),
+            "free_cells": self.active_free_cells(),
         }
 
     def point_from_poi(self, poi: Poi) -> Point:
@@ -2799,12 +2846,13 @@ class DesktopClient:
         self.update_view_metrics()
 
     def center_loaded_map(self) -> None:
-        cells = list(self.scan["occupied"].values())
+        cells = self.active_occupancy_cells()
         if not cells:
             self.center_robot()
             return
-        xs = [float(cell["ix"]) * float(self.scan["voxel"]) for cell in cells]
-        ys = [float(cell["iy"]) * float(self.scan["voxel"]) for cell in cells]
+        voxel = self.active_voxel_size()
+        xs = [float(cell["ix"]) * voxel for cell in cells]
+        ys = [float(cell["iy"]) * voxel for cell in cells]
         self.view["pan_x"] = -((min(xs) + max(xs)) / 2) * self.view["scale"]
         self.view["pan_y"] = ((min(ys) + max(ys)) / 2) * self.view["scale"]
         self.update_view_metrics()
@@ -2860,15 +2908,16 @@ class DesktopClient:
             y += spacing
 
     def draw_cells(self) -> None:
-        size = max(2.0, float(self.scan["voxel"]) * self.view["scale"])
+        voxel = self.active_voxel_size()
+        size = max(2.0, voxel * self.view["scale"])
         with self.scan_lock:
-            free_cells = [dict(cell) for cell in self.filtered_free_cells()]
-            occupied_cells = [dict(cell) for cell in self.filtered_occupancy_cells()]
+            free_cells = self.active_free_cells()
+            occupied_cells = self.active_occupancy_cells()
         for cell in free_cells:
-            sx, sy = self.world_to_screen(float(cell["ix"]) * float(self.scan["voxel"]), float(cell["iy"]) * float(self.scan["voxel"]))
+            sx, sy = self.world_to_screen(float(cell["ix"]) * voxel, float(cell["iy"]) * voxel)
             self.canvas.create_rectangle(sx - size / 2, sy - size / 2, sx + size / 2, sy + size / 2, fill="#ffffff", outline="")
         for cell in occupied_cells:
-            sx, sy = self.world_to_screen(float(cell["ix"]) * float(self.scan["voxel"]), float(cell["iy"]) * float(self.scan["voxel"]))
+            sx, sy = self.world_to_screen(float(cell["ix"]) * voxel, float(cell["iy"]) * voxel)
             self.canvas.create_rectangle(sx - size / 2, sy - size / 2, sx + size / 2, sy + size / 2, fill="#0c0f12", outline="")
 
     def draw_pending_obstacle(self) -> None:
@@ -3006,7 +3055,7 @@ class DesktopClient:
     def save_stcm(self) -> None:
         self.rebuild_path_nodes()
         config = self.apply_scan_fusion_config_from_ui()
-        voxel_size = float(self.scan["voxel"])
+        voxel_size = self.active_voxel_size()
         notes = {
             "text": self.map_notes_var.get().strip(),
             "voxelSize": voxel_size,
@@ -3021,7 +3070,7 @@ class DesktopClient:
             "notes": json.dumps(notes, ensure_ascii=False, indent=2),
             "created_at": time.time(),
             "source": "desktop",
-            "map_source": "stcm_editor" if self.edit["loaded_from_stcm"] else "laser_accumulation",
+            "map_source": "stcm_editor" if self.edit["loaded_from_stcm"] else "server_occupancy_grid" if self.should_use_server_grid() else "laser_accumulation",
             "scan_fusion": build_scan_fusion_metadata(config),
             "browser_occupancy": self.browser_occupancy(),
             "pose": self.pose,
@@ -3044,8 +3093,8 @@ class DesktopClient:
             "scan_summary": {
                 "scanActive": self.scan["active"],
                 "elapsedSec": round(max(0.0, (int(time.time() * 1000) - self.scan["started_ms"]) / 1000), 1) if self.scan["started_ms"] else 0.0,
-                "obstacleCells": len(self.scan["occupied"]),
-                "safeCells": len(self.scan["free"]),
+                "obstacleCells": len(self.active_occupancy_cells()),
+                "safeCells": len(self.active_free_cells()),
                 "rawLidarPoints": self.scan["raw_points"],
                 "frontFrames": self.scan["front_frames"],
                 "rearFrames": self.scan["rear_frames"],

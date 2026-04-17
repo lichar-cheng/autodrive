@@ -594,6 +594,95 @@ def test_browser_occupancy_filters_out_hidden_free_cells() -> None:
     assert payload["free_cells"] == [{"ix": 2, "iy": 2, "hits": 4}]
 
 
+def test_server_grid_browser_occupancy_overrides_local_scan_when_not_editing_loaded_map() -> None:
+    class Var:
+        def __init__(self, value) -> None:
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.scan = {
+        "voxel": 0.2,
+        "occupied": {"9:9": {"ix": 9, "iy": 9, "hits": 5, "intensity": 0.9}},
+        "free": {},
+    }
+    client.server_grid = {
+        "active": True,
+        "resolution": 0.5,
+        "occupied_cells": [{"ix": 1, "iy": 2, "hits": 3, "intensity": 1.0}],
+        "free_cells": [{"ix": 3, "iy": 4, "hits": 2}],
+    }
+    client.edit = {"loaded_from_stcm": False}
+    client.scan_fusion = {"preset": "indoor_balanced", "voxel_size": 0.2, "occupied_min_hits": 3, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
+    client.scan_fusion_preset_var = Var("indoor_balanced")
+    client.voxel_var = Var("0.20")
+    client.occupied_min_hits_var = Var("3")
+    client.occupied_over_free_ratio_var = Var("0.75")
+    client.turn_skip_wz_var = Var("0.45")
+    client.skip_turn_frames_var = Var(True)
+    client.number = DesktopClient.number.__get__(client, DesktopClient)
+    client.effective_scan_fusion_config = DesktopClient.effective_scan_fusion_config.__get__(client, DesktopClient)
+
+    payload = DesktopClient.browser_occupancy(client)
+
+    assert payload["voxel_size"] == 0.5
+    assert payload["occupied_cells"] == [{"ix": 1, "iy": 2, "hits": 3, "intensity": 1.0}]
+    assert payload["free_cells"] == [{"ix": 3, "iy": 4, "hits": 2}]
+
+
+def test_consume_messages_stores_server_grid_payload() -> None:
+    import queue
+
+    class Bridge:
+        def __init__(self) -> None:
+            self.queue = queue.Queue()
+
+    class Var:
+        def __init__(self) -> None:
+            self.value = ""
+
+        def set(self, value) -> None:
+            self.value = value
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.bridge = Bridge()
+    client.camera_inbox = {}
+    client.server_grid = {"active": False, "resolution": 0.0, "occupied_cells": [], "free_cells": []}
+    client.pose = {}
+    client.gps = {}
+    client.odom = {}
+    client.chassis = {}
+    client.pose_history = []
+    client.scan = {"front_frames": 0, "rear_frames": 0}
+    client.last_scan = {"front": {}, "rear": {}}
+    client.last_message_at_ms = 0
+    client.camera_refresh_var = Var()
+    client.mark_canvas_dirty = lambda: None
+    client.sync_scan_badges = lambda: None
+    client.queue_scan_frame = lambda *_args, **_kwargs: None
+    client.validate_message = lambda msg: True
+    client.consume_messages = DesktopClient.consume_messages.__get__(client, DesktopClient)
+
+    client.bridge.queue.put(
+        {
+            "topic": "/map/grid",
+            "stamp": 1.25,
+            "payload": {
+                "resolution": 0.4,
+                "occupied": [{"x": 1.0, "y": 2.0, "value": 100}],
+                "free": [{"x": 3.0, "y": 4.0, "value": 0}],
+            },
+        }
+    )
+
+    DesktopClient.consume_messages(client)
+
+    assert client.server_grid["active"] is True
+    assert client.server_grid["resolution"] == 0.4
+    assert client.server_grid["occupied_cells"] == [{"ix": 2, "iy": 5, "hits": 3, "intensity": 1.0}]
+    assert client.server_grid["free_cells"] == [{"ix": 8, "iy": 10, "hits": 3}]
 
 
 def test_apply_scan_fusion_config_updates_runtime_and_vars() -> None:
