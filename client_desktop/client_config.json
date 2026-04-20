@@ -1,0 +1,5 @@
+{
+  "login_required": false,
+  "server_ip": "192.168.0.111",
+  "server_port": 8080
+}

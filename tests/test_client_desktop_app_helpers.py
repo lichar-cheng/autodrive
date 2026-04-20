@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import types
+
 from client_desktop.app import (
     AuthFlowError,
     DesktopClient,
@@ -19,12 +21,74 @@ from client_desktop.app import (
     process_scan_frame,
     redact_sensitive_text,
     resolve_log_file_path,
+    read_slam_archive,
     safe_focus_widget,
     safe_mode_translation_key,
     strip_legacy_trajectory,
     should_clear_focus_on_click,
+    write_slam_archive,
     zoom_scale_factor,
 )
+
+
+class DummyVar:
+    def __init__(self, value="") -> None:
+        self.value = value
+
+    def set(self, value) -> None:
+        self.value = value
+
+    def get(self):
+        return self.value
+
+
+class DummyLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def build_minimal_client() -> DesktopClient:
+    client = DesktopClient.__new__(DesktopClient)
+    client.root = None
+    client.scan = {
+        "active": False,
+        "mode": "2d",
+        "phase": "idle",
+        "error": "",
+        "started_ms": 0,
+        "voxel": 0.08,
+        "front_frames": 0,
+        "rear_frames": 0,
+        "raw_points": 0,
+        "occupied": {},
+        "free": {},
+        "last_accum_pose": None,
+        "last_saved_file": "",
+        "saved_point_count": 0,
+        "pcd_name": "",
+        "pcd_bytes": b"",
+        "pcd_received_at": 0,
+    }
+    client.edit = {"loaded_from_stcm": False, "loaded_map_name": "", "tool": "view", "pending_obstacle_start": None}
+    client.scan_lock = DummyLock()
+    client.poi_nodes = []
+    client.path_segments = []
+    client.scan_state_var = DummyVar("")
+    client.map_badge_var = DummyVar("")
+    client.tool_badge_var = DummyVar("")
+    client.stats_badge_var = DummyVar("")
+    client.map_edit_status_var = DummyVar("")
+    client.scan_mode_var = DummyVar("2d")
+    client.tr = lambda key, **kwargs: f"{key}:{kwargs}" if kwargs else key
+    client.active_occupancy_cells = lambda: []
+    client.active_free_cells = lambda: []
+    client.mark_canvas_dirty = lambda: None
+    client.clear_scan = DesktopClient.clear_scan.__get__(client, DesktopClient)
+    client.sync_scan_badges = DesktopClient.sync_scan_badges.__get__(client, DesktopClient)
+    return client
 
 
 def test_normalize_server_ws_url_accepts_host_only_and_adds_stream_path() -> None:
@@ -213,12 +277,155 @@ def test_zoom_view_clamps_scale_and_refreshes_metrics() -> None:
     assert refreshed == [30.0, 8.0, 80.0]
 
 
+def test_fit_world_bounds_prefers_80px_when_map_fits_canvas() -> None:
+    class Canvas:
+        def winfo_width(self):
+            return 1200
+
+        def winfo_height(self):
+            return 900
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.canvas = Canvas()
+    client.view = {"scale": 25.0, "pan_x": 0.0, "pan_y": 0.0}
+    refreshed = []
+    client.update_view_metrics = lambda: refreshed.append((client.view["scale"], client.view["pan_x"], client.view["pan_y"]))
+
+    DesktopClient.fit_world_bounds(client, 0.0, 0.0, 4.0, 3.0)
+
+    assert refreshed
+    assert client.view["scale"] == 80.0
+
+
+def test_reset_view_defaults_to_80px_without_map_bounds() -> None:
+    client = DesktopClient.__new__(DesktopClient)
+    client.view = {"scale": 25.0, "pan_x": 0.0, "pan_y": 0.0}
+    client.pose = {"x": 0.0, "y": 0.0}
+    client.active_map_world_bounds = lambda include_robot=True: None
+    client.center_robot = DesktopClient.center_robot.__get__(client, DesktopClient)
+    refreshed = []
+    client.update_view_metrics = lambda: refreshed.append(client.view["scale"])
+
+    DesktopClient.reset_view(client)
+
+    assert refreshed
+    assert client.view["scale"] == 80.0
+
+
 def test_strip_legacy_trajectory_removes_exported_trajectory() -> None:
     manifest = {"poi": [], "path": [], "trajectory": [{"id": "old"}]}
     cleaned = strip_legacy_trajectory(manifest)
 
     assert "trajectory" not in cleaned
     assert "trajectory" in manifest
+
+
+def test_start_scan_sends_selected_mode_and_updates_phase() -> None:
+    client = build_minimal_client()
+    calls = []
+    client.call_api = lambda path, body: calls.append((path, body)) or {"ok": True, "scan_mode": "3d"}
+    client.scan_mode_var.set("3d")
+
+    DesktopClient.start_scan(client)
+
+    assert calls == [("/scan/start", {"mode": "3d"})]
+    assert client.scan["active"] is True
+    assert client.scan["mode"] == "3d"
+    assert client.scan["phase"] == "scanning"
+
+
+def test_stop_scan_3d_stores_pcd_payload_and_returns_idle() -> None:
+    client = build_minimal_client()
+    client.scan["active"] = True
+    client.scan["mode"] = "3d"
+    client.call_api = lambda path, body: {
+        "ok": True,
+        "scan_mode": "3d",
+        "pcd_file": {
+            "name": "map.pcd",
+            "encoding": "base64",
+            "content": "cGNkLWJ5dGVz",
+        },
+    }
+
+    DesktopClient.stop_scan(client)
+
+    assert client.scan["active"] is False
+    assert client.scan["phase"] == "idle"
+    assert client.scan["pcd_name"] == "map.pcd"
+    assert client.scan["pcd_bytes"] == b"pcd-bytes"
+
+
+def test_start_scan_persists_server_error_reason_in_status() -> None:
+    client = build_minimal_client()
+    client.call_api = lambda path, body: {"ok": False, "reason": "node_start_failed", "error": "failed to launch"}
+
+    DesktopClient.start_scan(client)
+
+    assert client.scan["phase"] == "error"
+    assert client.scan["error"] == "failed to launch"
+    assert "failed to launch" in client.scan_state_var.get()
+
+
+def test_write_slam_archive_omits_pcd_for_2d(tmp_path: Path) -> None:
+    target = tmp_path / "demo.slam"
+
+    write_slam_archive(target, {"version": "slam.v3", "scan_mode": "2d"}, [(1.0, 2.0, 3.0)], None)
+
+    manifest, points, pcd_file = read_slam_archive(target)
+
+    assert manifest["scan_mode"] == "2d"
+    assert points == [(1.0, 2.0, 3.0)]
+    assert pcd_file is None
+
+
+def test_write_slam_archive_round_trips_optional_pcd(tmp_path: Path) -> None:
+    target = tmp_path / "demo3d.slam"
+
+    write_slam_archive(
+        target,
+        {"version": "slam.v3", "scan_mode": "3d"},
+        [(1.0, 2.0, 3.0)],
+        {"name": "map.pcd", "content": b"pcd-bytes"},
+    )
+
+    manifest, points, pcd_file = read_slam_archive(target)
+
+    assert manifest["scan_mode"] == "3d"
+    assert points == [(1.0, 2.0, 3.0)]
+    assert pcd_file == {"name": "map.pcd", "content": b"pcd-bytes"}
+
+
+def test_export_pcd_warns_when_no_pcd_exists(monkeypatch) -> None:
+    warnings = []
+    monkeypatch.setattr("client_desktop.app.messagebox.showwarning", lambda title, message: warnings.append((title, message)))
+
+    client = build_minimal_client()
+    client.inspector = {"file": "demo.slam", "manifest": None, "points": [], "pgm": "", "yaml": "", "json": "", "meta": {}, "pcd_file": None}
+    client.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+
+    DesktopClient.export_inspector_file(client, "pcd")
+
+    assert warnings
+    assert warnings[0][1] == "pcd_export_unavailable"
+
+
+def test_export_pcd_writes_current_pcd_bytes(tmp_path: Path, monkeypatch) -> None:
+    exported = tmp_path / "exported.pcd"
+    infos = []
+    monkeypatch.setattr("client_desktop.app.filedialog.asksaveasfilename", lambda **_kwargs: str(exported))
+    monkeypatch.setattr("client_desktop.app.messagebox.showinfo", lambda title, message: infos.append((title, message)))
+
+    client = build_minimal_client()
+    client.scan["pcd_name"] = "map.pcd"
+    client.scan["pcd_bytes"] = b"pcd-bytes"
+    client.inspector = {"file": "demo.slam", "manifest": None, "points": [], "pgm": "", "yaml": "", "json": "", "meta": {}, "pcd_file": None}
+    client.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+
+    DesktopClient.export_inspector_file(client, "pcd")
+
+    assert exported.read_bytes() == b"pcd-bytes"
+    assert infos
 
 
 def test_compute_log_candidates_prefers_runtime_logs_dir() -> None:
@@ -255,7 +462,7 @@ def test_move_click_uses_async_api_for_forward() -> None:
 
     DesktopClient.move_click(client, "forward")
 
-    assert calls == [("async", "/control/move", {"velocity": 0.8, "yaw_rate": 0.0, "duration": 0.15})]
+    assert calls == [("async", "/control/target", {"velocity": 0.8, "yaw_rate": 0.0})]
 
 
 def test_move_click_uses_async_api_for_stop() -> None:
@@ -297,6 +504,55 @@ def test_send_control_command_now_uses_fast_timeout_without_retries() -> None:
     DesktopClient.send_control_command_now(client, "/control/move", {"velocity": 0.8})
 
     assert seen == [("/control/move", {"velocity": 0.8}, 0, 0.35, 0.0)]
+
+
+def test_control_sender_loop_uses_repeat_ms_interval() -> None:
+    class Event:
+        def __init__(self) -> None:
+            self.timeouts = []
+
+        def wait(self, timeout=None):
+            self.timeouts.append(timeout)
+            return False
+
+        def clear(self) -> None:
+            return None
+
+        def set(self) -> None:
+            return None
+
+    class Stop:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def is_set(self) -> bool:
+            self.calls += 1
+            return self.calls > 2
+
+    class Var:
+        def __init__(self, value) -> None:
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.control_sender_event = Event()
+    client.control_sender_stop = Stop()
+    client.control_lock = type("Lock", (), {"__enter__": lambda self: None, "__exit__": lambda self, exc_type, exc, tb: None})()
+    client.control_target = ("/control/target", {"velocity": 0.8, "yaw_rate": 0.0}, "forward")
+    client.repeat_ms_var = Var("120")
+    client.number = DesktopClient.number.__get__(client, DesktopClient)
+    sent = []
+    client.send_control_command_now = lambda path, body: sent.append((path, body))
+
+    DesktopClient._control_sender_loop(client)
+
+    assert client.control_sender_event.timeouts == [0.12, 0.12]
+    assert sent == [
+        ("/control/target", {"velocity": 0.8, "yaw_rate": 0.0}),
+        ("/control/target", {"velocity": 0.8, "yaw_rate": 0.0}),
+    ]
 
 
 def test_connect_uses_direct_ws_url_when_login_is_disabled() -> None:
@@ -351,6 +607,18 @@ def test_connect_uses_direct_ws_url_when_login_is_disabled() -> None:
         app_module.ServerBridge = original_bridge
 
     assert client.server_var.get() == "ws://192.168.3.56:28080/ws/stream"
+
+
+def test_reset_server_map_calls_api_and_clears_local_state() -> None:
+    client = DesktopClient.__new__(DesktopClient)
+    seen = []
+    client.call_api = lambda path, body: seen.append((path, body)) or {"ok": True}
+    client.clear_loaded_map = lambda: seen.append(("cleared", {}))
+    client.tr = lambda key, **kwargs: key if not kwargs else key
+
+    DesktopClient.reset_server_map(client)
+
+    assert seen == [("/map/reset", {}), ("cleared", {})]
 
 
 def test_on_key_release_delays_stop_until_after_confirmation_window() -> None:
@@ -460,6 +728,25 @@ def test_ensure_drive_loop_updates_control_target_immediately() -> None:
 
     assert seen == ["forward"]
     assert client.keyboard_var.get() == "forward"
+
+
+def test_update_control_target_skips_duplicate_command() -> None:
+    class Event:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def set(self) -> None:
+            self.calls += 1
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.control_lock = type("Lock", (), {"__enter__": lambda self: None, "__exit__": lambda self, exc_type, exc, tb: None})()
+    client.control_sender_event = Event()
+    client.control_target = ("/control/target", {"velocity": 0.8, "yaw_rate": 0.0}, "forward")
+    client.build_control_command = lambda name: ("/control/target", {"velocity": 0.8, "yaw_rate": 0.0}, name)
+
+    DesktopClient.update_control_target(client, "forward")
+
+    assert client.control_sender_event.calls == 0
 
 
 def test_on_key_release_updates_control_target_for_remaining_keys() -> None:
@@ -671,8 +958,10 @@ def test_consume_messages_stores_server_grid_payload() -> None:
             "stamp": 1.25,
             "payload": {
                 "resolution": 0.4,
-                "occupied": [{"x": 1.0, "y": 2.0, "value": 100}],
-                "free": [{"x": 3.0, "y": 4.0, "value": 0}],
+                "origin": {"x": 0.0, "y": 0.0},
+                "width": 3,
+                "height": 2,
+                "data": [-1, 0, 100, 50, -1, 0],
             },
         }
     )
@@ -681,8 +970,63 @@ def test_consume_messages_stores_server_grid_payload() -> None:
 
     assert client.server_grid["active"] is True
     assert client.server_grid["resolution"] == 0.4
-    assert client.server_grid["occupied_cells"] == [{"ix": 2, "iy": 5, "hits": 3, "intensity": 1.0}]
-    assert client.server_grid["free_cells"] == [{"ix": 8, "iy": 10, "hits": 3}]
+    assert client.server_grid["data"] == [-1, 0, 100, 50, -1, 0]
+    assert client.server_grid["occupied_cells"] == [
+        {"ix": 2, "iy": 0, "hits": 3, "intensity": 1.0},
+        {"ix": 0, "iy": 1, "hits": 3, "intensity": 1.0},
+    ]
+    assert client.server_grid["free_cells"] == [{"ix": 1, "iy": 0, "hits": 3}, {"ix": 2, "iy": 1, "hits": 3}]
+
+
+def test_consume_messages_does_not_queue_lidar_for_map_accumulation() -> None:
+    import queue
+
+    class Bridge:
+        def __init__(self) -> None:
+            self.queue = queue.Queue()
+
+    class Var:
+        def __init__(self) -> None:
+            self.value = ""
+
+        def set(self, value) -> None:
+            self.value = value
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.bridge = Bridge()
+    client.camera_inbox = {}
+    client.server_grid = {"active": False, "resolution": 0.0, "occupied_cells": [], "free_cells": []}
+    client.pose = {}
+    client.gps = {}
+    client.odom = {}
+    client.chassis = {}
+    client.pose_history = []
+    client.scan = {"front_frames": 0, "rear_frames": 0, "active": True}
+    client.last_scan = {"front": {}, "rear": {}}
+    client.last_message_at_ms = 0
+    client.camera_refresh_var = Var()
+    client.mark_canvas_dirty = lambda: None
+    queued = []
+    client.queue_scan_frame = lambda *_args, **_kwargs: queued.append("queued")
+    client.validate_message = lambda msg: True
+    client.sync_scan_badges = lambda: None
+
+    client.bridge.queue.put(
+        {
+            "topic": "/lidar/front",
+            "stamp": 1.25,
+            "payload": {
+                "points": [[1.0, 2.0, 1.0]],
+                "raw_points": 1,
+                "keyframe": True,
+            },
+        }
+    )
+
+    DesktopClient.consume_messages(client)
+
+    assert queued == []
+    assert client.scan["front_frames"] == 1
 
 
 def test_apply_scan_fusion_config_updates_runtime_and_vars() -> None:
@@ -987,7 +1331,7 @@ def test_consume_messages_coalesces_and_prioritizes_pose_updates() -> None:
     DesktopClient.consume_messages(client)
 
     assert client.pose == {"x": 9.0}
-    assert queued[-1][0] == [[MAX_MESSAGES_DRAIN_PER_TICK - 1, 0, 1]]
+    assert queued == []
     assert dirty
 
 

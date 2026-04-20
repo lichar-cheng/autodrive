@@ -8,8 +8,9 @@ The desktop client now tracks the browser client feature set closely:
 
 - WebSocket stream connection with reconnect, ping/pong, checksum/seq/lag diagnostics, and `/health` polling
 - Scan accumulation and map canvas rendering
+- 2D / 3D scan mode selection
 - Local `.slam` map save and load
-- Map exports for `PGM`, `YAML`, and `JSON`
+- Map exports for `PGM`, `YAML`, `JSON`, and `PCD`
 - Second-stage map editing
 - Noise erase and obstacle-line drawing
 - POI add, batch POI add, delete, geo apply, and clipboard copy
@@ -52,6 +53,23 @@ The desktop client no longer treats `/health` as a high-frequency connection pro
 - WebSocket state, message gap, lag, and API errors are still detected directly by the client.
 - `/health` is polled at a lower frequency and is mainly used to display server-side mapping readiness summary.
 - If the server rejects `/scan/start` because TF, odom, or lidar prerequisites are not ready, the desktop client shows the returned blockers directly.
+
+## 2D / 3D Scan Modes
+
+- `2D` mode starts the normal map scan flow and asks the server to verify or launch the configured 2D ROS dependency nodes before scanning.
+- `3D` mode uses the same live `/map` view during scanning, but when scanning stops the desktop client waits for the server to return the configured `pcd` file produced by the 3D stack.
+- While the `pcd` file is being received, the desktop client shows a receiving state.
+- If dependency checks, node startup, stop, `pcd` lookup, or transfer fail, the desktop client keeps the last error in scan status and also shows a warning dialog.
+
+## `.slam` Archive Layout
+
+The desktop client now writes the new `.slam` archive layout:
+
+- `manifest.json`
+- `map_points.bin`
+- `map.pcd` when the session includes 3D point cloud output
+
+2D sessions save only `manifest.json` and `map_points.bin`. 3D sessions save the same 2D occupancy/map content plus `map.pcd`, and that `pcd` can later be exported directly from the desktop client.
 
 ## Run
 

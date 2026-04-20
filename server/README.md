@@ -7,7 +7,7 @@
 1. 对外提供 HTTP 和 WebSocket 接口。
 2. 接 ROS2 真实数据，或在 ROS 不可用时切到内置模拟器。
 3. 聚合位姿、底盘、雷达、相机、地图数据，并通过统一主题总线分发。
-4. 保存/加载 `.stcm` 地图文件，给客户端提供扫描、路径、POI、地图管理能力。
+4. 保存/加载 `.slam` 地图文件，给客户端提供扫描、路径、POI、地图管理能力。
 
 默认监听地址：
 
@@ -29,7 +29,7 @@ tool/server/
    ├─ topic_bus.py            # 异步 topic 总线，负责发布/订阅和丢帧统计
    ├─ simulator.py            # ROS 不可用时的模拟数据源
    ├─ ros_bridge.py           # ROS2 桥接，订阅真实 topic 并转成本服务内部 topic
-   └─ stcm_codec.py           # .stcm 单文件存取
+   └─ stcm_codec.py           # .slam 单文件存取
 ```
 
 ## 3. 核心模块说明
@@ -67,6 +67,8 @@ tool/server/
 - `lidar_points_per_scan`
 - `allowed_clock_drift_sec`
 - `ros.topics.*`
+- `scan_modes.mode_2d.*`
+- `scan_modes.mode_3d.*`
 
 ROS 相关配置支持：
 
@@ -80,11 +82,21 @@ ROS 相关配置支持：
 - 相机列表 `camera_topics`
 - 速度控制 `cmd_vel`
 
+扫描模式配置支持：
+
+- `mode_2d.required_nodes`
+- `mode_2d.launch_commands`
+- `mode_3d.required_nodes`
+- `mode_3d.launch_commands`
+- `mode_3d.pcd_output_path`
+
 ### 3.4 `app/models.py`
 
 定义接口入参：
 
 - `MoveCommand`
+- `StartScanRequest`
+- `StopScanRequest`
 - `SaveMapRequest`
 - `LoadMapRequest`
 - `PlanPathRequest`

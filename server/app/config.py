@@ -3,10 +3,40 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 
+class ScanModeRuntimeConfig(BaseModel):
+    required_nodes: list[str] = Field(default_factory=list)
+    launch_commands: list[list[str]] = Field(default_factory=list)
+    pcd_output_path: str = ""
+
+
+class ScanModesConfig(BaseModel):
+    mode_2d: ScanModeRuntimeConfig = Field(
+        default_factory=lambda: ScanModeRuntimeConfig(
+            required_nodes=[
+                "/slam_toolbox",
+            ],
+            launch_commands=[
+                ["ros2", "launch", "slam_toolbox", "online_async_launch.py"],
+            ],
+        )
+    )
+    mode_3d: ScanModeRuntimeConfig = Field(
+        default_factory=lambda: ScanModeRuntimeConfig(
+            required_nodes=[
+                "/point_lio","/slam_toolbox",
+            ],
+            launch_commands=[
+                ["ros2", "launch", "caddie_hardware", "navigation_slam_based.launch.py"],
+            ],
+            pcd_output_path="/tmp/point_lio_map.pcd",
+        )
+    )
+
+
 class RosTopicConfig(BaseModel):
     odom: str = "/odom"
     gps: str = ""
-    occupancy_grid: str = ""
+    occupancy_grid: str = "/map"
     lidar_front: str = ""
     lidar_rear: str = ""
     lidar_fallback: str = "/scan"
@@ -35,7 +65,7 @@ class RosBridgeConfig(BaseModel):
 
 class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
-    port: int = 8080
+    port: int = 8180
     ws_queue_size: int = 200
     sim_rate_hz: float = 10.0
     lidar_points_per_scan: int = Field(default=700, ge=50, le=5000)
@@ -43,6 +73,7 @@ class ServerConfig(BaseModel):
     map_size: int = 300
     allowed_clock_drift_sec: float = 5.0
     ros: RosBridgeConfig = Field(default_factory=RosBridgeConfig)
+    scan_modes: ScanModesConfig = Field(default_factory=ScanModesConfig)
 
 
 CONFIG = ServerConfig()

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import copy
 import hashlib
 import json
 import logging
+import subprocess
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -13,7 +17,16 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import CONFIG
-from .models import AddPoiRequest, LoadMapRequest, MoveCommand, PlanPathRequest, SaveMapRequest
+from .models import (
+    AddPoiRequest,
+    ControlTargetRequest,
+    LoadMapRequest,
+    MoveCommand,
+    PlanPathRequest,
+    SaveMapRequest,
+    StartScanRequest,
+    StopScanRequest,
+)
 from .ros_bridge import RosRuntime, detect_ros
 from .simulator import Simulator
 from .stcm_codec import load_stcm, save_stcm
@@ -34,6 +47,9 @@ latest_points: list[tuple[float, float, float]] = []
 seq_by_topic: dict[str, int] = defaultdict(int)
 ws_clients: set[int] = set()
 motion_command_seq = 0
+CONTROL_TARGET = {"velocity": 0.0, "yaw_rate": 0.0, "updated_at": 0.0}
+CONTROL_PUBLISH_INTERVAL_SEC = 0.05
+control_task: asyncio.Task | None = None
 
 
 STREAM_TOPICS = [
@@ -74,14 +90,21 @@ SERVER_RUNTIME = {
 
 SCAN_SESSION = {
     "active": False,
+    "mode": "2d",
     "started_at": 0.0,
     "stopped_at": 0.0,
     "voxel_size": 0.12,
     "front_frames": 0,
     "rear_frames": 0,
     "raw_points": 0,
-    "accumulated": {},
+    "dependency_status": {"required_nodes": [], "missing_nodes": [], "started_nodes": [], "errors": []},
+    "pcd_transfer_state": "idle",
+    "pcd_file": None,
 }
+
+LAUNCHED_SCAN_PROCESSES: list[subprocess.Popen[str]] = []
+SCAN_DEPENDENCY_POLL_ATTEMPTS = 10
+SCAN_DEPENDENCY_POLL_INTERVAL_SEC = 1.0
 
 
 def _checksum(topic: str, stamp: float, seq: int, payload: dict) -> str:
@@ -116,58 +139,149 @@ def _thin_points(points: list[list[float]] | list[tuple[float, float, float]], l
 
 def _reset_scan_session(voxel_size: float | None = None, keep_points: bool = False) -> None:
     SCAN_SESSION["active"] = False
+    SCAN_SESSION["mode"] = "2d"
     SCAN_SESSION["started_at"] = 0.0
     SCAN_SESSION["stopped_at"] = 0.0
     SCAN_SESSION["front_frames"] = 0
     SCAN_SESSION["rear_frames"] = 0
     SCAN_SESSION["raw_points"] = 0
+    SCAN_SESSION["dependency_status"] = {"required_nodes": [], "missing_nodes": [], "started_nodes": [], "errors": []}
+    SCAN_SESSION["pcd_transfer_state"] = "idle"
+    SCAN_SESSION["pcd_file"] = None
     if voxel_size is not None:
         SCAN_SESSION["voxel_size"] = max(0.02, float(voxel_size))
-    if not keep_points:
-        SCAN_SESSION["accumulated"] = {}
 
 
-def _scan_point_key(x: float, y: float, voxel_size: float) -> str:
-    ix = round(x / voxel_size)
-    iy = round(y / voxel_size)
-    return f"{ix}:{iy}"
+def _normalize_scan_mode(mode: str | None) -> str | None:
+    normalized = str(mode or "").strip().lower()
+    return normalized if normalized in {"2d", "3d"} else None
 
 
-def _accumulate_scan(points: list[tuple[float, float, float]] | list[list[float]], source: str) -> None:
-    if not SCAN_SESSION["active"] or not points:
-        return
-
-    voxel_size = float(SCAN_SESSION["voxel_size"])
-    acc = SCAN_SESSION["accumulated"]
-    SCAN_SESSION["raw_points"] += len(points)
-    if source == "front":
-        SCAN_SESSION["front_frames"] += 1
-    elif source == "rear":
-        SCAN_SESSION["rear_frames"] += 1
-
-    for point in points:
-        x, y, intensity = float(point[0]), float(point[1]), float(point[2])
-        key = _scan_point_key(x, y, voxel_size)
-        slot = acc.get(key)
-        if slot is None:
-            acc[key] = {
-                "x": round(round(x / voxel_size) * voxel_size, 4),
-                "y": round(round(y / voxel_size) * voxel_size, 4),
-                "intensity": round(float(intensity), 4),
-                "hits": 1,
-                "source": source,
-            }
-        else:
-            slot["hits"] += 1
-            slot["intensity"] = max(slot["intensity"], round(float(intensity), 4))
-            slot["source"] = source
+def _scan_mode_config(mode: str) -> Any:
+    if mode == "2d":
+        return CONFIG.scan_modes.mode_2d
+    if mode == "3d":
+        return CONFIG.scan_modes.mode_3d
+    raise ValueError(f"unsupported scan mode: {mode}")
 
 
-def _accumulated_points() -> list[tuple[float, float, float]]:
-    return [
-        (float(item["x"]), float(item["y"]), float(item["intensity"]))
-        for item in SCAN_SESSION["accumulated"].values()
-    ]
+def _list_ros_nodes() -> list[str]:
+    completed = subprocess.run(
+        ["ros2", "node", "list"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return [line.strip() for line in str(completed.stdout or "").splitlines() if line.strip()]
+
+
+def _check_required_nodes(nodes: list[str]) -> dict[str, Any]:
+    if not nodes:
+        return {
+            "required_nodes": [],
+            "missing_nodes": [],
+            "started_nodes": [],
+            "errors": [],
+        }
+    try:
+        existing = set(_list_ros_nodes())
+    except Exception as exc:  # noqa: BLE001
+        detail = ""
+        if isinstance(exc, subprocess.CalledProcessError):
+            detail = str(getattr(exc, "stderr", "") or getattr(exc, "stdout", "") or "").strip()
+        if not detail:
+            detail = str(exc)
+        return {
+            "required_nodes": list(nodes),
+            "missing_nodes": list(nodes),
+            "started_nodes": [],
+            "errors": [detail],
+        }
+    return {
+        "required_nodes": list(nodes),
+        "missing_nodes": [node for node in nodes if node not in existing],
+        "started_nodes": [],
+        "errors": [],
+    }
+
+
+def _stream_process_output(stream: Any, level: int, prefix: str) -> None:
+    try:
+        for raw_line in iter(stream.readline, ""):
+            line = str(raw_line).rstrip()
+            if line:
+                logger.log(level, "%s %s", prefix, line)
+    finally:
+        try:
+            stream.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _launch_scan_mode_command(argv: list[str]) -> tuple[bool, str]:
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+    LAUNCHED_SCAN_PROCESSES.append(process)
+    logger.info("started scan dependency command argv=%s pid=%s", argv, process.pid)
+    if process.stdout is not None:
+        threading.Thread(
+            target=_stream_process_output,
+            args=(process.stdout, logging.INFO, f"[scan-launch:{process.pid}:stdout]"),
+            daemon=True,
+        ).start()
+    if process.stderr is not None:
+        threading.Thread(
+            target=_stream_process_output,
+            args=(process.stderr, logging.WARNING, f"[scan-launch:{process.pid}:stderr]"),
+            daemon=True,
+        ).start()
+    return True, f"pid={process.pid}"
+
+
+def _ensure_scan_mode_dependencies(mode: str) -> dict[str, Any]:
+    config = _scan_mode_config(mode)
+    status = _check_required_nodes(list(config.required_nodes))
+    if not status["missing_nodes"]:
+        return status
+    started_nodes: list[str] = list(status.get("started_nodes", []))
+    errors: list[str] = list(status.get("errors", []))
+    for command in config.launch_commands:
+        ok, detail = _launch_scan_mode_command(list(command))
+        if not ok:
+            errors.append(detail or f"failed to launch {command}")
+            continue
+        logger.info("waiting for scan dependency nodes mode=%s command=%s", mode, command)
+        refreshed = status
+        for _ in range(SCAN_DEPENDENCY_POLL_ATTEMPTS):
+            time.sleep(SCAN_DEPENDENCY_POLL_INTERVAL_SEC)
+            refreshed = _check_required_nodes(list(config.required_nodes))
+            if not refreshed["missing_nodes"]:
+                break
+        started_nodes = list(dict.fromkeys(started_nodes + list(refreshed.get("required_nodes", []))))
+        status = refreshed
+        if not status["missing_nodes"]:
+            status["started_nodes"] = started_nodes
+            status["errors"] = errors
+            return status
+    status["started_nodes"] = started_nodes
+    status["errors"] = errors
+    return status
+
+
+def _pcd_output_path_for_mode(mode: str) -> Path | None:
+    normalized = _normalize_scan_mode(mode)
+    if normalized != "3d":
+        return None
+    raw = str(_scan_mode_config(normalized).pcd_output_path or "").strip()
+    return Path(raw) if raw else None
 
 
 def _server_capacity_summary() -> dict[str, Any]:
@@ -209,7 +323,7 @@ def _scan_summary() -> dict[str, Any]:
         "front_frames": int(SCAN_SESSION["front_frames"]),
         "rear_frames": int(SCAN_SESSION["rear_frames"]),
         "raw_points": int(SCAN_SESSION["raw_points"]),
-        "accumulated_points": len(SCAN_SESSION["accumulated"]),
+        "accumulated_points": 0,
     }
 
 
@@ -283,15 +397,62 @@ def _current_map_points() -> list[tuple[float, float, float]]:
         ros_points = ros.bridge.latest_map_points()
         if ros_points:
             return ros_points
-    accumulated = _accumulated_points()
-    if accumulated:
-        return accumulated
     return latest_points
+
+
+def _current_map_source() -> str:
+    if ros.enabled and ros.bridge is not None and getattr(ros.bridge, "latest_map_points", lambda: [])():
+        return "occupancy_grid"
+    if latest_points:
+        return "loaded_map"
+    return "unavailable"
+
+
+def _occupancy_payload_to_points(payload: dict[str, Any]) -> list[tuple[float, float, float]]:
+    if isinstance(payload.get("data"), list):
+        resolution = max(0.02, float(payload.get("resolution", 0.05) or 0.05))
+        origin = payload.get("origin") if isinstance(payload.get("origin"), dict) else {}
+        origin_x = float(origin.get("x", 0.0))
+        origin_y = float(origin.get("y", 0.0))
+        width = int(payload.get("width", 0) or 0)
+        points: list[tuple[float, float, float]] = []
+        if width <= 0:
+            return points
+        for index, value in enumerate(payload.get("data", [])):
+            if int(value) < 50:
+                continue
+            row = index // width
+            col = index % width
+            x = origin_x + (col + 0.5) * resolution
+            y = origin_y + (row + 0.5) * resolution
+            points.append((round(x, 3), round(y, 3), 1.0))
+        return points
+    return [
+        (float(cell.get("x", 0.0)), float(cell.get("y", 0.0)), 1.0)
+        for cell in payload.get("occupied", [])
+    ]
+
+
+async def _control_publisher_loop() -> None:
+    while True:
+        try:
+            velocity = float(CONTROL_TARGET["velocity"])
+            yaw_rate = float(CONTROL_TARGET["yaw_rate"])
+            if ros.enabled and ros.bridge is not None:
+                ros.bridge.publish_cmd_vel(velocity, yaw_rate)
+            else:
+                sim.set_motion(velocity, yaw_rate)
+            await asyncio.sleep(CONTROL_PUBLISH_INTERVAL_SEC)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("control publisher loop failed")
+            await asyncio.sleep(CONTROL_PUBLISH_INTERVAL_SEC)
 
 
 @app.on_event("startup")
 async def startup() -> None:
-    global ros
+    global control_task, ros
 
     map_dir.mkdir(parents=True, exist_ok=True)
     loop = asyncio.get_running_loop()
@@ -304,10 +465,19 @@ async def startup() -> None:
         if CONFIG.ros.fallback_to_simulator_on_failure:
             await sim.start()
             logger.info("Simulator fallback started")
+    control_task = asyncio.create_task(_control_publisher_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    global control_task
+    if control_task is not None:
+        control_task.cancel()
+        try:
+            await control_task
+        except asyncio.CancelledError:
+            pass
+        control_task = None
     if ros.enabled and ros.bridge is not None:
         ros.bridge.stop()
     if sim._running:
@@ -322,16 +492,20 @@ async def health() -> dict:
         "ros_enabled": ros.enabled,
         "ros_reason": ros.reason,
         "scan_active": bool(SCAN_SESSION["active"]),
+        "scan_mode": str(SCAN_SESSION["mode"]),
         "ws_clients": len(ws_clients),
         "topics": STREAM_TOPICS,
         "scan_summary": _scan_summary(),
+        "dependency_status": copy.deepcopy(SCAN_SESSION["dependency_status"]),
+        "pcd_transfer_state": str(SCAN_SESSION["pcd_transfer_state"]),
+        "pcd_metadata": copy.deepcopy(SCAN_SESSION["pcd_file"]),
         "ros_diag": _ros_diag(),
         "mapping_ready": bool(mapping_prereq["ready"]),
         "mapping_status": mapping_prereq["severity"],
         "mapping_blockers": list(mapping_prereq["blockers"]),
         "mapping_warnings": list(mapping_prereq["warnings"]),
         "simulator_active": bool(sim._running),
-        "map_source": "occupancy_grid" if CONFIG.ros.topics.occupancy_grid else "laser_accumulation",
+        "map_source": _current_map_source(),
         "frames": {
             "odom": CONFIG.ros.topics.odom_frame,
             "base": CONFIG.ros.topics.robot_base_frame,
@@ -367,7 +541,32 @@ async def diag_stream_stats() -> dict:
 
 
 @app.post("/scan/start")
-async def start_scan() -> dict:
+async def start_scan(req: StartScanRequest | None = None) -> dict:
+    mode = _normalize_scan_mode(req.mode if req is not None else "2d")
+    if mode is None:
+        return {
+            "ok": False,
+            "reason": "invalid_scan_mode",
+            "scan_active": False,
+        }
+    if bool(SCAN_SESSION["active"]):
+        return {
+            "ok": False,
+            "reason": "scan_already_active",
+            "scan_active": True,
+            "scan_mode": str(SCAN_SESSION["mode"]),
+        }
+    dependency_status = _ensure_scan_mode_dependencies(mode)
+    SCAN_SESSION["dependency_status"] = copy.deepcopy(dependency_status)
+    if dependency_status["missing_nodes"] or dependency_status["errors"]:
+        return {
+            "ok": False,
+            "reason": "node_start_failed",
+            "scan_active": False,
+            "scan_mode": mode,
+            "dependency_status": dependency_status,
+            "ros_enabled": ros.enabled,
+        }
     mapping_prereq = _mapping_prereq_summary()
     if not mapping_prereq["ready"]:
         logger.warning("scan start rejected blockers=%s warnings=%s", mapping_prereq["blockers"], mapping_prereq["warnings"])
@@ -379,6 +578,8 @@ async def start_scan() -> dict:
             "ros_enabled": ros.enabled,
         }
     _reset_scan_session()
+    SCAN_SESSION["mode"] = mode
+    SCAN_SESSION["dependency_status"] = copy.deepcopy(dependency_status)
     SCAN_SESSION["active"] = True
     SCAN_SESSION["started_at"] = time.time()
     if ros.enabled and ros.bridge is not None:
@@ -386,11 +587,32 @@ async def start_scan() -> dict:
     else:
         sim.scanning = True
     logger.info("scan started")
-    return {"ok": True, "scan_active": True, "scan_summary": _scan_summary(), "ros_enabled": ros.enabled}
+    return {
+        "ok": True,
+        "scan_active": True,
+        "scan_mode": mode,
+        "scan_summary": _scan_summary(),
+        "dependency_status": dependency_status,
+        "ros_enabled": ros.enabled,
+    }
 
 
 @app.post("/scan/stop")
-async def stop_scan() -> dict:
+async def stop_scan(req: StopScanRequest | None = None) -> dict:
+    mode = _normalize_scan_mode(req.mode if req is not None else str(SCAN_SESSION.get("mode", "2d")))
+    if mode is None:
+        return {
+            "ok": False,
+            "reason": "invalid_scan_mode",
+            "scan_active": bool(SCAN_SESSION["active"]),
+        }
+    if not bool(SCAN_SESSION["active"]):
+        return {
+            "ok": False,
+            "reason": "scan_not_active",
+            "scan_active": False,
+            "scan_mode": mode,
+        }
     SCAN_SESSION["active"] = False
     SCAN_SESSION["stopped_at"] = time.time()
     if ros.enabled and ros.bridge is not None:
@@ -398,7 +620,61 @@ async def stop_scan() -> dict:
     else:
         sim.scanning = False
     logger.info("scan stopped")
-    return {"ok": True, "scan_active": False, "scan_summary": _scan_summary(), "ros_enabled": ros.enabled}
+    if str(SCAN_SESSION["mode"]) == "3d":
+        pcd_path = _pcd_output_path_for_mode("3d")
+        if pcd_path is None:
+            SCAN_SESSION["pcd_transfer_state"] = "error"
+            return {
+                "ok": False,
+                "reason": "pcd_path_not_configured",
+                "scan_active": False,
+                "scan_mode": "3d",
+            }
+        if not pcd_path.exists():
+            SCAN_SESSION["pcd_transfer_state"] = "error"
+            return {
+                "ok": False,
+                "reason": "pcd_file_missing",
+                "scan_active": False,
+                "scan_mode": "3d",
+                "error": f"pcd file not found: {pcd_path}",
+            }
+        try:
+            SCAN_SESSION["pcd_transfer_state"] = "reading"
+            content = pcd_path.read_bytes()
+        except OSError as exc:
+            SCAN_SESSION["pcd_transfer_state"] = "error"
+            return {
+                "ok": False,
+                "reason": "pcd_read_failed",
+                "scan_active": False,
+                "scan_mode": "3d",
+                "error": str(exc),
+            }
+        encoded = base64.b64encode(content).decode("ascii")
+        pcd_file = {
+            "name": pcd_path.name,
+            "size": len(content),
+            "encoding": "base64",
+            "content": encoded,
+        }
+        SCAN_SESSION["pcd_file"] = copy.deepcopy(pcd_file)
+        SCAN_SESSION["pcd_transfer_state"] = "ready"
+        return {
+            "ok": True,
+            "scan_active": False,
+            "scan_mode": "3d",
+            "scan_summary": _scan_summary(),
+            "pcd_file": pcd_file,
+            "ros_enabled": ros.enabled,
+        }
+    return {
+        "ok": True,
+        "scan_active": False,
+        "scan_mode": str(SCAN_SESSION["mode"]),
+        "scan_summary": _scan_summary(),
+        "ros_enabled": ros.enabled,
+    }
 
 
 @app.post("/scan/reset")
@@ -430,10 +706,30 @@ async def move(cmd: MoveCommand) -> dict:
     return {"ok": True, "msg": "sim motion applied", "state": sim.state.__dict__}
 
 
+@app.post("/control/target")
+async def set_control_target(cmd: ControlTargetRequest) -> dict:
+    CONTROL_TARGET["velocity"] = float(cmd.velocity)
+    CONTROL_TARGET["yaw_rate"] = float(cmd.yaw_rate)
+    CONTROL_TARGET["updated_at"] = time.time()
+    if ros.enabled and ros.bridge is not None:
+        ros.bridge.publish_cmd_vel(float(cmd.velocity), float(cmd.yaw_rate))
+        state = {
+            "pose": ros.bridge.latest_pose(),
+            "gps": ros.bridge.latest_gps(),
+            "chassis": ros.bridge.latest_chassis(),
+        }
+        return {"ok": True, "msg": "control target applied", "state": state}
+    sim.set_motion(float(cmd.velocity), float(cmd.yaw_rate))
+    return {"ok": True, "msg": "control target applied", "state": sim.state.__dict__}
+
+
 @app.post("/control/stop")
 async def stop() -> dict:
     global motion_command_seq
     motion_command_seq += 1
+    CONTROL_TARGET["velocity"] = 0.0
+    CONTROL_TARGET["yaw_rate"] = 0.0
+    CONTROL_TARGET["updated_at"] = time.time()
     if ros.enabled and ros.bridge is not None:
         ros.bridge.stop_motion()
     else:
@@ -453,13 +749,30 @@ async def add_poi(req: AddPoiRequest) -> dict:
     return {"ok": True, "poi_count": len(sim.state.poi)}
 
 
+@app.post("/map/reset")
+async def reset_map() -> dict:
+    global latest_points
+
+    if not (ros.enabled and ros.bridge is not None):
+        return {"ok": False, "reason": "ros_unavailable", "map_source": _current_map_source()}
+    if not hasattr(ros.bridge, "reset_map"):
+        return {"ok": False, "reason": "reset_unavailable", "map_source": _current_map_source()}
+    if not bool(ros.bridge.reset_map()):
+        return {"ok": False, "reason": "slam_toolbox_reset_failed", "map_source": _current_map_source()}
+
+    latest_points = []
+    _reset_scan_session()
+    logger.info("map reset requested via slam_toolbox")
+    return {"ok": True, "map_source": _current_map_source(), "scan_summary": _scan_summary()}
+
+
 @app.post("/map/save")
 async def save_map(req: SaveMapRequest) -> dict:
     points_to_save = _current_map_points()
     if req.voxel_size is not None:
         SCAN_SESSION["voxel_size"] = max(0.02, float(req.voxel_size))
     if not points_to_save:
-        points_to_save = [(0.0, 0.0, 1.0)]
+        return {"ok": False, "reason": "map_unavailable", "map_source": _current_map_source(), "scan_summary": _scan_summary()}
 
     pose = ros.bridge.latest_pose() if ros.enabled and ros.bridge is not None else {
         "x": sim.state.x,
@@ -470,12 +783,14 @@ async def save_map(req: SaveMapRequest) -> dict:
     imu = ros.bridge.latest_imu() if ros.enabled and ros.bridge is not None else {}
     filename = f"{req.name}_{int(time.time())}.slam"
     target = map_dir / filename
+    pcd_file = copy.deepcopy(SCAN_SESSION.get("pcd_file"))
     bundle = {
-        "version": "stcm.v2",
+        "version": "slam.v3",
+        "scan_mode": str(SCAN_SESSION.get("mode", "2d")),
         "notes": req.notes,
         "created_at": time.time(),
         "source": "ros" if ros.enabled else "sim",
-        "map_source": "occupancy_grid" if CONFIG.ros.topics.occupancy_grid else "laser_accumulation",
+        "map_source": _current_map_source(),
         "pose": pose,
         "gps": gps,
         "imu": imu,
@@ -488,6 +803,8 @@ async def save_map(req: SaveMapRequest) -> dict:
         "ros_diag": _ros_diag(),
         "radar_points": points_to_save,
     }
+    if isinstance(pcd_file, dict):
+        bundle["pcd_file"] = pcd_file
     save_stcm(target, bundle)
     response = {
         "ok": True,
@@ -499,8 +816,10 @@ async def save_map(req: SaveMapRequest) -> dict:
             "gps_track": len(sim.state.gps_track),
             "chassis_track": len(sim.state.chassis_track),
             "radar_points": len(points_to_save),
+            "pcd": isinstance(pcd_file, dict),
         },
         "scan_summary": _scan_summary(),
+        "scan_mode": str(SCAN_SESSION.get("mode", "2d")),
         "ros_enabled": ros.enabled,
     }
     if getattr(req, "reset_after_save", False):
@@ -521,22 +840,16 @@ async def load_map(req: LoadMapRequest) -> dict:
     sim.state.chassis_track = bundle.get("chassis_track", [])
 
     _reset_scan_session(keep_points=True)
-    SCAN_SESSION["accumulated"] = {
-        _scan_point_key(float(p[0]), float(p[1]), float(SCAN_SESSION["voxel_size"])): {
-            "x": float(p[0]),
-            "y": float(p[1]),
-            "intensity": float(p[2]),
-            "hits": 1,
-            "source": "load",
-        }
-        for p in latest_points
-    }
+    SCAN_SESSION["mode"] = str(bundle.get("scan_mode", "2d"))
+    SCAN_SESSION["pcd_file"] = copy.deepcopy(bundle.get("pcd_file"))
     return {
         "ok": True,
         "point_count": len(latest_points),
         "poi_count": len(sim.state.poi),
         "path_count": len(sim.state.path),
         "chassis_count": len(sim.state.chassis_track),
+        "scan_mode": str(SCAN_SESSION["mode"]),
+        "contains": {"pcd": isinstance(bundle.get("pcd_file"), dict)},
         "scan_summary": _scan_summary(),
     }
 
@@ -617,17 +930,13 @@ async def ws_stream(websocket: WebSocket) -> None:
                 last_sent_at[topic] = now
 
             if topic == "/lidar/front":
-                latest_points = [tuple(point) for point in message["payload"].get("points", [])[:4000]]
-                _accumulate_scan(latest_points, "front")
+                SCAN_SESSION["front_frames"] += 1
+                SCAN_SESSION["raw_points"] += len(message["payload"].get("points", []))
             elif topic == "/lidar/rear":
-                rear_points = [tuple(point) for point in message["payload"].get("points", [])[:4000]]
-                if rear_points:
-                    latest_points = rear_points
-                _accumulate_scan(rear_points, "rear")
-            elif topic == "/map/grid" and ros.enabled and ros.bridge is not None:
-                ros_points = ros.bridge.latest_map_points()
-                if ros_points:
-                    latest_points = ros_points
+                SCAN_SESSION["rear_frames"] += 1
+                SCAN_SESSION["raw_points"] += len(message["payload"].get("points", []))
+            elif topic == "/map/grid":
+                latest_points = _occupancy_payload_to_points(message["payload"])
 
             outbound_message = message
             if topic in {"/lidar/front", "/lidar/rear"}:

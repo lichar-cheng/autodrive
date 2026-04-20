@@ -35,6 +35,7 @@ class RosBridgeState:
     latest_rear_points: list[list[float]] = field(default_factory=list)
     latest_occupancy_payload: dict[str, Any] = field(default_factory=dict)
     latest_occupancy_points: list[tuple[float, float, float]] = field(default_factory=list)
+    latest_occupancy_frame: str = ""
     camera_payloads: dict[str, dict[str, Any]] = field(default_factory=dict)
     tf_tree: dict[tuple[str, str], dict[str, float | str]] = field(default_factory=dict)
     last_scan_frame_by_side: dict[str, str] = field(default_factory=dict)
@@ -49,6 +50,27 @@ def _yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
 
 def _normalize_frame(frame_id: str) -> str:
     return str(frame_id).lstrip("/")
+
+
+def _compose_transform(
+    first: dict[str, float | str],
+    second: dict[str, float | str],
+    source: str | None = None,
+) -> dict[str, float | str]:
+    first_yaw = float(first["yaw"])
+    second_yaw = float(second["yaw"])
+    cos_yaw = math.cos(first_yaw)
+    sin_yaw = math.sin(first_yaw)
+    second_tx = float(second["tx"])
+    second_ty = float(second["ty"])
+    return {
+        "tx": float(first["tx"]) + cos_yaw * second_tx - sin_yaw * second_ty,
+        "ty": float(first["ty"]) + sin_yaw * second_tx + cos_yaw * second_ty,
+        "tz": float(first["tz"]) + float(second["tz"]),
+        "yaw": first_yaw + second_yaw,
+        "source": source or f"{first['source']}+{second['source']}",
+        "stamp": max(float(first.get("stamp", 0.0) or 0.0), float(second.get("stamp", 0.0) or 0.0)),
+    }
 
 
 def _stamp_to_seconds(stamp: Any) -> float:
@@ -84,6 +106,8 @@ class RosBridge:
         self._node = None
         self._cmd_pub = None
         self._twist_cls = None
+        self._reset_client = None
+        self._reset_request_cls = None
         self._subscriptions: list[Any] = []
         self._import_error: str | None = None
 
@@ -113,6 +137,14 @@ class RosBridge:
 
         self._node = rclpy.create_node(self.config.node_name)
         self._cmd_pub = self._node.create_publisher(Twist, self.config.topics.cmd_vel, 10)
+        try:
+            from slam_toolbox.srv import Reset
+
+            self._reset_client = self._node.create_client(Reset, "/slam_toolbox/reset")
+            self._reset_request_cls = Reset.Request
+        except Exception:  # noqa: BLE001
+            self._reset_client = None
+            self._reset_request_cls = None
 
         tf_static_qos = _build_tf_static_qos(rclpy_qos, qos_profile_sensor_data)
         self._subscriptions = [
@@ -270,9 +302,7 @@ class RosBridge:
 
     def latest_map_points(self) -> list[tuple[float, float, float]]:
         with self._lock:
-            if self.state.latest_occupancy_points:
-                return list(self.state.latest_occupancy_points)
-            return [tuple(p) for p in self.state.latest_front_points + self.state.latest_rear_points]
+            return list(self.state.latest_occupancy_points)
 
     def latest_pose(self) -> dict[str, float]:
         with self._lock:
@@ -319,6 +349,26 @@ class RosBridge:
     def stop_motion(self) -> None:
         self.publish_cmd_vel(0.0, 0.0)
 
+    def reset_map(self, timeout_sec: float = 3.0) -> bool:
+        if self._reset_client is None or self._reset_request_cls is None:
+            return False
+        try:
+            if not self._reset_client.wait_for_service(timeout_sec=float(timeout_sec)):
+                return False
+            future = self._reset_client.call_async(self._reset_request_cls())
+            deadline = time.time() + max(0.1, float(timeout_sec))
+            while time.time() < deadline:
+                if future.done():
+                    future.result()
+                    with self._lock:
+                        self.state.latest_occupancy_payload = {}
+                        self.state.latest_occupancy_points = []
+                    return True
+                time.sleep(0.02)
+        except Exception:  # noqa: BLE001
+            return False
+        return False
+
     def _spin_loop(self) -> None:
         assert self._rclpy is not None
         while self._running and self._rclpy.ok():
@@ -352,25 +402,67 @@ class RosBridge:
         normalized_parent = _normalize_frame(parent)
         normalized_child = _normalize_frame(child)
         with self._lock:
-            direct = self.state.tf_tree.get((normalized_parent, normalized_child))
-            if direct is not None:
-                return dict(direct)
-            reverse = self.state.tf_tree.get((normalized_child, normalized_parent))
-        if reverse is None:
-            return None
-        yaw = -float(reverse["yaw"])
-        cos_yaw = math.cos(yaw)
-        sin_yaw = math.sin(yaw)
-        tx = -float(reverse["tx"]) * cos_yaw + float(reverse["ty"]) * sin_yaw
-        ty = -float(reverse["tx"]) * sin_yaw - float(reverse["ty"]) * cos_yaw
-        return {
-            "tx": tx,
-            "ty": ty,
-            "tz": -float(reverse["tz"]),
-            "yaw": yaw,
-            "source": f"inverse:{reverse['source']}",
-            "stamp": reverse["stamp"],
-        }
+            tf_tree = {key: dict(value) for key, value in self.state.tf_tree.items()}
+
+        def inverse(transform: dict[str, float | str]) -> dict[str, float | str]:
+            yaw = -float(transform["yaw"])
+            cos_yaw = math.cos(yaw)
+            sin_yaw = math.sin(yaw)
+            tx = -float(transform["tx"]) * cos_yaw + float(transform["ty"]) * sin_yaw
+            ty = -float(transform["tx"]) * sin_yaw - float(transform["ty"]) * cos_yaw
+            return {
+                "tx": tx,
+                "ty": ty,
+                "tz": -float(transform["tz"]),
+                "yaw": yaw,
+                "source": f"inverse:{transform['source']}",
+                "stamp": transform["stamp"],
+            }
+
+        direct = tf_tree.get((normalized_parent, normalized_child))
+        if direct is not None:
+            return dict(direct)
+        reverse = tf_tree.get((normalized_child, normalized_parent))
+        if reverse is not None:
+            return inverse(reverse)
+
+        queue: list[tuple[str, dict[str, float | str]]] = [
+            (
+                normalized_parent,
+                {
+                    "tx": 0.0,
+                    "ty": 0.0,
+                    "tz": 0.0,
+                    "yaw": 0.0,
+                    "source": "identity",
+                    "stamp": time.time(),
+                },
+            )
+        ]
+        visited = {normalized_parent}
+        while queue:
+            current_frame, current_transform = queue.pop(0)
+            if current_frame == normalized_child:
+                return current_transform
+            for (edge_parent, edge_child), edge_transform in tf_tree.items():
+                next_frame = None
+                step_transform = None
+                if edge_parent == current_frame and edge_child not in visited:
+                    next_frame = edge_child
+                    step_transform = dict(edge_transform)
+                elif edge_child == current_frame and edge_parent not in visited:
+                    next_frame = edge_parent
+                    step_transform = inverse(edge_transform)
+                if next_frame is None or step_transform is None:
+                    continue
+                visited.add(next_frame)
+                queue.append(
+                    (
+                        next_frame,
+                        _compose_transform(current_transform, step_transform),
+                    )
+                )
+        return None
 
     def _resolve_lidar_mount(self) -> dict[str, float | str] | None:
         base_frame = self.config.topics.robot_base_frame
@@ -421,6 +513,25 @@ class RosBridge:
             "vx": float(twist.linear.x),
             "wz": float(twist.angular.z),
         }
+        if self.config.prefer_tf_pose:
+            with self._lock:
+                map_frame = str(self.state.latest_occupancy_frame)
+            if map_frame:
+                map_to_odom = self._lookup_transform(map_frame, self.config.topics.odom_frame)
+                if map_to_odom is not None:
+                    odom_to_base = {
+                        "tx": float(pose.position.x),
+                        "ty": float(pose.position.y),
+                        "tz": float(getattr(pose.position, "z", 0.0)),
+                        "yaw": float(yaw),
+                        "source": "odom_msg",
+                        "stamp": float(stamp),
+                    }
+                    map_pose = _compose_transform(map_to_odom, odom_to_base, source=f"{map_to_odom['source']}+odom_msg")
+                    payload["x"] = float(map_pose["tx"])
+                    payload["y"] = float(map_pose["ty"])
+                    payload["yaw"] = float(map_pose["yaw"])
+                    payload["frame"] = map_frame
         chassis_payload = {
             "wheel_speed_l": float(twist.linear.x),
             "wheel_speed_r": float(twist.linear.x),
@@ -573,10 +684,6 @@ class RosBridge:
 
     def _on_occupancy_grid(self, msg) -> None:  # noqa: ANN001
         info = msg.info
-        stride = int(self.config.occupancy_stride)
-        sample_limit = int(self.config.occupancy_sample_limit)
-        occupied: list[dict[str, float | int]] = []
-        free: list[dict[str, float | int]] = []
         occupied_points: list[tuple[float, float, float]] = []
 
         width = int(info.width)
@@ -584,37 +691,31 @@ class RosBridge:
         resolution = float(info.resolution)
         origin_x = float(info.origin.position.x)
         origin_y = float(info.origin.position.y)
+        frame_id = _normalize_frame(getattr(getattr(msg, "header", None), "frame_id", ""))
+        data = [int(value) for value in msg.data]
 
-        count = 0
-        for row in range(0, height, stride):
-            for col in range(0, width, stride):
-                if count >= sample_limit:
-                    break
-                value = int(msg.data[row * width + col])
+        for row in range(height):
+            for col in range(width):
+                value = int(data[row * width + col])
                 if value < 0:
                     continue
-                x = origin_x + (col + 0.5) * resolution
-                y = origin_y + (row + 0.5) * resolution
                 if value >= 50:
-                    occupied.append({"x": round(x, 3), "y": round(y, 3), "value": value})
+                    x = origin_x + (col + 0.5) * resolution
+                    y = origin_y + (row + 0.5) * resolution
                     occupied_points.append((round(x, 3), round(y, 3), 1.0))
-                else:
-                    free.append({"x": round(x, 3), "y": round(y, 3), "value": value})
-                count += 1
-            if count >= sample_limit:
-                break
 
         payload = {
-            "occupied": occupied,
-            "free": free,
+            "data": data,
             "resolution": resolution,
             "origin": {"x": origin_x, "y": origin_y},
             "width": width,
             "height": height,
+            "frame_id": frame_id,
         }
         with self._lock:
             self.state.latest_occupancy_payload = payload
             self.state.latest_occupancy_points = occupied_points
+            self.state.latest_occupancy_frame = frame_id
         self._mark_topic(self.config.topics.occupancy_grid)
         self._publish_async("/map/grid", payload, time.time())
 
