@@ -49,6 +49,7 @@ ws_clients: set[int] = set()
 motion_command_seq = 0
 CONTROL_TARGET = {"velocity": 0.0, "yaw_rate": 0.0, "updated_at": 0.0}
 CONTROL_PUBLISH_INTERVAL_SEC = 0.05
+CONTROL_TARGET_HOLD_SEC = 1.0
 control_task: asyncio.Task | None = None
 
 
@@ -433,11 +434,46 @@ def _occupancy_payload_to_points(payload: dict[str, Any]) -> list[tuple[float, f
     ]
 
 
+def _effective_control_target(now: float | None = None) -> tuple[float, float, bool]:
+    now = time.time() if now is None else float(now)
+    updated_at = float(CONTROL_TARGET.get("updated_at", 0.0) or 0.0)
+    velocity = float(CONTROL_TARGET.get("velocity", 0.0) or 0.0)
+    yaw_rate = float(CONTROL_TARGET.get("yaw_rate", 0.0) or 0.0)
+    if updated_at <= 0.0:
+        return 0.0, 0.0, False
+    if now - updated_at <= CONTROL_TARGET_HOLD_SEC:
+        return velocity, yaw_rate, False
+    return 0.0, 0.0, bool(velocity or yaw_rate)
+
+
+def _control_target_health(now: float | None = None) -> dict[str, Any]:
+    now = time.time() if now is None else float(now)
+    updated_at = float(CONTROL_TARGET.get("updated_at", 0.0) or 0.0)
+    age_sec = max(0.0, now - updated_at) if updated_at > 0.0 else None
+    velocity, yaw_rate, stale = _effective_control_target(now=now)
+    return {
+        "velocity": float(CONTROL_TARGET.get("velocity", 0.0) or 0.0),
+        "yaw_rate": float(CONTROL_TARGET.get("yaw_rate", 0.0) or 0.0),
+        "effective_velocity": velocity,
+        "effective_yaw_rate": yaw_rate,
+        "updated_at": updated_at,
+        "age_sec": round(age_sec, 3) if age_sec is not None else None,
+        "stale": stale,
+        "publish_interval_sec": CONTROL_PUBLISH_INTERVAL_SEC,
+        "hold_sec": CONTROL_TARGET_HOLD_SEC,
+    }
+
+
 async def _control_publisher_loop() -> None:
+    stale_logged = False
     while True:
         try:
-            velocity = float(CONTROL_TARGET["velocity"])
-            yaw_rate = float(CONTROL_TARGET["yaw_rate"])
+            velocity, yaw_rate, stale = _effective_control_target()
+            if stale and not stale_logged:
+                logger.warning("control target stale; publishing stop for safety")
+                stale_logged = True
+            elif not stale:
+                stale_logged = False
             if ros.enabled and ros.bridge is not None:
                 ros.bridge.publish_cmd_vel(velocity, yaw_rate)
             else:
@@ -504,6 +540,7 @@ async def health() -> dict:
         "mapping_status": mapping_prereq["severity"],
         "mapping_blockers": list(mapping_prereq["blockers"]),
         "mapping_warnings": list(mapping_prereq["warnings"]),
+        "control_target": _control_target_health(),
         "simulator_active": bool(sim._running),
         "map_source": _current_map_source(),
         "frames": {

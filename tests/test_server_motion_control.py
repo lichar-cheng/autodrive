@@ -433,3 +433,33 @@ def test_set_control_target_updates_server_target_without_sleeping(monkeypatch) 
     assert bridge.commands == [("move", 0.6, 0.2)]
     assert main.CONTROL_TARGET["velocity"] == 0.6
     assert main.CONTROL_TARGET["yaw_rate"] == 0.2
+
+
+def test_effective_control_target_holds_recent_command(monkeypatch) -> None:
+    monkeypatch.setattr(main, "CONTROL_TARGET_HOLD_SEC", 1.0)
+    monkeypatch.setattr(main, "CONTROL_TARGET", {"velocity": 0.5, "yaw_rate": 0.1, "updated_at": 10.0})
+
+    target = main._effective_control_target(now=10.8)
+
+    assert target == (0.5, 0.1, False)
+
+
+def test_effective_control_target_stops_stale_command(monkeypatch) -> None:
+    monkeypatch.setattr(main, "CONTROL_TARGET_HOLD_SEC", 1.0)
+    monkeypatch.setattr(main, "CONTROL_TARGET", {"velocity": 0.5, "yaw_rate": 0.1, "updated_at": 10.0})
+
+    target = main._effective_control_target(now=11.01)
+
+    assert target == (0.0, 0.0, True)
+
+
+def test_control_target_health_reports_stale_age(monkeypatch) -> None:
+    monkeypatch.setattr(main, "CONTROL_TARGET_HOLD_SEC", 1.0)
+    monkeypatch.setattr(main, "CONTROL_TARGET", {"velocity": 0.5, "yaw_rate": 0.1, "updated_at": 10.0})
+
+    health = main._control_target_health(now=11.5)
+
+    assert health["velocity"] == 0.5
+    assert health["yaw_rate"] == 0.1
+    assert health["age_sec"] == 1.5
+    assert health["stale"] is True
