@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 class ScanModeRuntimeConfig(BaseModel):
     required_nodes: list[str] = Field(default_factory=list)
+    required_processes: list[str] = Field(default_factory=list)
     launch_commands: list[list[str]] = Field(default_factory=list)
     pcd_output_path: str = ""
 
@@ -15,6 +16,9 @@ class ScanModesConfig(BaseModel):
             required_nodes=[
                 "/slam_toolbox",
             ],
+            required_processes=[
+                "slam_toolbox",
+            ],
             launch_commands=[
                 ["ros2", "launch", "slam_toolbox", "online_async_launch.py"],
             ],
@@ -24,6 +28,10 @@ class ScanModesConfig(BaseModel):
         default_factory=lambda: ScanModeRuntimeConfig(
             required_nodes=[
                 "/point_lio","/slam_toolbox",
+            ],
+            required_processes=[
+                "point_lio",
+                "slam_toolbox",
             ],
             launch_commands=[
                 ["ros2", "launch", "caddie_hardware", "navigation_slam_based.launch.py"],

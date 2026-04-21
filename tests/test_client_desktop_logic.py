@@ -109,35 +109,35 @@ def test_compute_path_closed_loop_validation_reports_disconnected_path() -> None
     assert result["invalid_ids"] == {"seg-1", "seg-2", "seg-3"}
 
 
-def test_resolve_scan_fusion_config_merges_preset_and_overrides() -> None:
-    config = resolve_scan_fusion_config("indoor_balanced", {"occupied_min_hits": 5, "skip_turn_frames": False})
+def test_resolve_scan_fusion_config_merges_defaults_and_overrides_without_preset() -> None:
+    config = resolve_scan_fusion_config(None, {"occupied_min_hits": 5, "skip_turn_frames": False})
 
-    assert config["preset"] == "indoor_balanced"
-    assert config["voxel_size"] == 0.08
+    assert "preset" not in config
+    assert config["voxel_size"] == 0.15
     assert config["occupied_min_hits"] == 5
-    assert config["occupied_over_free_ratio"] == 0.75
+    assert config["occupied_over_free_ratio"] == 0.6
     assert config["skip_turn_frames"] is False
 
 
-def test_is_occupied_scan_cell_differs_between_presets() -> None:
-    sim_clean = resolve_scan_fusion_config("sim_clean")
-    indoor_sensitive = resolve_scan_fusion_config("indoor_sensitive")
+def test_is_occupied_scan_cell_uses_effective_thresholds() -> None:
+    strict = resolve_scan_fusion_config(None, {"occupied_min_hits": 3, "occupied_over_free_ratio": 0.9})
+    sensitive = resolve_scan_fusion_config(None, {"occupied_min_hits": 1, "occupied_over_free_ratio": 0.55})
     cell = {"hits": 2}
     free = {"hits": 2}
 
-    assert is_occupied_scan_cell(cell, free, sim_clean) is False
-    assert is_occupied_scan_cell(cell, free, indoor_sensitive) is True
+    assert is_occupied_scan_cell(cell, free, strict) is False
+    assert is_occupied_scan_cell(cell, free, sensitive) is True
 
 
-def test_should_skip_scan_by_turn_depends_on_preset() -> None:
-    sim_clean = resolve_scan_fusion_config("sim_clean")
-    indoor_sensitive = resolve_scan_fusion_config("indoor_sensitive")
+def test_should_skip_scan_by_turn_depends_on_effective_config() -> None:
+    skip_turns = resolve_scan_fusion_config(None, {"turn_skip_wz": 0.35, "skip_turn_frames": True})
+    keep_turns = resolve_scan_fusion_config(None, {"turn_skip_wz": 0.60, "skip_turn_frames": False})
 
-    assert should_skip_scan_by_turn(0.4, False, sim_clean) is True
-    assert should_skip_scan_by_turn(0.4, False, indoor_sensitive) is False
+    assert should_skip_scan_by_turn(0.4, False, skip_turns) is True
+    assert should_skip_scan_by_turn(0.4, False, keep_turns) is False
 
 
-def test_extract_scan_fusion_config_prefers_manifest_metadata_and_notes_voxel_fallback() -> None:
+def test_extract_scan_fusion_config_prefers_manifest_metadata_and_ignores_preset_output() -> None:
     config = extract_scan_fusion_config(
         {
             "scan_fusion": {
@@ -153,7 +153,7 @@ def test_extract_scan_fusion_config_prefers_manifest_metadata_and_notes_voxel_fa
         default_preset="indoor_balanced",
     )
 
-    assert config["preset"] == "indoor_sensitive"
+    assert "preset" not in config
     assert config["voxel_size"] == 0.07
     assert config["skip_turn_frames"] is False
 
@@ -161,17 +161,16 @@ def test_extract_scan_fusion_config_prefers_manifest_metadata_and_notes_voxel_fa
 def test_extract_scan_fusion_config_uses_notes_voxel_when_manifest_metadata_missing() -> None:
     config = extract_scan_fusion_config({"notes": "{\"voxelSize\": 0.09}"}, default_preset="indoor_balanced")
 
-    assert config["preset"] == "indoor_balanced"
+    assert "preset" not in config
     assert config["voxel_size"] == 0.09
-    assert config["occupied_min_hits"] == 2
+    assert config["occupied_min_hits"] == 1
 
 
 def test_build_scan_fusion_metadata_keeps_effective_values() -> None:
-    config = resolve_scan_fusion_config("warehouse_sparse", {"occupied_min_hits": 4})
+    config = resolve_scan_fusion_config(None, {"voxel_size": 0.1, "occupied_min_hits": 4, "occupied_over_free_ratio": 0.65, "turn_skip_wz": 0.5})
     payload = build_scan_fusion_metadata(config)
 
     assert payload == {
-        "preset": "warehouse_sparse",
         "voxel_size": 0.1,
         "occupied_min_hits": 4,
         "occupied_over_free_ratio": 0.65,

@@ -28,7 +28,6 @@ import websocket
 try:
     from .native_map_import import NativeMapImportTool
     from .logic import (
-        SCAN_FUSION_PRESETS,
         Point,
         build_scan_fusion_metadata,
         build_poi_copy_text,
@@ -46,7 +45,6 @@ try:
 except ImportError:
     from native_map_import import NativeMapImportTool  # type: ignore
     from logic import (  # type: ignore
-        SCAN_FUSION_PRESETS,
         Point,
         build_scan_fusion_metadata,
         build_poi_copy_text,
@@ -365,6 +363,10 @@ KEYUP_STOP_CONFIRM_MS = 50
 HEALTH_POLL_INTERVAL_SEC = 15.0
 MAX_MESSAGES_PER_TICK = 12
 MAX_MESSAGES_DRAIN_PER_TICK = 256
+NETWORK_LAG_DEGRADED_MS = 800
+NETWORK_SILENCE_UNSTABLE_MS = 2000
+NETWORK_RECENT_WS_ISSUE_MS = 5000
+NETWORK_CONTROL_FAILURE_UNSTABLE_COUNT = 2
 MIN_SCAN_TRANSLATION_DELTA_M = 0.05
 MIN_SCAN_ROTATION_DELTA_RAD = 0.03
 MAX_FREE_DISPLAY_CELLS = 12000
@@ -381,6 +383,31 @@ def summarize_mapping_status(health: dict) -> str:
     if status == "ok" and "mapping_ready" in health:
         return "ready"
     return status
+
+
+def classify_network_quality(
+    bridge_connected: bool,
+    stream_health: dict,
+    last_message_at_ms: int,
+    now_ms: int | None = None,
+    recent_ws_issue_ms: int = 0,
+) -> str:
+    if not bridge_connected:
+        return "offline"
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    if int(stream_health.get("control_failures_consecutive", 0) or 0) >= NETWORK_CONTROL_FAILURE_UNSTABLE_COUNT:
+        return "unstable"
+    if recent_ws_issue_ms and now_ms - int(recent_ws_issue_ms) <= NETWORK_RECENT_WS_ISSUE_MS:
+        return "unstable"
+    if last_message_at_ms and now_ms - int(last_message_at_ms) > NETWORK_SILENCE_UNSTABLE_MS:
+        return "unstable"
+    if int(stream_health.get("last_lag_ms", 0) or 0) > NETWORK_LAG_DEGRADED_MS:
+        return "degraded"
+    if int(stream_health.get("gap_err", 0) or 0) > int(stream_health.get("network_quality_gap_seen", 0) or 0):
+        return "degraded"
+    if int(stream_health.get("checksum_err", 0) or 0) > int(stream_health.get("network_quality_checksum_seen", 0) or 0):
+        return "degraded"
+    return "ok"
 
 
 def mapping_prereq_message(summary: dict) -> str:
@@ -596,6 +623,8 @@ class ServerBridge:
         self.ws: websocket.WebSocketApp | None = None
         self.session = requests.Session()
         self.session.trust_env = False
+        self.reconnect_count = 0
+        self.last_ws_issue_at_ms = 0
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
@@ -679,10 +708,12 @@ class ServerBridge:
 
         def on_close(_ws, _code, _msg) -> None:
             self.connected = False
+            self.last_ws_issue_at_ms = int(time.time() * 1000)
             self.logger.warning("ws closed code=%s msg=%s", _code, _msg)
 
         def on_error(_ws, _err) -> None:
             self.connected = False
+            self.last_ws_issue_at_ms = int(time.time() * 1000)
             self.logger.error("ws error err=%s", _err)
 
         while not self.stop_event.is_set():
@@ -705,6 +736,8 @@ class ServerBridge:
             if self.stop_event.is_set():
                 break
             retry += 1
+            self.reconnect_count += 1
+            self.last_ws_issue_at_ms = int(time.time() * 1000)
             self.logger.warning("ws reconnect scheduled retry=%s", retry)
             time.sleep(min(10.0, 0.3 * (2 ** min(retry, 5))))
 
@@ -746,6 +779,8 @@ class DesktopClient:
                 "start_scan": "Start Scan",
                 "stop_scan": "Stop Scan",
                 "clear": "Clear",
+                "scan_starting": "Starting scan...",
+                "scan_waiting_mapping": "Waiting for mapping data...",
                 "map_name": "Map Name",
                 "voxel": "Voxel",
                 "notes": "Notes",
@@ -830,6 +865,10 @@ class DesktopClient:
                 "status_line": "WS {ws} | scan {scan} | poi {poi} | path {path}",
                 "status_detail": "WS ok | clients {clients} | scan {scan} | ros {ros}",
                 "status_detail_mapping": "WS ok | clients {clients} | scan {scan} | ros {ros} | map {mapping}",
+                "network_ok": "link ok",
+                "network_degraded": "network lagging",
+                "network_unstable": "network unstable, control may lag",
+                "network_offline": "network offline",
                 "recording_obstacles": "Recording {count} obstacle cells",
                 "stopped_summary": "Stopped | {obs} obs / {free} safe",
                 "loaded_badge": "Loaded: {name}",
@@ -920,6 +959,8 @@ class DesktopClient:
                 "start_scan": "开始扫描",
                 "stop_scan": "停止扫描",
                 "clear": "清空",
+                "scan_starting": "正在启动扫描...",
+                "scan_waiting_mapping": "正在等待建图数据...",
                 "map_name": "地图名",
                 "voxel": "体素大小",
                 "notes": "备注",
@@ -1004,6 +1045,10 @@ class DesktopClient:
                 "status_line": "WS {ws} | 扫描 {scan} | POI {poi} | 路径 {path}",
                 "status_detail": "WS 正常 | 客户端 {clients} | 扫描 {scan} | ROS {ros}",
                 "status_detail_mapping": "WS 正常 | 客户端 {clients} | 扫描 {scan} | ROS {ros} | 建图 {mapping}",
+                "network_ok": "链路正常",
+                "network_degraded": "网络延迟偏高",
+                "network_unstable": "网络不稳定，控制可能延迟",
+                "network_offline": "网络离线",
                 "recording_obstacles": "正在记录 {count} 个障碍栅格",
                 "stopped_summary": "已停止 | 障碍 {obs} / 空闲 {free}",
                 "loaded_badge": "已加载：{name}",
@@ -1102,6 +1147,9 @@ class DesktopClient:
             "mode": "2d",
             "phase": "idle",
             "error": "",
+            "error_reason": "",
+            "pending_start": False,
+            "pending_mode": "",
             "started_ms": 0,
             "voxel": 0.08,
             "front_frames": 0,
@@ -1125,7 +1173,7 @@ class DesktopClient:
         self.canvas_revision = 0
         self.last_render_revision = -1
         self.scan_badges_dirty = False
-        self.scan_fusion = resolve_scan_fusion_config("indoor_balanced")
+        self.scan_fusion = resolve_scan_fusion_config()
         self.edit = {
             "tool": "view",
             "pending_obstacle_start": None,
@@ -1166,7 +1214,7 @@ class DesktopClient:
         self.map_name_var = tk.StringVar(value="desktop_map")
         self.map_notes_var = tk.StringVar(value="Desktop scan session")
         self.voxel_var = tk.StringVar(value=f"{float(self.scan_fusion['voxel_size']):.2f}")
-        self.scan_fusion_preset_var = tk.StringVar(value=str(self.scan_fusion["preset"]))
+        self.scan_fusion_preset_var = tk.StringVar(value="")
         self.occupied_min_hits_var = tk.StringVar(value=str(int(self.scan_fusion["occupied_min_hits"])))
         self.occupied_over_free_ratio_var = tk.StringVar(value=f"{float(self.scan_fusion['occupied_over_free_ratio']):.2f}")
         self.turn_skip_wz_var = tk.StringVar(value=f"{float(self.scan_fusion['turn_skip_wz']):.2f}")
@@ -1225,6 +1273,10 @@ class DesktopClient:
             "retries_http": 0,
             "last_lag_ms": 0,
             "last_api_error": "",
+            "control_failures_consecutive": 0,
+            "network_quality_gap_seen": 0,
+            "network_quality_checksum_seen": 0,
+            "network_quality": "offline",
             "last_seq": {},
         }
         self.auth_context = {"base_url": "", "user_name": "", "token": "", "http_url": "", "ws_url": ""}
@@ -1420,6 +1472,8 @@ class DesktopClient:
         card = ttk.LabelFrame(parent, text=self.tr("scan"), padding=8)
         card.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(card, textvariable=self.scan_state_var).pack(anchor=tk.W, pady=(0, 6))
+        self.scan_progress = ttk.Progressbar(card, mode="indeterminate", length=160)
+        self.scan_progress.pack(fill=tk.X, pady=(0, 6))
         mode_row = ttk.Frame(card)
         mode_row.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(mode_row, text=self.tr("scan_mode_label"), width=18).pack(side=tk.LEFT)
@@ -1718,15 +1772,53 @@ class DesktopClient:
         self.batch_action_btn.configure(text=self.tr("start_batch_add") if self.pending_poi is None and not self.pending_poi_queue else self.tr("cancel_batch", count=len(self.pending_poi_queue) + (1 if self.pending_poi else 0)))
 
     def update_health_status_detail(self, health: dict) -> None:
+        if (
+            hasattr(self, "scan")
+            and self.scan.get("phase") == "waiting_mapping"
+            and bool(self.scan.get("pending_start"))
+            and (self.scan.get("error_reason") or self.scan.get("error")) == "mapping_prereq_failed"
+            and bool(health.get("mapping_ready"))
+        ):
+            mode = str(self.scan.get("pending_mode") or self.scan.get("mode") or "2d")
+            response = self.call_api("/scan/start", {"mode": mode})
+            self._finish_start_scan(mode, response, show_mapping_warning=False)
+        if (
+            hasattr(self, "scan")
+            and self.scan.get("phase") == "error"
+            and (self.scan.get("error_reason") or self.scan.get("error")) == "mapping_prereq_failed"
+            and bool(health.get("mapping_ready"))
+        ):
+            self.scan["phase"] = "idle"
+            self.scan["error"] = ""
+            self.scan["error_reason"] = ""
+            self.sync_scan_badges()
+        network_quality = self.update_network_quality()
         self.status_detail_var.set(
             self.tr(
                 "status_detail_mapping",
                 clients=health.get("ws_clients", "n/a"),
                 scan="on" if health.get("scan_active") else "off",
                 ros="enabled" if health.get("ros_enabled") else "detected only",
-                mapping=summarize_mapping_status(health),
+                mapping=f"{summarize_mapping_status(health)} | {self.tr(f'network_{network_quality}')}",
             )
         )
+
+    def update_network_quality(self) -> str:
+        if not hasattr(self, "stream_health"):
+            self.stream_health = {}
+        bridge = getattr(self, "bridge", None)
+        recent_ws_issue_ms = int(getattr(bridge, "last_ws_issue_at_ms", 0) or 0) if bridge is not None else 0
+        quality = classify_network_quality(
+            bool(bridge and bridge.connected),
+            self.stream_health,
+            int(getattr(self, "last_message_at_ms", 0) or 0),
+            recent_ws_issue_ms=recent_ws_issue_ms,
+        )
+        self.stream_health["network_quality"] = quality
+        if quality == "ok":
+            self.stream_health["network_quality_gap_seen"] = int(self.stream_health.get("gap_err", 0) or 0)
+            self.stream_health["network_quality_checksum_seen"] = int(self.stream_health.get("checksum_err", 0) or 0)
+        return quality
 
     def open_login_dialog(self) -> None:
         dialog = tk.Toplevel(self.root)
@@ -1862,13 +1954,14 @@ class DesktopClient:
             self.scan_badges_dirty = False
             self.sync_scan_badges()
         self.poll_health()
+        network_quality = self.update_network_quality()
         self.render_canvas_if_needed()
         self.render_text_panels()
         self.conn_var.set(self.tr("connected") if self.bridge and self.bridge.connected else self.tr("disconnected"))
         self.status_var.set(
             self.tr(
                 "status_line",
-                ws="ok" if self.bridge and self.bridge.connected else "offline",
+                ws=self.tr(f"network_{network_quality}"),
                 scan="on" if self.scan["active"] else "off",
                 poi=len(self.poi_nodes),
                 path=len(self.path_segments),
@@ -1992,23 +2085,75 @@ class DesktopClient:
 
     def start_scan(self) -> None:
         mode = str(getattr(self, "scan_mode_var", None).get() if getattr(self, "scan_mode_var", None) is not None else self.scan.get("mode", "2d")).strip().lower()
+        if self.scan.get("phase") == "starting":
+            return
         self.scan["phase"] = "starting"
         self.scan["error"] = ""
+        self.scan["error_reason"] = ""
+        self.scan["pending_start"] = False
+        self.scan["pending_mode"] = ""
+        if hasattr(self, "scan_state_var"):
+            self.scan_state_var.set(self.tr("scan_starting"))
+        if hasattr(self, "scan_progress"):
+            self.scan_progress.start(80)
+        if getattr(self, "root", None) is not None:
+            try:
+                self.root.update_idletasks()
+            except Exception:
+                pass
+        if getattr(self, "root", None) is not None and getattr(self, "bridge", None) is not None:
+            threading.Thread(target=self._start_scan_worker, args=(mode,), daemon=True, name="scan-start").start()
+            return
         response = self.call_api("/scan/start", {"mode": mode})
+        self._finish_start_scan(mode, response)
+
+    def _start_scan_worker(self, mode: str) -> None:
+        response = None
+        try:
+            if hasattr(self, "stream_health"):
+                self.stream_health["last_api_error"] = ""
+            response = self.bridge.post("/scan/start", {"mode": mode}, timeout_sec=30.0)
+        except Exception as exc:
+            if hasattr(self, "stream_health"):
+                self.stream_health["retries_http"] += 1
+                self.stream_health["last_api_error"] = str(exc)
+            if hasattr(self, "logger"):
+                self.logger.exception("scan start failed")
+        if getattr(self, "root", None) is not None:
+            self.root.after(0, lambda: self._finish_start_scan(mode, response))
+
+    def _finish_start_scan(self, mode: str, response: dict | None, show_mapping_warning: bool = True) -> None:
+        if hasattr(self, "scan_progress"):
+            self.scan_progress.stop()
         if response is None:
             self.scan["phase"] = "error"
             self.scan["error"] = "request_failed"
+            self.scan["error_reason"] = "request_failed"
+            self.scan["pending_start"] = False
+            self.scan["pending_mode"] = ""
             if hasattr(self, "scan_state_var"):
                 self.scan_state_var.set("request_failed")
             return
         if not bool(response.get("ok", True)):
             detail = str(response.get("error") or response.get("reason") or "scan_start_failed")
+            if response.get("reason") == "mapping_prereq_failed":
+                self.scan["phase"] = "waiting_mapping"
+                self.scan["error"] = detail
+                self.scan["error_reason"] = "mapping_prereq_failed"
+                self.scan["pending_start"] = True
+                self.scan["pending_mode"] = mode
+                if hasattr(self, "scan_state_var"):
+                    self.scan_state_var.set(self.tr("scan_waiting_mapping"))
+                if show_mapping_warning:
+                    messagebox.showwarning(self.tr("scan"), mapping_prereq_message(response.get("mapping_prereq") or {}))
+                return
             self.scan["phase"] = "error"
             self.scan["error"] = detail
+            self.scan["error_reason"] = str(response.get("reason") or detail)
+            self.scan["pending_start"] = False
+            self.scan["pending_mode"] = ""
             if hasattr(self, "scan_state_var"):
                 self.scan_state_var.set(detail)
-            if response.get("reason") == "mapping_prereq_failed":
-                messagebox.showwarning(self.tr("scan"), mapping_prereq_message(response.get("mapping_prereq") or {}))
             return
         if response is not None:
             self.clear_scan()
@@ -2018,16 +2163,31 @@ class DesktopClient:
             self.scan["mode"] = str(response.get("scan_mode") or mode)
             self.scan["phase"] = "scanning"
             self.scan["error"] = ""
+            self.scan["error_reason"] = ""
+            self.scan["pending_start"] = False
+            self.scan["pending_mode"] = ""
             self.scan["started_ms"] = int(time.time() * 1000)
             self.sync_scan_badges()
 
     def stop_scan(self) -> None:
         mode = str(self.scan.get("mode", "2d")).strip().lower()
         self.scan["phase"] = "stopping"
+        if hasattr(self, "scan_state_var"):
+            self.scan_state_var.set(self.tr("scan_stopping"))
+        if hasattr(self, "scan_progress"):
+            self.scan_progress.start(80)
+        if getattr(self, "root", None) is not None:
+            try:
+                self.root.update_idletasks()
+            except Exception:
+                pass
         response = self.call_api("/scan/stop", {"mode": mode})
+        if hasattr(self, "scan_progress"):
+            self.scan_progress.stop()
         if response is None:
             self.scan["phase"] = "error"
             self.scan["error"] = "request_failed"
+            self.scan["error_reason"] = "request_failed"
             if hasattr(self, "scan_state_var"):
                 self.scan_state_var.set("request_failed")
             return
@@ -2035,6 +2195,7 @@ class DesktopClient:
             detail = str(response.get("error") or response.get("reason") or "scan_stop_failed")
             self.scan["phase"] = "error"
             self.scan["error"] = detail
+            self.scan["error_reason"] = str(response.get("reason") or detail)
             if hasattr(self, "scan_state_var"):
                 self.scan_state_var.set(detail)
             return
@@ -2051,6 +2212,7 @@ class DesktopClient:
             self.scan["pcd_received_at"] = int(time.time() * 1000)
         self.scan["phase"] = "idle"
         self.scan["error"] = ""
+        self.scan["error_reason"] = ""
         self.sync_scan_badges()
 
     def clear_scan(self) -> None:
@@ -2073,6 +2235,8 @@ class DesktopClient:
         free = len(self.active_free_cells())
         if self.scan.get("phase") == "error" and self.scan.get("error"):
             self.scan_state_var.set(str(self.scan["error"]))
+        elif self.scan.get("phase") == "waiting_mapping":
+            self.scan_state_var.set(self.tr("scan_waiting_mapping"))
         elif self.scan.get("phase") == "receiving_pcd":
             self.scan_state_var.set(self.tr("scan_receiving_pcd"))
         elif self.scan["active"]:
@@ -2123,6 +2287,41 @@ class DesktopClient:
             return [dict(cell) for cell in getattr(self, "server_grid", {}).get("free_cells", [])]
         return self.filtered_free_cells()
 
+    def active_map_fence_xy(self) -> list[dict[str, float]]:
+        if self.should_use_server_grid():
+            server_grid = getattr(self, "server_grid", {}) or {}
+            width = int(server_grid.get("width", 0) or 0)
+            height = int(server_grid.get("height", 0) or 0)
+            if width > 0 and height > 0:
+                resolution = max(0.02, float(server_grid.get("resolution", self.active_voxel_size())))
+                origin = server_grid.get("origin") if isinstance(server_grid.get("origin"), dict) else {}
+                min_x = float(origin.get("x", 0.0))
+                min_y = float(origin.get("y", 0.0))
+                max_x = min_x + width * resolution
+                max_y = min_y + height * resolution
+                return [
+                    {"x": round(min_x, 3), "y": round(min_y, 3)},
+                    {"x": round(max_x, 3), "y": round(min_y, 3)},
+                    {"x": round(max_x, 3), "y": round(max_y, 3)},
+                    {"x": round(min_x, 3), "y": round(max_y, 3)},
+                    {"x": round(min_x, 3), "y": round(min_y, 3)},
+                ]
+        cells = self.active_occupancy_cells() + self.active_free_cells()
+        if not cells:
+            return []
+        voxel = self.active_voxel_size()
+        min_x = min(float(cell["ix"]) * voxel for cell in cells)
+        min_y = min(float(cell["iy"]) * voxel for cell in cells)
+        max_x = (max(float(cell["ix"]) for cell in cells) + 1.0) * voxel
+        max_y = (max(float(cell["iy"]) for cell in cells) + 1.0) * voxel
+        return [
+            {"x": round(min_x, 3), "y": round(min_y, 3)},
+            {"x": round(max_x, 3), "y": round(min_y, 3)},
+            {"x": round(max_x, 3), "y": round(max_y, 3)},
+            {"x": round(min_x, 3), "y": round(max_y, 3)},
+            {"x": round(min_x, 3), "y": round(min_y, 3)},
+        ]
+
     def update_server_grid(self, payload: dict[str, Any], stamp: float) -> None:
         was_active = bool(self.server_grid.get("active"))
         resolution = max(0.02, float(payload.get("resolution", getattr(self, "scan", {}).get("voxel", 0.08))))
@@ -2170,14 +2369,15 @@ class DesktopClient:
             "turn_skip_wz": max(0.0, self.number(self.turn_skip_wz_var, float(self.scan_fusion.get("turn_skip_wz", 0.45)))),
             "skip_turn_frames": bool(self.skip_turn_frames_var.get()),
         }
-        return resolve_scan_fusion_config(self.scan_fusion_preset_var.get(), overrides)
+        return resolve_scan_fusion_config(None, overrides)
 
     def apply_scan_fusion_config(self, config: dict, update_vars: bool = True) -> dict:
-        resolved = resolve_scan_fusion_config(str(config.get("preset", "indoor_balanced")), config)
+        resolved = resolve_scan_fusion_config(str(config.get("preset", "")), config)
         self.scan_fusion = resolved
         self.scan["voxel"] = float(resolved["voxel_size"])
         if update_vars:
-            self.scan_fusion_preset_var.set(str(resolved["preset"]))
+            if hasattr(self, "scan_fusion_preset_var"):
+                self.scan_fusion_preset_var.set("")
             self.voxel_var.set(f"{float(resolved['voxel_size']):.2f}")
             self.occupied_min_hits_var.set(str(int(resolved["occupied_min_hits"])))
             self.occupied_over_free_ratio_var.set(f"{float(resolved['occupied_over_free_ratio']):.2f}")
@@ -2263,6 +2463,7 @@ class DesktopClient:
             "scan_fusion": build_scan_fusion_metadata(config),
             "occupied_cells": self.active_occupancy_cells(),
             "free_cells": self.active_free_cells(),
+            "map_fence_xy": self.active_map_fence_xy(),
         }
 
     def point_from_poi(self, poi: Poi) -> Point:
@@ -2714,6 +2915,8 @@ class DesktopClient:
         if bridge is None or not bridge.connected:
             return
         bridge.post(path, body, retries=0, timeout_sec=0.35, backoff_base_sec=0.0)
+        if hasattr(self, "stream_health"):
+            self.stream_health["control_failures_consecutive"] = 0
 
     def _control_sender_loop(self) -> None:
         while not self.control_sender_stop.is_set():
@@ -2730,6 +2933,7 @@ class DesktopClient:
             except Exception as exc:
                 if hasattr(self, "stream_health"):
                     self.stream_health["retries_http"] += 1
+                    self.stream_health["control_failures_consecutive"] = int(self.stream_health.get("control_failures_consecutive", 0) or 0) + 1
                     self.stream_health["last_api_error"] = str(exc)
                 if hasattr(self, "logger"):
                     self.logger.warning("control sender failed path=%s err=%s", path, exc)
@@ -3244,7 +3448,7 @@ class DesktopClient:
         )
 
     def set_inspector_bundle_state(self, file_name: str, manifest: dict, points: list) -> None:
-        config = extract_scan_fusion_config(manifest, default_preset=self.scan_fusion_preset_var.get())
+        config = extract_scan_fusion_config(manifest, default_preset="")
         resolution = float(config["voxel_size"])
         pgm = self.build_pgm_export(manifest, points, resolution)
         yaml_text = self.build_yaml_export(file_name, resolution, pgm["origin"])
@@ -3268,7 +3472,6 @@ class DesktopClient:
         notes = {
             "text": self.map_notes_var.get().strip(),
             "voxelSize": voxel_size,
-            "scanFusionPreset": config["preset"],
             "loadedFromStcm": self.edit["loaded_from_stcm"],
             "loadedMapName": self.edit["loaded_map_name"] or None,
             "manualCameraSnapshotAt": self.camera_refresh_var.get(),
@@ -3354,7 +3557,7 @@ class DesktopClient:
         self.clear_scan()
         self.scan["active"] = False
         self.scan["mode"] = str(manifest.get("scan_mode", "2d")).lower()
-        config = extract_scan_fusion_config(manifest, default_preset=self.scan_fusion_preset_var.get())
+        config = extract_scan_fusion_config(manifest, default_preset="")
         self.apply_scan_fusion_config(config, update_vars=True)
         occ = manifest.get("occupancy") or manifest.get("browser_occupancy", {})
         if isinstance(occ, dict) and isinstance(occ.get("occupied_cells"), list):

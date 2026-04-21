@@ -11,6 +11,7 @@ from client_desktop.app import (
     build_camera_refresh_text,
     build_direct_ws_url,
     can_zoom_from_widget,
+    classify_network_quality,
     coalesce_stream_messages,
     compose_http_base_url,
     compute_log_candidates,
@@ -50,6 +51,18 @@ class DummyLock:
         return False
 
 
+class DummyProgress:
+    def __init__(self) -> None:
+        self.started: list[int] = []
+        self.stopped = 0
+
+    def start(self, interval: int) -> None:
+        self.started.append(interval)
+
+    def stop(self) -> None:
+        self.stopped += 1
+
+
 def build_minimal_client() -> DesktopClient:
     client = DesktopClient.__new__(DesktopClient)
     client.root = None
@@ -58,6 +71,9 @@ def build_minimal_client() -> DesktopClient:
         "mode": "2d",
         "phase": "idle",
         "error": "",
+        "error_reason": "",
+        "pending_start": False,
+        "pending_mode": "",
         "started_ms": 0,
         "voxel": 0.08,
         "front_frames": 0,
@@ -334,6 +350,21 @@ def test_start_scan_sends_selected_mode_and_updates_phase() -> None:
     assert client.scan["phase"] == "scanning"
 
 
+def test_start_scan_shows_starting_feedback_before_request_returns() -> None:
+    client = build_minimal_client()
+
+    def call_api(_path, _body):
+        assert client.scan["phase"] == "starting"
+        assert client.scan_state_var.get() == "scan_starting"
+        return {"ok": True, "scan_mode": "2d"}
+
+    client.call_api = call_api
+
+    DesktopClient.start_scan(client)
+
+    assert client.scan["phase"] == "scanning"
+
+
 def test_stop_scan_3d_stores_pcd_payload_and_returns_idle() -> None:
     client = build_minimal_client()
     client.scan["active"] = True
@@ -356,6 +387,25 @@ def test_stop_scan_3d_stores_pcd_payload_and_returns_idle() -> None:
     assert client.scan["pcd_bytes"] == b"pcd-bytes"
 
 
+def test_stop_scan_shows_stopping_feedback_before_request_returns() -> None:
+    client = build_minimal_client()
+    progress = DummyProgress()
+    client.scan_progress = progress
+
+    def call_api(_path, _body):
+        assert client.scan["phase"] == "stopping"
+        assert client.scan_state_var.get() == "scan_stopping"
+        assert progress.started == [80]
+        return {"ok": True, "scan_mode": "2d"}
+
+    client.call_api = call_api
+
+    DesktopClient.stop_scan(client)
+
+    assert progress.stopped == 1
+    assert client.scan["phase"] == "idle"
+
+
 def test_start_scan_persists_server_error_reason_in_status() -> None:
     client = build_minimal_client()
     client.call_api = lambda path, body: {"ok": False, "reason": "node_start_failed", "error": "failed to launch"}
@@ -365,6 +415,31 @@ def test_start_scan_persists_server_error_reason_in_status() -> None:
     assert client.scan["phase"] == "error"
     assert client.scan["error"] == "failed to launch"
     assert "failed to launch" in client.scan_state_var.get()
+
+
+def test_health_ready_retries_mapping_prereq_pending_scan() -> None:
+    client = build_minimal_client()
+    client.scan["phase"] = "waiting_mapping"
+    client.scan["pending_start"] = True
+    client.scan["pending_mode"] = "3d"
+    client.scan["error"] = "tf base->lidar missing"
+    client.scan["error_reason"] = "mapping_prereq_failed"
+    client.update_network_banner = lambda health: None
+    client.status_detail_var = DummyVar("")
+    calls = []
+    client.call_api = lambda path, body: calls.append((path, body)) or {"ok": True, "scan_mode": "3d"}
+
+    DesktopClient.update_health_status_detail(
+        client,
+        {"ws_clients": 1, "scan_active": False, "ros_enabled": True, "mapping_status": "ok", "mapping_ready": True},
+    )
+
+    assert calls == [("/scan/start", {"mode": "3d"})]
+    assert client.scan["phase"] == "scanning"
+    assert client.scan["active"] is True
+    assert client.scan["error"] == ""
+    assert client.scan["error_reason"] == ""
+    assert client.scan["pending_start"] is False
 
 
 def test_write_slam_archive_omits_pcd_for_2d(tmp_path: Path) -> None:
@@ -504,6 +579,64 @@ def test_send_control_command_now_uses_fast_timeout_without_retries() -> None:
     DesktopClient.send_control_command_now(client, "/control/move", {"velocity": 0.8})
 
     assert seen == [("/control/move", {"velocity": 0.8}, 0, 0.35, 0.0)]
+
+
+def test_network_quality_classifies_existing_signals_without_extra_polling() -> None:
+    assert classify_network_quality(False, {}, 10_000, now_ms=10_100) == "offline"
+    assert classify_network_quality(True, {"control_failures_consecutive": 2}, 10_000, now_ms=10_100) == "unstable"
+    assert classify_network_quality(True, {}, 7_000, now_ms=10_100) == "unstable"
+    assert classify_network_quality(True, {"last_lag_ms": 900}, 10_000, now_ms=10_100) == "degraded"
+    assert classify_network_quality(True, {"gap_err": 2, "network_quality_gap_seen": 1}, 10_000, now_ms=10_100) == "degraded"
+    assert classify_network_quality(True, {"last_lag_ms": 20}, 10_000, now_ms=10_100) == "ok"
+
+
+def test_update_health_status_detail_includes_network_warning() -> None:
+    client = DesktopClient.__new__(DesktopClient)
+    client.status_detail_var = DummyVar("")
+    client.stream_health = {"control_failures_consecutive": 2}
+    client.last_message_at_ms = 10_000
+    client.bridge = types.SimpleNamespace(connected=True, last_ws_issue_at_ms=0)
+    client.tr = lambda key, **kwargs: key if not kwargs else f"{key}:{kwargs}"
+
+    DesktopClient.update_health_status_detail(client, {"ws_clients": 1, "scan_active": False, "ros_enabled": True, "mapping_status": "ok", "mapping_ready": True})
+
+    assert "network_unstable" in client.status_detail_var.get()
+
+
+def test_control_sender_loop_counts_consecutive_control_failures() -> None:
+    class Event:
+        def wait(self, timeout=None):
+            return False
+
+        def clear(self) -> None:
+            return None
+
+    class Stop:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def is_set(self) -> bool:
+            self.calls += 1
+            return self.calls > 3
+
+    class Var:
+        def get(self):
+            return "120"
+
+    client = DesktopClient.__new__(DesktopClient)
+    client.control_sender_event = Event()
+    client.control_sender_stop = Stop()
+    client.control_lock = type("Lock", (), {"__enter__": lambda self: None, "__exit__": lambda self, exc_type, exc, tb: None})()
+    client.control_target = ("/control/target", {"velocity": 0.8, "yaw_rate": 0.0}, "forward")
+    client.repeat_ms_var = Var()
+    client.stream_health = {"retries_http": 0, "control_failures_consecutive": 0, "last_api_error": ""}
+    client.number = DesktopClient.number.__get__(client, DesktopClient)
+    client.send_control_command_now = lambda _path, _body: (_ for _ in ()).throw(RuntimeError("timeout"))
+
+    DesktopClient._control_sender_loop(client)
+
+    assert client.stream_health["control_failures_consecutive"] == 3
+    assert client.stream_health["retries_http"] == 3
 
 
 def test_control_sender_loop_uses_repeat_ms_interval() -> None:
@@ -803,7 +936,7 @@ def test_browser_occupancy_includes_scan_fusion_metadata() -> None:
 
     payload = DesktopClient.browser_occupancy(client)
 
-    assert payload["scan_fusion"]["preset"] == "indoor_sensitive"
+    assert "preset" not in payload["scan_fusion"]
     assert payload["scan_fusion"]["occupied_min_hits"] == 1
     assert payload["occupied_cells"] == [{"ix": 1, "iy": 2, "hits": 1, "intensity": 0.8}]
 
@@ -917,6 +1050,53 @@ def test_server_grid_browser_occupancy_overrides_local_scan_when_not_editing_loa
     assert payload["voxel_size"] == 0.5
     assert payload["occupied_cells"] == [{"ix": 1, "iy": 2, "hits": 3, "intensity": 1.0}]
     assert payload["free_cells"] == [{"ix": 3, "iy": 4, "hits": 2}]
+
+
+def test_browser_occupancy_includes_closed_map_fence_from_server_grid() -> None:
+    client = build_minimal_client()
+    client.server_grid = {
+        "active": True,
+        "resolution": 0.5,
+        "occupied_cells": [{"ix": 1, "iy": 2, "hits": 3, "intensity": 1.0}],
+        "free_cells": [],
+        "origin": {"x": -1.0, "y": 2.0},
+        "width": 4,
+        "height": 3,
+    }
+    client.edit = {"loaded_from_stcm": False}
+    client.active_map_fence_xy = DesktopClient.active_map_fence_xy.__get__(client, DesktopClient)
+    client.effective_scan_fusion_config = lambda: {}
+
+    payload = DesktopClient.browser_occupancy(client)
+
+    assert payload["map_fence_xy"] == [
+        {"x": -1.0, "y": 2.0},
+        {"x": 1.0, "y": 2.0},
+        {"x": 1.0, "y": 3.5},
+        {"x": -1.0, "y": 3.5},
+        {"x": -1.0, "y": 2.0},
+    ]
+
+
+def test_browser_occupancy_includes_closed_map_fence_from_active_cells() -> None:
+    client = build_minimal_client()
+    client.scan["voxel"] = 0.5
+    client.active_occupancy_cells = lambda: [{"ix": 2, "iy": 1, "hits": 3, "intensity": 1.0}]
+    client.active_free_cells = lambda: [{"ix": 4, "iy": 3, "hits": 1}]
+    client.active_voxel_size = lambda: 0.5
+    client.should_use_server_grid = lambda: False
+    client.active_map_fence_xy = DesktopClient.active_map_fence_xy.__get__(client, DesktopClient)
+    client.effective_scan_fusion_config = lambda: {}
+
+    payload = DesktopClient.browser_occupancy(client)
+
+    assert payload["map_fence_xy"] == [
+        {"x": 1.0, "y": 0.5},
+        {"x": 2.5, "y": 0.5},
+        {"x": 2.5, "y": 2.0},
+        {"x": 1.0, "y": 2.0},
+        {"x": 1.0, "y": 0.5},
+    ]
 
 
 def test_consume_messages_stores_server_grid_payload() -> None:
@@ -1050,14 +1230,13 @@ def test_apply_scan_fusion_config_updates_runtime_and_vars() -> None:
     client.turn_skip_wz_var = Var("0.45")
     client.skip_turn_frames_var = Var(True)
 
-    DesktopClient.apply_scan_fusion_config(client, {"preset": "warehouse_sparse", "occupied_min_hits": 4}, update_vars=True)
+    DesktopClient.apply_scan_fusion_config(client, {"voxel_size": 0.1, "occupied_min_hits": 4, "occupied_over_free_ratio": 0.65, "turn_skip_wz": 0.5}, update_vars=True)
 
     assert client.scan["voxel"] == 0.1
-    assert client.scan_fusion_preset_var.get() == "warehouse_sparse"
     assert client.occupied_min_hits_var.get() == "4"
 
 
-def test_on_scan_fusion_preset_selected_loads_preset_defaults() -> None:
+def test_apply_scan_fusion_config_accepts_legacy_preset_defaults() -> None:
     class Var:
         def __init__(self, value) -> None:
             self.value = value
@@ -1070,8 +1249,8 @@ def test_on_scan_fusion_preset_selected_loads_preset_defaults() -> None:
 
     client = DesktopClient.__new__(DesktopClient)
     client.scan = {"voxel": 0.2}
-    client.scan_fusion = {"preset": "indoor_balanced", "voxel_size": 0.2, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
-    client.scan_fusion_preset_var = Var("warehouse_sparse")
+    client.scan_fusion = {"voxel_size": 0.2, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
+    client.scan_fusion_preset_var = Var("")
     client.voxel_var = Var("0.20")
     client.occupied_min_hits_var = Var("2")
     client.occupied_over_free_ratio_var = Var("0.75")
@@ -1079,7 +1258,7 @@ def test_on_scan_fusion_preset_selected_loads_preset_defaults() -> None:
     client.skip_turn_frames_var = Var(True)
     client.apply_scan_fusion_config = DesktopClient.apply_scan_fusion_config.__get__(client, DesktopClient)
 
-    DesktopClient.on_scan_fusion_preset_selected(client)
+    DesktopClient.apply_scan_fusion_config(client, {"preset": "warehouse_sparse"}, update_vars=True)
 
     assert client.scan["voxel"] == 0.10
     assert client.voxel_var.get() == "0.10"
@@ -1088,7 +1267,7 @@ def test_on_scan_fusion_preset_selected_loads_preset_defaults() -> None:
     assert client.turn_skip_wz_var.get() == "0.50"
 
 
-def test_start_scan_does_not_activate_local_scan_when_server_rejects_prereq(monkeypatch) -> None:
+def test_start_scan_waits_when_server_rejects_prereq(monkeypatch) -> None:
     warnings = []
     monkeypatch.setattr("client_desktop.app.messagebox.showwarning", lambda title, message: warnings.append((title, message)))
 
@@ -1107,6 +1286,9 @@ def test_start_scan_does_not_activate_local_scan_when_server_rejects_prereq(monk
     DesktopClient.start_scan(client)
 
     assert client.scan["active"] is False
+    assert client.scan["phase"] == "waiting_mapping"
+    assert client.scan["pending_start"] is True
+    assert client.scan["error_reason"] == "mapping_prereq_failed"
     assert warnings
 
 

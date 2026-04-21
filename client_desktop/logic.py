@@ -41,6 +41,10 @@ SCAN_FUSION_PRESETS: dict[str, dict[str, Any]] = {
     },
 }
 
+DEFAULT_SCAN_FUSION_CONFIG: dict[str, Any] = {
+    key: value for key, value in SCAN_FUSION_PRESETS["indoor_balanced"].items() if key != "preset"
+}
+
 
 @dataclass
 class Point:
@@ -87,13 +91,12 @@ def parse_optional_float(value: Any) -> float | None:
 
 
 def resolve_scan_fusion_config(preset: str | None = None, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
-    selected = str(preset or "indoor_balanced")
-    base = SCAN_FUSION_PRESETS.get(selected, SCAN_FUSION_PRESETS["indoor_balanced"])
-    config = dict(base)
-    config["preset"] = selected if selected in SCAN_FUSION_PRESETS else "indoor_balanced"
+    selected = str(preset or "").strip()
+    base = SCAN_FUSION_PRESETS.get(selected, DEFAULT_SCAN_FUSION_CONFIG) if selected else DEFAULT_SCAN_FUSION_CONFIG
+    config = {key: value for key, value in dict(base).items() if key != "preset"}
     if overrides:
         for key, value in overrides.items():
-            if value is None:
+            if value is None or key == "preset":
                 continue
             config[key] = value
     config["voxel_size"] = max(0.02, float(config["voxel_size"]))
@@ -119,9 +122,8 @@ def is_occupied_scan_cell(cell: dict[str, Any], free: dict[str, Any] | None, con
 
 
 def build_scan_fusion_metadata(config: dict[str, Any]) -> dict[str, Any]:
-    resolved = resolve_scan_fusion_config(str(config.get("preset", "indoor_balanced")), config)
+    resolved = resolve_scan_fusion_config(str(config.get("preset", "")), config)
     return {
-        "preset": str(resolved["preset"]),
         "voxel_size": float(resolved["voxel_size"]),
         "occupied_min_hits": int(resolved["occupied_min_hits"]),
         "occupied_over_free_ratio": float(resolved["occupied_over_free_ratio"]),
@@ -143,7 +145,7 @@ def extract_scan_fusion_config(manifest: dict[str, Any], default_preset: str = "
             parsed_notes = None
         if isinstance(parsed_notes, dict) and "voxelSize" in parsed_notes and "voxel_size" not in overrides:
             overrides["voxel_size"] = parsed_notes["voxelSize"]
-    preset = str(overrides.get("preset") or default_preset)
+    preset = str(overrides.get("preset") or default_preset or "")
     return resolve_scan_fusion_config(preset, overrides)
 
 

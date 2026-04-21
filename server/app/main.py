@@ -6,6 +6,8 @@ import copy
 import hashlib
 import json
 import logging
+import os
+import signal
 import subprocess
 import threading
 import time
@@ -36,6 +38,29 @@ from .topic_bus import TopicBus
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("autodrive.server")
 
+
+class _SuccessPostAccessLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args if isinstance(record.args, tuple) else ()
+        method = str(args[1]) if len(args) >= 5 else ""
+        try:
+            status_code = int(args[4]) if len(args) >= 5 else 0
+        except (TypeError, ValueError):
+            status_code = 0
+        if method.upper() == "POST" and 200 <= status_code < 300:
+            logging.getLogger(record.name).debug(record.getMessage())
+            return False
+        return True
+
+
+def _install_access_log_filter() -> None:
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(existing, _SuccessPostAccessLogFilter) for existing in access_logger.filters):
+        access_logger.addFilter(_SuccessPostAccessLogFilter())
+
+
+_install_access_log_filter()
+
 app = FastAPI(title="AutoDrive Mapping Server", version="0.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -48,8 +73,18 @@ seq_by_topic: dict[str, int] = defaultdict(int)
 ws_clients: set[int] = set()
 motion_command_seq = 0
 CONTROL_TARGET = {"velocity": 0.0, "yaw_rate": 0.0, "updated_at": 0.0}
-CONTROL_PUBLISH_INTERVAL_SEC = 0.05
+CONTROL_PUBLISH_INTERVAL_SEC = 0.1
 CONTROL_TARGET_HOLD_SEC = 1.0
+CONTROL_STOP_BURST_TICKS = 3
+CONTROL_STOP_BURST_REMAINING = 0
+CONTROL_RUNTIME = {
+    "last_zero_source": "",
+    "last_zero_at": 0.0,
+    "last_publish_source": "",
+    "last_logged_source": "",
+    "last_logged_velocity": None,
+    "last_logged_yaw_rate": None,
+}
 control_task: asyncio.Task | None = None
 
 
@@ -98,7 +133,15 @@ SCAN_SESSION = {
     "front_frames": 0,
     "rear_frames": 0,
     "raw_points": 0,
-    "dependency_status": {"required_nodes": [], "missing_nodes": [], "started_nodes": [], "errors": []},
+    "dependency_status": {
+        "required_nodes": [],
+        "missing_nodes": [],
+        "started_nodes": [],
+        "required_processes": [],
+        "missing_processes": [],
+        "started_processes": [],
+        "errors": [],
+    },
     "pcd_transfer_state": "idle",
     "pcd_file": None,
 }
@@ -106,6 +149,8 @@ SCAN_SESSION = {
 LAUNCHED_SCAN_PROCESSES: list[subprocess.Popen[str]] = []
 SCAN_DEPENDENCY_POLL_ATTEMPTS = 10
 SCAN_DEPENDENCY_POLL_INTERVAL_SEC = 1.0
+SCAN_MAPPING_PREREQ_POLL_ATTEMPTS = 10
+SCAN_MAPPING_PREREQ_POLL_INTERVAL_SEC = 0.5
 
 
 def _checksum(topic: str, stamp: float, seq: int, payload: dict) -> str:
@@ -146,7 +191,15 @@ def _reset_scan_session(voxel_size: float | None = None, keep_points: bool = Fal
     SCAN_SESSION["front_frames"] = 0
     SCAN_SESSION["rear_frames"] = 0
     SCAN_SESSION["raw_points"] = 0
-    SCAN_SESSION["dependency_status"] = {"required_nodes": [], "missing_nodes": [], "started_nodes": [], "errors": []}
+    SCAN_SESSION["dependency_status"] = {
+        "required_nodes": [],
+        "missing_nodes": [],
+        "started_nodes": [],
+        "required_processes": [],
+        "missing_processes": [],
+        "started_processes": [],
+        "errors": [],
+    }
     SCAN_SESSION["pcd_transfer_state"] = "idle"
     SCAN_SESSION["pcd_file"] = None
     if voxel_size is not None:
@@ -206,6 +259,46 @@ def _check_required_nodes(nodes: list[str]) -> dict[str, Any]:
     }
 
 
+def _list_process_matches(pattern: str) -> list[str]:
+    completed = subprocess.run(
+        ["pgrep", "-af", pattern],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode not in {0, 1}:
+        detail = str(completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(detail or f"pgrep failed for {pattern}")
+    return [line.strip() for line in str(completed.stdout or "").splitlines() if line.strip()]
+
+
+def _check_required_processes(processes: list[str]) -> dict[str, Any]:
+    if not processes:
+        return {"required_processes": [], "missing_processes": [], "matched_processes": {}, "errors": []}
+    missing: list[str] = []
+    errors: list[str] = []
+    matched: dict[str, list[str]] = {}
+    for process in processes:
+        try:
+            matches = _list_process_matches(process)
+        except Exception as exc:  # noqa: BLE001
+            missing.append(process)
+            errors.append(str(exc))
+            matched[process] = []
+            continue
+        matched[process] = matches[:5]
+        if not matches:
+            missing.append(process)
+    logger.info(
+        "scan process check required=%s missing=%s matched=%s errors=%s",
+        list(processes),
+        missing,
+        matched,
+        errors,
+    )
+    return {"required_processes": list(processes), "missing_processes": missing, "matched_processes": matched, "errors": errors}
+
+
 def _stream_process_output(stream: Any, level: int, prefix: str) -> None:
     try:
         for raw_line in iter(stream.readline, ""):
@@ -247,34 +340,138 @@ def _launch_scan_mode_command(argv: list[str]) -> tuple[bool, str]:
     return True, f"pid={process.pid}"
 
 
+def _merge_scan_dependency_status(node_status: dict[str, Any], process_status: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "required_nodes": list(node_status.get("required_nodes", [])),
+        "missing_nodes": list(node_status.get("missing_nodes", [])),
+        "started_nodes": list(node_status.get("started_nodes", [])),
+        "required_processes": list(process_status.get("required_processes", [])),
+        "missing_processes": list(process_status.get("missing_processes", [])),
+        "started_processes": list(process_status.get("started_processes", [])),
+        "matched_processes": copy.deepcopy(process_status.get("matched_processes", {})),
+        "errors": list(node_status.get("errors", [])) + list(process_status.get("errors", [])),
+    }
+
+
+def _scan_dependency_status(config: Any) -> dict[str, Any]:
+    node_status = _check_required_nodes(list(config.required_nodes))
+    process_status = _check_required_processes(list(getattr(config, "required_processes", [])))
+    return _merge_scan_dependency_status(node_status, process_status)
+
+
 def _ensure_scan_mode_dependencies(mode: str) -> dict[str, Any]:
     config = _scan_mode_config(mode)
-    status = _check_required_nodes(list(config.required_nodes))
-    if not status["missing_nodes"]:
+    status = _scan_dependency_status(config)
+    logger.info(
+        "scan dependency check mode=%s required_nodes=%s missing_nodes=%s required_processes=%s missing_processes=%s errors=%s",
+        mode,
+        status.get("required_nodes", []),
+        status.get("missing_nodes", []),
+        status.get("required_processes", []),
+        status.get("missing_processes", []),
+        status.get("errors", []),
+    )
+    if not status["missing_nodes"] and not status["missing_processes"]:
         return status
     started_nodes: list[str] = list(status.get("started_nodes", []))
+    started_processes: list[str] = list(status.get("started_processes", []))
     errors: list[str] = list(status.get("errors", []))
     for command in config.launch_commands:
         ok, detail = _launch_scan_mode_command(list(command))
         if not ok:
             errors.append(detail or f"failed to launch {command}")
+            logger.warning("scan dependency launch failed mode=%s command=%s detail=%s", mode, command, detail)
             continue
-        logger.info("waiting for scan dependency nodes mode=%s command=%s", mode, command)
+        logger.info("waiting for scan dependencies mode=%s command=%s", mode, command)
         refreshed = status
-        for _ in range(SCAN_DEPENDENCY_POLL_ATTEMPTS):
+        for attempt in range(1, SCAN_DEPENDENCY_POLL_ATTEMPTS + 1):
             time.sleep(SCAN_DEPENDENCY_POLL_INTERVAL_SEC)
-            refreshed = _check_required_nodes(list(config.required_nodes))
-            if not refreshed["missing_nodes"]:
+            refreshed = _scan_dependency_status(config)
+            logger.info(
+                "scan dependency poll mode=%s attempt=%s/%s missing_nodes=%s missing_processes=%s errors=%s",
+                mode,
+                attempt,
+                SCAN_DEPENDENCY_POLL_ATTEMPTS,
+                refreshed.get("missing_nodes", []),
+                refreshed.get("missing_processes", []),
+                refreshed.get("errors", []),
+            )
+            if not refreshed["missing_nodes"] and not refreshed["missing_processes"]:
                 break
         started_nodes = list(dict.fromkeys(started_nodes + list(refreshed.get("required_nodes", []))))
+        started_processes = list(dict.fromkeys(started_processes + list(refreshed.get("required_processes", []))))
         status = refreshed
-        if not status["missing_nodes"]:
+        if not status["missing_nodes"] and not status["missing_processes"]:
             status["started_nodes"] = started_nodes
+            status["started_processes"] = started_processes
             status["errors"] = errors
             return status
     status["started_nodes"] = started_nodes
+    status["started_processes"] = started_processes
     status["errors"] = errors
     return status
+
+
+def _stop_launched_scan_processes() -> dict[str, Any]:
+    stopped_pids: list[int] = []
+    errors: list[str] = []
+    remaining: list[subprocess.Popen[str]] = []
+    for process in LAUNCHED_SCAN_PROCESSES:
+        try:
+            logger.info("stopping scan dependency process pid=%s signal=SIGINT", process.pid)
+            os.killpg(process.pid, signal.SIGINT)
+            stopped_pids.append(int(process.pid))
+            try:
+                if process.poll() is None:
+                    process.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                errors.append(f"pid={process.pid}: did not exit after SIGINT")
+                remaining.append(process)
+        except ProcessLookupError:
+            logger.info("scan dependency process group already exited pid=%s", getattr(process, "pid", "?"))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"pid={getattr(process, 'pid', '?')}: {exc}")
+            remaining.append(process)
+    LAUNCHED_SCAN_PROCESSES[:] = remaining
+    pattern_status = _terminate_process_patterns(list(SCAN_SESSION.get("dependency_status", {}).get("started_processes", [])))
+    if stopped_pids:
+        logger.info("stopped scan dependency processes pids=%s", stopped_pids)
+    errors.extend(pattern_status["errors"])
+    if errors:
+        logger.warning("failed to stop scan dependency processes errors=%s", errors)
+    return {"stopped_pids": stopped_pids, "stopped_patterns": pattern_status["stopped_patterns"], "errors": errors}
+
+
+def _terminate_process_patterns(patterns: list[str]) -> dict[str, Any]:
+    stopped_patterns: list[str] = []
+    errors: list[str] = []
+    for pattern in dict.fromkeys(str(pattern).strip() for pattern in patterns if str(pattern).strip()):
+        logger.info("stopping scan dependency process pattern=%s signal=SIGINT", pattern)
+        term = subprocess.run(["pkill", "-INT", "-f", pattern], check=False, capture_output=True, text=True)
+        if term.returncode not in {0, 1}:
+            detail = str(term.stderr or term.stdout or "").strip()
+            errors.append(f"{pattern}: {detail or 'pkill INT failed'}")
+            continue
+        if term.returncode == 0:
+            stopped_patterns.append(pattern)
+        time.sleep(0.2)
+        remaining = _list_process_matches(pattern)
+        if remaining:
+            logger.warning("scan dependency process pattern still running after SIGINT pattern=%s matches=%s", pattern, remaining[:5])
+            errors.append(f"{pattern}: still running after SIGINT")
+    return {"stopped_patterns": stopped_patterns, "errors": errors}
+
+
+def _wait_for_mapping_prereq_after_dependency_start(dependency_status: dict[str, Any]) -> dict[str, Any]:
+    summary = _mapping_prereq_summary()
+    if summary["ready"] or not (dependency_status.get("started_nodes") or dependency_status.get("started_processes")):
+        return summary
+    for _ in range(SCAN_MAPPING_PREREQ_POLL_ATTEMPTS):
+        time.sleep(SCAN_MAPPING_PREREQ_POLL_INTERVAL_SEC)
+        summary = _mapping_prereq_summary()
+        if summary["ready"]:
+            return summary
+    return summary
 
 
 def _pcd_output_path_for_mode(mode: str) -> Path | None:
@@ -434,50 +631,105 @@ def _occupancy_payload_to_points(payload: dict[str, Any]) -> list[tuple[float, f
     ]
 
 
-def _effective_control_target(now: float | None = None) -> tuple[float, float, bool]:
+def _effective_control_target(now: float | None = None) -> tuple[float, float, bool, bool]:
     now = time.time() if now is None else float(now)
     updated_at = float(CONTROL_TARGET.get("updated_at", 0.0) or 0.0)
     velocity = float(CONTROL_TARGET.get("velocity", 0.0) or 0.0)
     yaw_rate = float(CONTROL_TARGET.get("yaw_rate", 0.0) or 0.0)
     if updated_at <= 0.0:
-        return 0.0, 0.0, False
+        return 0.0, 0.0, False, False
     if now - updated_at <= CONTROL_TARGET_HOLD_SEC:
-        return velocity, yaw_rate, False
-    return 0.0, 0.0, bool(velocity or yaw_rate)
+        return velocity, yaw_rate, False, True
+    return 0.0, 0.0, bool(velocity or yaw_rate), False
 
 
 def _control_target_health(now: float | None = None) -> dict[str, Any]:
     now = time.time() if now is None else float(now)
     updated_at = float(CONTROL_TARGET.get("updated_at", 0.0) or 0.0)
     age_sec = max(0.0, now - updated_at) if updated_at > 0.0 else None
-    velocity, yaw_rate, stale = _effective_control_target(now=now)
+    velocity, yaw_rate, stale, should_publish = _effective_control_target(now=now)
     return {
         "velocity": float(CONTROL_TARGET.get("velocity", 0.0) or 0.0),
         "yaw_rate": float(CONTROL_TARGET.get("yaw_rate", 0.0) or 0.0),
         "effective_velocity": velocity,
         "effective_yaw_rate": yaw_rate,
+        "publishing": should_publish,
         "updated_at": updated_at,
         "age_sec": round(age_sec, 3) if age_sec is not None else None,
         "stale": stale,
         "publish_interval_sec": CONTROL_PUBLISH_INTERVAL_SEC,
         "hold_sec": CONTROL_TARGET_HOLD_SEC,
+        "last_publish_source": str(CONTROL_RUNTIME["last_publish_source"]),
+        "last_zero_source": str(CONTROL_RUNTIME["last_zero_source"]),
+        "last_zero_at": float(CONTROL_RUNTIME["last_zero_at"]),
     }
 
 
+def _record_control_publish_source(source: str, velocity: float, yaw_rate: float) -> None:
+    CONTROL_RUNTIME["last_publish_source"] = source
+    velocity = float(velocity)
+    yaw_rate = float(yaw_rate)
+    last_velocity = CONTROL_RUNTIME.get("last_logged_velocity")
+    last_yaw_rate = CONTROL_RUNTIME.get("last_logged_yaw_rate")
+    velocity_changed = (
+        last_velocity is None
+        or last_yaw_rate is None
+        or abs(float(last_velocity) - velocity) > 1e-9
+        or abs(float(last_yaw_rate) - yaw_rate) > 1e-9
+    )
+    source_changed = CONTROL_RUNTIME.get("last_logged_source") != source
+    changed = (
+        velocity_changed
+        or (source_changed and source != "target_hold")
+    )
+    zero = abs(velocity) <= 1e-9 and abs(yaw_rate) <= 1e-9
+    if changed:
+        logger.info(
+            "control cmd publish source=%s velocity=%.3f yaw_rate=%.3f zero=%s",
+            source,
+            velocity,
+            yaw_rate,
+            zero,
+        )
+        CONTROL_RUNTIME["last_logged_source"] = source
+        CONTROL_RUNTIME["last_logged_velocity"] = velocity
+        CONTROL_RUNTIME["last_logged_yaw_rate"] = yaw_rate
+    if abs(float(velocity)) <= 1e-9 and abs(float(yaw_rate)) <= 1e-9:
+        CONTROL_RUNTIME["last_zero_source"] = source
+        CONTROL_RUNTIME["last_zero_at"] = time.time()
+
+
+def _publish_control_command(velocity: float, yaw_rate: float, source: str) -> None:
+    _record_control_publish_source(source, velocity, yaw_rate)
+    if ros.enabled and ros.bridge is not None:
+        ros.bridge.publish_cmd_vel(velocity, yaw_rate)
+    else:
+        sim.set_motion(velocity, yaw_rate)
+
+
 async def _control_publisher_loop() -> None:
+    global CONTROL_STOP_BURST_REMAINING
     stale_logged = False
     while True:
         try:
-            velocity, yaw_rate, stale = _effective_control_target()
+            velocity, yaw_rate, stale, should_publish = _effective_control_target()
             if stale and not stale_logged:
                 logger.warning("control target stale; publishing stop for safety")
                 stale_logged = True
+                CONTROL_STOP_BURST_REMAINING = CONTROL_STOP_BURST_TICKS
+                CONTROL_TARGET["velocity"] = 0.0
+                CONTROL_TARGET["yaw_rate"] = 0.0
+                CONTROL_TARGET["updated_at"] = 0.0
             elif not stale:
                 stale_logged = False
-            if ros.enabled and ros.bridge is not None:
-                ros.bridge.publish_cmd_vel(velocity, yaw_rate)
-            else:
-                sim.set_motion(velocity, yaw_rate)
+            source = "target_stale_stop" if stale else "target_hold"
+            if CONTROL_STOP_BURST_REMAINING > 0:
+                velocity, yaw_rate = 0.0, 0.0
+                should_publish = True
+                CONTROL_STOP_BURST_REMAINING -= 1
+                source = "target_stale_stop_burst"
+            if should_publish:
+                _publish_control_command(velocity, yaw_rate, source)
             await asyncio.sleep(CONTROL_PUBLISH_INTERVAL_SEC)
         except asyncio.CancelledError:
             raise
@@ -595,7 +847,7 @@ async def start_scan(req: StartScanRequest | None = None) -> dict:
         }
     dependency_status = _ensure_scan_mode_dependencies(mode)
     SCAN_SESSION["dependency_status"] = copy.deepcopy(dependency_status)
-    if dependency_status["missing_nodes"] or dependency_status["errors"]:
+    if dependency_status["missing_nodes"] or dependency_status.get("missing_processes") or dependency_status["errors"]:
         return {
             "ok": False,
             "reason": "node_start_failed",
@@ -604,7 +856,7 @@ async def start_scan(req: StartScanRequest | None = None) -> dict:
             "dependency_status": dependency_status,
             "ros_enabled": ros.enabled,
         }
-    mapping_prereq = _mapping_prereq_summary()
+    mapping_prereq = _wait_for_mapping_prereq_after_dependency_start(dependency_status)
     if not mapping_prereq["ready"]:
         logger.warning("scan start rejected blockers=%s warnings=%s", mapping_prereq["blockers"], mapping_prereq["warnings"])
         return {
@@ -644,14 +896,18 @@ async def stop_scan(req: StopScanRequest | None = None) -> dict:
             "scan_active": bool(SCAN_SESSION["active"]),
         }
     if not bool(SCAN_SESSION["active"]):
+        process_stop_status = _stop_launched_scan_processes()
+        logger.info("scan stop requested while inactive process_stop_status=%s", process_stop_status)
         return {
             "ok": False,
             "reason": "scan_not_active",
             "scan_active": False,
             "scan_mode": mode,
+            "process_stop_status": process_stop_status,
         }
     SCAN_SESSION["active"] = False
     SCAN_SESSION["stopped_at"] = time.time()
+    process_stop_status = _stop_launched_scan_processes()
     if ros.enabled and ros.bridge is not None:
         ros.bridge.set_scan_active(False)
     else:
@@ -666,6 +922,7 @@ async def stop_scan(req: StopScanRequest | None = None) -> dict:
                 "reason": "pcd_path_not_configured",
                 "scan_active": False,
                 "scan_mode": "3d",
+                "process_stop_status": process_stop_status,
             }
         if not pcd_path.exists():
             SCAN_SESSION["pcd_transfer_state"] = "error"
@@ -675,6 +932,7 @@ async def stop_scan(req: StopScanRequest | None = None) -> dict:
                 "scan_active": False,
                 "scan_mode": "3d",
                 "error": f"pcd file not found: {pcd_path}",
+                "process_stop_status": process_stop_status,
             }
         try:
             SCAN_SESSION["pcd_transfer_state"] = "reading"
@@ -687,6 +945,7 @@ async def stop_scan(req: StopScanRequest | None = None) -> dict:
                 "scan_active": False,
                 "scan_mode": "3d",
                 "error": str(exc),
+                "process_stop_status": process_stop_status,
             }
         encoded = base64.b64encode(content).decode("ascii")
         pcd_file = {
@@ -704,6 +963,7 @@ async def stop_scan(req: StopScanRequest | None = None) -> dict:
             "scan_summary": _scan_summary(),
             "pcd_file": pcd_file,
             "ros_enabled": ros.enabled,
+            "process_stop_status": process_stop_status,
         }
     return {
         "ok": True,
@@ -711,6 +971,7 @@ async def stop_scan(req: StopScanRequest | None = None) -> dict:
         "scan_mode": str(SCAN_SESSION["mode"]),
         "scan_summary": _scan_summary(),
         "ros_enabled": ros.enabled,
+        "process_stop_status": process_stop_status,
     }
 
 
@@ -749,6 +1010,7 @@ async def set_control_target(cmd: ControlTargetRequest) -> dict:
     CONTROL_TARGET["yaw_rate"] = float(cmd.yaw_rate)
     CONTROL_TARGET["updated_at"] = time.time()
     if ros.enabled and ros.bridge is not None:
+        _record_control_publish_source("api_target", float(cmd.velocity), float(cmd.yaw_rate))
         ros.bridge.publish_cmd_vel(float(cmd.velocity), float(cmd.yaw_rate))
         state = {
             "pose": ros.bridge.latest_pose(),
@@ -756,6 +1018,7 @@ async def set_control_target(cmd: ControlTargetRequest) -> dict:
             "chassis": ros.bridge.latest_chassis(),
         }
         return {"ok": True, "msg": "control target applied", "state": state}
+    _record_control_publish_source("api_target", float(cmd.velocity), float(cmd.yaw_rate))
     sim.set_motion(float(cmd.velocity), float(cmd.yaw_rate))
     return {"ok": True, "msg": "control target applied", "state": sim.state.__dict__}
 
@@ -767,6 +1030,7 @@ async def stop() -> dict:
     CONTROL_TARGET["velocity"] = 0.0
     CONTROL_TARGET["yaw_rate"] = 0.0
     CONTROL_TARGET["updated_at"] = time.time()
+    _record_control_publish_source("api_stop", 0.0, 0.0)
     if ros.enabled and ros.bridge is not None:
         ros.bridge.stop_motion()
     else:
