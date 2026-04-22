@@ -152,6 +152,8 @@ SCAN_START_LOCK = threading.Lock()
 SCAN_START_CANCEL_SEQ = 0
 SCAN_DEPENDENCY_POLL_ATTEMPTS = 10
 SCAN_DEPENDENCY_POLL_INTERVAL_SEC = 1.0
+SCAN_PROCESS_STOP_POLL_ATTEMPTS = 15
+SCAN_PROCESS_STOP_POLL_INTERVAL_SEC = 0.2
 SCAN_MAPPING_PREREQ_POLL_ATTEMPTS = 10
 SCAN_MAPPING_PREREQ_POLL_INTERVAL_SEC = 0.5
 
@@ -251,46 +253,6 @@ def _scan_mode_config(mode: str) -> Any:
     raise ValueError(f"unsupported scan mode: {mode}")
 
 
-def _list_ros_nodes() -> list[str]:
-    completed = subprocess.run(
-        ["ros2", "node", "list"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return [line.strip() for line in str(completed.stdout or "").splitlines() if line.strip()]
-
-
-def _check_required_nodes(nodes: list[str]) -> dict[str, Any]:
-    if not nodes:
-        return {
-            "required_nodes": [],
-            "missing_nodes": [],
-            "started_nodes": [],
-            "errors": [],
-        }
-    try:
-        existing = set(_list_ros_nodes())
-    except Exception as exc:  # noqa: BLE001
-        detail = ""
-        if isinstance(exc, subprocess.CalledProcessError):
-            detail = str(getattr(exc, "stderr", "") or getattr(exc, "stdout", "") or "").strip()
-        if not detail:
-            detail = str(exc)
-        return {
-            "required_nodes": list(nodes),
-            "missing_nodes": list(nodes),
-            "started_nodes": [],
-            "errors": [detail],
-        }
-    return {
-        "required_nodes": list(nodes),
-        "missing_nodes": [node for node in nodes if node not in existing],
-        "started_nodes": [],
-        "errors": [],
-    }
-
-
 def _list_process_matches(pattern: str) -> list[str]:
     completed = subprocess.run(
         ["pgrep", "-af", pattern],
@@ -363,6 +325,53 @@ def _command_targets_satisfied_dependency(argv: list[str], required_processes: l
     return bool(targeted) and not any(process in missing for process in targeted)
 
 
+def _launch_command_argv(command: Any) -> list[str]:
+    if isinstance(command, dict):
+        return [str(part) for part in command.get("command", [])]
+    raw = getattr(command, "command", command)
+    return [str(part) for part in raw]
+
+
+def _launch_command_processes(command: Any) -> list[str]:
+    if isinstance(command, dict):
+        raw = command.get("processes", [])
+    elif isinstance(command, list):
+        raw = [str(command[-1])] if command else []
+    else:
+        raw = getattr(command, "processes", [])
+    return [str(process) for process in raw if str(process).strip()]
+
+
+def _scan_command_process_matches(argv: list[str]) -> list[str]:
+    tokens = [str(part) for part in argv if str(part).strip()]
+    if not tokens:
+        return []
+    pattern = tokens[-1]
+    try:
+        matches = _list_process_matches(pattern)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("scan launch command process check failed argv=%s err=%s", argv, exc)
+        return []
+    required_tokens = tokens[1:] if tokens[0] == "ros2" else tokens
+    filtered = [line for line in matches if all(token in line for token in required_tokens)]
+    return filtered[:5]
+
+
+def _scan_launch_command_needed(command: Any, status: dict[str, Any]) -> bool:
+    processes = _launch_command_processes(command)
+    missing_processes = {str(process) for process in status.get("missing_processes", [])}
+    if processes:
+        return any(process in missing_processes for process in processes)
+    return bool(status.get("missing_processes"))
+
+
+def _scan_required_processes_from_launch_commands(config: Any) -> list[str]:
+    processes: list[str] = []
+    for command in getattr(config, "launch_commands", []):
+        processes.extend(_launch_command_processes(command))
+    return list(dict.fromkeys(processes))
+
+
 def _launch_scan_mode_command(argv: list[str]) -> tuple[bool, str]:
     key = _scan_command_key(argv)
     existing_processes = LAUNCHED_SCAN_COMMANDS.get(key, [])
@@ -425,8 +434,8 @@ def _merge_scan_dependency_status(node_status: dict[str, Any], process_status: d
 
 
 def _scan_dependency_status(config: Any) -> dict[str, Any]:
-    node_status = _check_required_nodes(list(config.required_nodes))
-    process_status = _check_required_processes(list(getattr(config, "required_processes", [])))
+    node_status = {"required_nodes": [], "missing_nodes": [], "started_nodes": [], "errors": []}
+    process_status = _check_required_processes(_scan_required_processes_from_launch_commands(config))
     return _merge_scan_dependency_status(node_status, process_status)
 
 
@@ -434,71 +443,87 @@ def _ensure_scan_mode_dependencies(mode: str) -> dict[str, Any]:
     config = _scan_mode_config(mode)
     status = _scan_dependency_status(config)
     logger.info(
-        "scan dependency check mode=%s required_nodes=%s missing_nodes=%s required_processes=%s missing_processes=%s errors=%s",
+        "scan dependency check mode=%s required_processes=%s missing_processes=%s errors=%s",
         mode,
-        status.get("required_nodes", []),
-        status.get("missing_nodes", []),
         status.get("required_processes", []),
         status.get("missing_processes", []),
         status.get("errors", []),
     )
-    if not status["missing_nodes"] and not status["missing_processes"]:
+    if not status["missing_processes"]:
         status["started_processes"] = list(status.get("required_processes", []))
         return status
     started_nodes: list[str] = list(status.get("started_nodes", []))
     started_processes: list[str] = list(status.get("started_processes", []))
     errors: list[str] = list(status.get("errors", []))
+    launched_or_waiting = False
     for command in config.launch_commands:
-        if not status["missing_nodes"] and not status["missing_processes"]:
-            status["started_nodes"] = started_nodes
-            status["started_processes"] = started_processes
-            status["errors"] = errors
-            return status
+        argv = _launch_command_argv(command)
+        if not argv:
+            continue
+        command_processes = _launch_command_processes(command)
+        if command_processes and not _scan_launch_command_needed(command, status):
+            logger.info(
+                "skip scan dependency command; configured processes already running mode=%s command=%s processes=%s missing_processes=%s",
+                mode,
+                argv,
+                command_processes,
+                status.get("missing_processes", []),
+            )
+            continue
         if _command_targets_satisfied_dependency(
-            list(command),
-            list(getattr(config, "required_processes", [])),
+            argv,
+            _scan_required_processes_from_launch_commands(config),
             list(status.get("missing_processes", [])),
         ):
             logger.info(
                 "skip scan dependency command; targeted process already running mode=%s command=%s missing_processes=%s",
                 mode,
-                command,
+                argv,
                 status.get("missing_processes", []),
             )
             continue
-        ok, detail = _launch_scan_mode_command(list(command))
-        if not ok:
-            errors.append(detail or f"failed to launch {command}")
-            logger.warning("scan dependency launch failed mode=%s command=%s detail=%s", mode, command, detail)
+        existing_command_matches = _scan_command_process_matches(argv)
+        if existing_command_matches:
+            logger.info(
+                "scan dependency command already exists in system mode=%s command=%s matches=%s",
+                mode,
+                argv,
+                existing_command_matches,
+            )
+            launched_or_waiting = True
             continue
-        logger.info("waiting for scan dependencies mode=%s command=%s", mode, command)
-        refreshed = status
+        ok, detail = _launch_scan_mode_command(argv)
+        if not ok:
+            errors.append(detail or f"failed to launch {argv}")
+            logger.warning("scan dependency launch failed mode=%s command=%s detail=%s", mode, argv, detail)
+            continue
+        launched_or_waiting = True
+        logger.info("started scan dependency launch mode=%s command=%s detail=%s processes=%s", mode, argv, detail, command_processes)
+    if launched_or_waiting:
+        logger.info("waiting for scan dependencies mode=%s", mode)
         for attempt in range(1, SCAN_DEPENDENCY_POLL_ATTEMPTS + 1):
             time.sleep(SCAN_DEPENDENCY_POLL_INTERVAL_SEC)
-            refreshed = _scan_dependency_status(config)
+            status = _scan_dependency_status(config)
             logger.info(
-                "scan dependency poll mode=%s attempt=%s/%s missing_nodes=%s missing_processes=%s errors=%s",
+                "scan dependency poll mode=%s attempt=%s/%s missing_processes=%s errors=%s",
                 mode,
                 attempt,
                 SCAN_DEPENDENCY_POLL_ATTEMPTS,
-                refreshed.get("missing_nodes", []),
-                refreshed.get("missing_processes", []),
-                refreshed.get("errors", []),
+                status.get("missing_processes", []),
+                status.get("errors", []),
             )
-            if not refreshed["missing_nodes"] and not refreshed["missing_processes"]:
+            if not status["missing_processes"]:
                 break
-        started_nodes = list(dict.fromkeys(started_nodes + list(refreshed.get("required_nodes", []))))
-        started_processes = list(dict.fromkeys(started_processes + list(refreshed.get("required_processes", []))))
-        status = refreshed
-        if not status["missing_nodes"] and not status["missing_processes"]:
+        started_nodes = list(dict.fromkeys(started_nodes + list(status.get("required_nodes", []))))
+        started_processes = list(dict.fromkeys(started_processes + list(status.get("required_processes", []))))
+        if not status["missing_processes"]:
             status["started_nodes"] = started_nodes
             status["started_processes"] = started_processes
             status["errors"] = errors
             status["tracked_pids"] = _matched_process_pids(status.get("matched_processes", {}))
             logger.info(
-                "scan dependency launch success mode=%s started_nodes=%s started_processes=%s",
+                "scan dependency launch success mode=%s started_processes=%s",
                 mode,
-                status["started_nodes"],
                 status["started_processes"],
             )
             return status
@@ -521,9 +546,39 @@ def _stop_tracked_scan_pids(pids: list[int]) -> dict[str, Any]:
             logger.info("tracked scan dependency pid already exited pid=%s", pid)
         except Exception as exc:  # noqa: BLE001
             errors.append(f"pid={pid}: {exc}")
-    if stopped_pids:
-        time.sleep(0.2)
+    for pid in stopped_pids:
+        if _wait_for_pid_exit(pid):
+            logger.info("tracked scan dependency pid exited pid=%s", pid)
+        else:
+            logger.warning("tracked scan dependency pid still running after SIGINT pid=%s", pid)
+            errors.append(f"pid={pid}: still running after SIGINT")
     return {"stopped_pids": stopped_pids, "errors": errors}
+
+
+def _wait_for_pid_exit(pid: int) -> bool:
+    proc_path = Path(f"/proc/{pid}")
+    for _ in range(SCAN_PROCESS_STOP_POLL_ATTEMPTS):
+        if _reap_child_pid(pid):
+            return True
+        if not proc_path.exists():
+            return True
+        time.sleep(SCAN_PROCESS_STOP_POLL_INTERVAL_SEC)
+    if _reap_child_pid(pid):
+        return True
+    return not proc_path.exists()
+
+
+def _reap_child_pid(pid: int) -> bool:
+    try:
+        reaped_pid, _status = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return False
+    except OSError:
+        return False
+    if reaped_pid == pid:
+        logger.info("reaped scan dependency child pid=%s", pid)
+        return True
+    return False
 
 
 def _stop_launched_scan_processes() -> dict[str, Any]:
@@ -555,12 +610,12 @@ def _stop_launched_scan_processes() -> dict[str, Any]:
         LAUNCHED_SCAN_COMMANDS[key] = [process for process in processes if process in remaining]
         if not LAUNCHED_SCAN_COMMANDS[key]:
             LAUNCHED_SCAN_COMMANDS.pop(key, None)
-    pattern_status = _terminate_process_patterns(list(SCAN_SESSION.get("dependency_status", {}).get("started_processes", [])))
     if stopped_pids:
         logger.info("stopped scan dependency processes pids=%s", stopped_pids)
     tracked_status = _stop_tracked_scan_pids(list(SCAN_SESSION.get("dependency_status", {}).get("tracked_pids", [])))
     stopped_pids = list(dict.fromkeys(stopped_pids + tracked_status["stopped_pids"]))
     errors.extend(tracked_status["errors"])
+    pattern_status = _terminate_process_patterns(list(SCAN_SESSION.get("dependency_status", {}).get("started_processes", [])))
     errors.extend(pattern_status["errors"])
     if errors:
         logger.warning("failed to stop scan dependency processes errors=%s", errors)
@@ -579,8 +634,12 @@ def _terminate_process_patterns(patterns: list[str]) -> dict[str, Any]:
             continue
         if term.returncode == 0:
             stopped_patterns.append(pattern)
-        time.sleep(0.2)
-        remaining = _list_process_matches(pattern)
+        remaining: list[str] = []
+        for _ in range(SCAN_PROCESS_STOP_POLL_ATTEMPTS):
+            remaining = _list_process_matches(pattern)
+            if not remaining:
+                break
+            time.sleep(SCAN_PROCESS_STOP_POLL_INTERVAL_SEC)
         if remaining:
             logger.warning("scan dependency process pattern still running after SIGINT pattern=%s matches=%s", pattern, remaining[:5])
             errors.append(f"{pattern}: still running after SIGINT")
@@ -984,7 +1043,7 @@ async def start_scan(req: StartScanRequest | None = None) -> dict:
     try:
         dependency_status = _ensure_scan_mode_dependencies(mode)
         SCAN_SESSION["dependency_status"] = copy.deepcopy(dependency_status)
-        if dependency_status["missing_nodes"] or dependency_status.get("missing_processes") or dependency_status["errors"]:
+        if dependency_status.get("missing_processes") or dependency_status["errors"]:
             return {
                 "ok": False,
                 "reason": "node_start_failed",

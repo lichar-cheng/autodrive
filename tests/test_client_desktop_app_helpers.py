@@ -606,12 +606,17 @@ def test_save_stcm_downloads_pcd_before_writing_archive(tmp_path: Path, monkeypa
     client.browser_occupancy = lambda: {"occupied_cells": [], "free_cells": [], "map_fence_xy": [], "voxel_size": 0.1, "scan_fusion": {}}
     client.occupied_points = lambda: [[1.0, 2.0, 1.0]]
     client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
-    client.ensure_scan_pcd = lambda: {"name": "map.pcd", "content": b"pcd-bytes"}
+    client.scan["mode"] = "2d"
+    client.scan_mode_var = DummyVar("3d")
+    pcd_modes = []
+    client.ensure_scan_pcd = lambda mode=None: pcd_modes.append(mode) or {"name": "map.pcd", "content": b"pcd-bytes"}
 
     DesktopClient.save_stcm(client)
 
     assert writes
     assert writes[0][3] == {"name": "map.pcd", "content": b"pcd-bytes"}
+    assert writes[0][1]["scan_mode"] == "3d"
+    assert pcd_modes == ["3d"]
     assert infos
 
 
@@ -657,7 +662,7 @@ def test_export_pcd_downloads_when_local_copy_missing(tmp_path: Path, monkeypatc
     client.inspector = {"file": "demo.slam", "manifest": None, "points": [], "pgm": "", "yaml": "", "json": "", "meta": {}, "pcd_file": None}
     client.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
     client.scan["mode"] = "3d"
-    client.ensure_scan_pcd = lambda: {"name": "map.pcd", "content": b"pcd-bytes"}
+    client.ensure_scan_pcd = lambda mode=None: {"name": "map.pcd", "content": b"pcd-bytes"}
 
     DesktopClient.export_inspector_file(client, "pcd")
 
@@ -902,18 +907,6 @@ def test_connect_uses_direct_ws_url_when_login_is_disabled() -> None:
         app_module.ServerBridge = original_bridge
 
     assert client.server_var.get() == "ws://192.168.3.56:28080/ws/stream"
-
-
-def test_reset_server_map_calls_api_and_clears_local_state() -> None:
-    client = DesktopClient.__new__(DesktopClient)
-    seen = []
-    client.call_api = lambda path, body: seen.append((path, body)) or {"ok": True}
-    client.clear_loaded_map = lambda: seen.append(("cleared", {}))
-    client.tr = lambda key, **kwargs: key if not kwargs else key
-
-    DesktopClient.reset_server_map(client)
-
-    assert seen == [("/map/reset", {}), ("cleared", {})]
 
 
 def test_on_key_release_delays_stop_until_after_confirmation_window() -> None:

@@ -1,40 +1,64 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from typing import Any
+
+from pydantic import BaseModel, Field, model_validator
+
+
+class ScanLaunchCommandConfig(BaseModel):
+    command: list[str] = Field(default_factory=list)
+    processes: list[str] = Field(default_factory=list)
 
 
 class ScanModeRuntimeConfig(BaseModel):
-    required_nodes: list[str] = Field(default_factory=list)
-    required_processes: list[str] = Field(default_factory=list)
-    launch_commands: list[list[str]] = Field(default_factory=list)
+    launch_commands: list[ScanLaunchCommandConfig] = Field(default_factory=list)
     pcd_output_path: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_launch_commands(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        commands = data.get("launch_commands")
+        if not isinstance(commands, list):
+            return data
+        normalized: list[Any] = []
+        changed = False
+        for item in commands:
+            if isinstance(item, list):
+                normalized.append({"command": item, "processes": [str(item[-1])] if item else []})
+                changed = True
+            else:
+                normalized.append(item)
+        if changed:
+            updated = dict(data)
+            updated["launch_commands"] = normalized
+            return updated
+        return data
 
 
 class ScanModesConfig(BaseModel):
     mode_2d: ScanModeRuntimeConfig = Field(
         default_factory=lambda: ScanModeRuntimeConfig(
-            required_nodes=[
-                "/slam_toolbox",
-            ],
-            required_processes=[
-                "slam_toolbox",
-            ],
             launch_commands=[
-                ["ros2", "launch", "slam_toolbox", "online_async_launch.py"],
+                ScanLaunchCommandConfig(
+                    command=["ros2", "launch", "slam_toolbox", "online_async_launch.py"],
+                    processes=["online_async_launch.py"],
+                ),
             ],
         )
     )
     mode_3d: ScanModeRuntimeConfig = Field(
         default_factory=lambda: ScanModeRuntimeConfig(
-            required_nodes=[
-                "/point_lio","/slam_toolbox",
-            ],
-            required_processes=[
-                "point_lio",
-                "slam_toolbox",
-            ],
             launch_commands=[
-                ["ros2", "launch", "caddie_hardware", "navigation_slam_based.launch.py"],
+                ScanLaunchCommandConfig(
+                    command=["ros2", "launch", "caddie_hardware", "navigation_hardware.launch.py"],
+                    processes=["navigation_hardware.launch.py"],
+                ),
+                ScanLaunchCommandConfig(
+                    command=["ros2", "launch", "caddie_velocity_controller", "caddie_velocity_controller_launch.py"],
+                    processes=["caddie_velocity_controller_launch.py"],
+                ),
             ],
             pcd_output_path="/tmp/point_lio_map.pcd",
         )

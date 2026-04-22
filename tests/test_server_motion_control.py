@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from server.app import main
-from server.app.config import ScanModesConfig
+from server.app.config import ScanLaunchCommandConfig, ScanModesConfig
 from server.app.models import ControlTargetRequest, MoveCommand, SaveMapRequest, StartScanRequest, StopScanRequest
 
 
@@ -86,12 +86,28 @@ def test_scan_start_request_rejects_invalid_mode() -> None:
 def test_scan_mode_config_exposes_2d_and_3d_defaults() -> None:
     config = ScanModesConfig()
 
-    assert config.mode_2d.required_nodes == ["/slam_toolbox"]
-    assert config.mode_2d.required_processes == ["slam_toolbox"]
-    assert config.mode_2d.launch_commands == [["ros2", "launch", "slam_toolbox", "online_async_launch.py"]]
-    assert config.mode_3d.required_nodes == ["/point_lio", "/slam_toolbox"]
-    assert config.mode_3d.required_processes == ["point_lio", "slam_toolbox"]
+    assert config.mode_2d.launch_commands == [
+        ScanLaunchCommandConfig(command=["ros2", "launch", "slam_toolbox", "online_async_launch.py"], processes=["online_async_launch.py"])
+    ]
+    assert config.mode_3d.launch_commands == [
+        ScanLaunchCommandConfig(command=["ros2", "launch", "caddie_hardware", "navigation_hardware.launch.py"], processes=["navigation_hardware.launch.py"]),
+        ScanLaunchCommandConfig(command=["ros2", "launch", "caddie_velocity_controller", "caddie_velocity_controller_launch.py"], processes=["caddie_velocity_controller_launch.py"]),
+    ]
     assert config.mode_3d.pcd_output_path == "/tmp/point_lio_map.pcd"
+
+
+def test_scan_mode_config_accepts_legacy_launch_command_lists() -> None:
+    config = ScanModesConfig.model_validate(
+        {
+            "mode_3d": {
+                "launch_commands": [["ros2", "launch", "point_lio", "mapping.launch.py"]],
+            }
+        }
+    )
+
+    assert config.mode_3d.launch_commands == [
+        ScanLaunchCommandConfig(command=["ros2", "launch", "point_lio", "mapping.launch.py"], processes=["mapping.launch.py"])
+    ]
 
 
 def test_start_scan_rejects_when_mapping_prereq_not_ready(monkeypatch) -> None:
@@ -262,53 +278,49 @@ def test_stop_scan_inactive_still_attempts_process_cleanup(monkeypatch) -> None:
     assert calls == [True]
 
 
-def test_check_required_nodes_reports_missing_nodes(monkeypatch) -> None:
-    monkeypatch.setattr(main, "_list_ros_nodes", lambda: ["/slam_toolbox"])
-
-    result = main._check_required_nodes(["/slam_toolbox", "/point_lio"])
-
-    assert result["required_nodes"] == ["/slam_toolbox", "/point_lio"]
-    assert result["missing_nodes"] == ["/point_lio"]
-    assert result["errors"] == []
-
-
-def test_check_required_nodes_reports_ros2_node_list_failure(monkeypatch) -> None:
-    def raise_error():
-        raise subprocess.CalledProcessError(returncode=1, cmd=["ros2", "node", "list"], stderr="boom")
-
-    monkeypatch.setattr(main, "_list_ros_nodes", raise_error)
-
-    result = main._check_required_nodes(["/slam_toolbox"])
-
-    assert result["missing_nodes"] == ["/slam_toolbox"]
-    assert result["errors"] == ["boom"]
-
-
-def test_ensure_scan_mode_dependencies_launches_missing_nodes(monkeypatch) -> None:
+def test_ensure_scan_mode_dependencies_launches_missing_process_from_launch_command(monkeypatch) -> None:
     monkeypatch.setattr(
         main,
         "_scan_mode_config",
         lambda mode: SimpleNamespace(
-            required_nodes=["/point_lio"],
-            required_processes=[],
-            launch_commands=[["ros2", "launch", "point_lio", "mapping.launch.py"]],
+            launch_commands=[
+                ScanLaunchCommandConfig(command=["ros2", "launch", "point_lio", "mapping.launch.py"], processes=["mapping.launch.py"])
+            ],
         ),
     )
     states = iter(
         [
-            {"required_nodes": ["/point_lio"], "missing_nodes": ["/point_lio"], "started_nodes": [], "errors": []},
-            {"required_nodes": ["/point_lio"], "missing_nodes": [], "started_nodes": [], "errors": []},
+            {
+                "required_nodes": [],
+                "missing_nodes": [],
+                "started_nodes": [],
+                "required_processes": ["mapping.launch.py"],
+                "missing_processes": ["mapping.launch.py"],
+                "matched_processes": {"mapping.launch.py": []},
+                "errors": [],
+            },
+            {
+                "required_nodes": [],
+                "missing_nodes": [],
+                "started_nodes": [],
+                "required_processes": ["mapping.launch.py"],
+                "missing_processes": [],
+                "matched_processes": {"mapping.launch.py": ["123 mapping.launch.py"]},
+                "errors": [],
+            },
         ]
     )
-    monkeypatch.setattr(main, "_check_required_nodes", lambda nodes: next(states))
+    monkeypatch.setattr(main, "_scan_dependency_status", lambda _config: next(states))
+    monkeypatch.setattr(main, "_scan_command_process_matches", lambda argv: [])
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
     launches = []
     monkeypatch.setattr(main, "_launch_scan_mode_command", lambda argv: launches.append(argv) or (True, "started"))
 
     result = main._ensure_scan_mode_dependencies("3d")
 
     assert launches == [["ros2", "launch", "point_lio", "mapping.launch.py"]]
-    assert result["missing_nodes"] == []
-    assert result["started_nodes"] == ["/point_lio"]
+    assert result["missing_processes"] == []
+    assert result["started_processes"] == ["mapping.launch.py"]
 
 
 def test_ensure_scan_mode_dependencies_logs_launch_success(monkeypatch, caplog) -> None:
@@ -316,27 +328,27 @@ def test_ensure_scan_mode_dependencies_logs_launch_success(monkeypatch, caplog) 
         main,
         "_scan_mode_config",
         lambda mode: SimpleNamespace(
-            required_nodes=["/point_lio"],
-            required_processes=["point_lio"],
-            launch_commands=[["ros2", "launch", "point_lio", "mapping.launch.py"]],
+            launch_commands=[
+                ScanLaunchCommandConfig(command=["ros2", "launch", "point_lio", "mapping.launch.py"], processes=["mapping.launch.py"])
+            ],
         ),
     )
     states = iter(
         [
             {
-                "required_nodes": ["/point_lio"],
-                "missing_nodes": ["/point_lio"],
+                "required_nodes": [],
+                "missing_nodes": [],
                 "started_nodes": [],
-                "required_processes": ["point_lio"],
-                "missing_processes": ["point_lio"],
+                "required_processes": ["mapping.launch.py"],
+                "missing_processes": ["mapping.launch.py"],
                 "started_processes": [],
                 "errors": [],
             },
             {
-                "required_nodes": ["/point_lio"],
+                "required_nodes": [],
                 "missing_nodes": [],
                 "started_nodes": [],
-                "required_processes": ["point_lio"],
+                "required_processes": ["mapping.launch.py"],
                 "missing_processes": [],
                 "started_processes": [],
                 "errors": [],
@@ -350,8 +362,8 @@ def test_ensure_scan_mode_dependencies_logs_launch_success(monkeypatch, caplog) 
     with caplog.at_level(logging.INFO, logger="autodrive.server"):
         result = main._ensure_scan_mode_dependencies("3d")
 
-    assert result["started_nodes"] == ["/point_lio"]
-    assert result["started_processes"] == ["point_lio"]
+    assert result["started_nodes"] == []
+    assert result["started_processes"] == ["mapping.launch.py"]
     assert "scan dependency launch success mode=3d" in caplog.text
 
 
@@ -423,20 +435,20 @@ def test_ensure_scan_mode_dependencies_launches_when_process_missing(monkeypatch
         main,
         "_scan_mode_config",
         lambda mode: SimpleNamespace(
-            required_nodes=["/point_lio"],
-            required_processes=["point_lio"],
-            launch_commands=[["ros2", "launch", "point_lio", "mapping.launch.py"]],
+            launch_commands=[
+                ScanLaunchCommandConfig(command=["ros2", "launch", "point_lio", "mapping.launch.py"], processes=["mapping.launch.py"])
+            ],
         ),
     )
-    node_status = {"required_nodes": ["/point_lio"], "missing_nodes": [], "started_nodes": [], "errors": []}
     process_states = iter(
         [
-            {"required_processes": ["point_lio"], "missing_processes": ["point_lio"], "errors": []},
-            {"required_processes": ["point_lio"], "missing_processes": [], "errors": []},
+            {"required_processes": ["mapping.launch.py"], "missing_processes": ["mapping.launch.py"], "matched_processes": {}, "errors": []},
+            {"required_processes": ["mapping.launch.py"], "missing_processes": [], "matched_processes": {}, "errors": []},
         ]
     )
-    monkeypatch.setattr(main, "_check_required_nodes", lambda nodes: dict(node_status))
     monkeypatch.setattr(main, "_check_required_processes", lambda names: next(process_states))
+    monkeypatch.setattr(main, "_scan_command_process_matches", lambda argv: [])
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
     launches = []
     monkeypatch.setattr(main, "_launch_scan_mode_command", lambda argv: launches.append(argv) or (True, "started"))
 
@@ -445,7 +457,137 @@ def test_ensure_scan_mode_dependencies_launches_when_process_missing(monkeypatch
     assert launches == [["ros2", "launch", "point_lio", "mapping.launch.py"]]
     assert result["missing_nodes"] == []
     assert result["missing_processes"] == []
-    assert result["started_processes"] == ["point_lio"]
+    assert result["started_processes"] == ["mapping.launch.py"]
+
+
+def test_ensure_scan_mode_dependencies_launches_parallel_commands_before_polling(monkeypatch) -> None:
+    commands = [
+        ScanLaunchCommandConfig(command=["ros2", "launch", "caddie_hardware", "build_3d_map.launch.py"], processes=["point_lio"]),
+        ScanLaunchCommandConfig(command=["ros2", "launch", "slam_toolbox", "online_async_launch.py"], processes=["slam_toolbox"]),
+    ]
+    monkeypatch.setattr(
+        main,
+        "_scan_mode_config",
+        lambda mode: SimpleNamespace(
+            required_nodes=["/point_lio", "/slam_toolbox"],
+            required_processes=["point_lio", "slam_toolbox"],
+            launch_commands=commands,
+        ),
+    )
+    states = iter(
+        [
+            {
+                "required_nodes": ["/point_lio", "/slam_toolbox"],
+                "missing_nodes": ["/point_lio", "/slam_toolbox"],
+                "started_nodes": [],
+                "required_processes": ["point_lio", "slam_toolbox"],
+                "missing_processes": ["point_lio", "slam_toolbox"],
+                "started_processes": [],
+                "matched_processes": {},
+                "errors": [],
+            },
+            {
+                "required_nodes": ["/point_lio", "/slam_toolbox"],
+                "missing_nodes": [],
+                "started_nodes": [],
+                "required_processes": ["point_lio", "slam_toolbox"],
+                "missing_processes": [],
+                "started_processes": [],
+                "matched_processes": {},
+                "errors": [],
+            },
+        ]
+    )
+    monkeypatch.setattr(main, "_scan_dependency_status", lambda _config: next(states))
+    monkeypatch.setattr(main, "_scan_command_process_matches", lambda argv: [])
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+    launches = []
+    monkeypatch.setattr(main, "_launch_scan_mode_command", lambda argv: launches.append(list(argv)) or (True, "started"))
+
+    result = main._ensure_scan_mode_dependencies("3d")
+
+    assert launches == [
+        ["ros2", "launch", "caddie_hardware", "build_3d_map.launch.py"],
+        ["ros2", "launch", "slam_toolbox", "online_async_launch.py"],
+    ]
+    assert result["missing_processes"] == []
+    assert result["started_processes"] == ["point_lio", "slam_toolbox"]
+
+
+def test_ensure_scan_mode_dependencies_skips_existing_launch_command(monkeypatch) -> None:
+    command = ScanLaunchCommandConfig(
+        command=["ros2", "launch", "slam_toolbox", "online_async_launch.py"],
+        processes=["slam_toolbox"],
+    )
+    monkeypatch.setattr(
+        main,
+        "_scan_mode_config",
+        lambda mode: SimpleNamespace(
+            required_nodes=["/slam_toolbox"],
+            required_processes=["slam_toolbox"],
+            launch_commands=[command],
+        ),
+    )
+    status = {
+        "required_nodes": ["/slam_toolbox"],
+        "missing_nodes": ["/slam_toolbox"],
+        "started_nodes": [],
+        "required_processes": ["slam_toolbox"],
+        "missing_processes": ["slam_toolbox"],
+        "started_processes": [],
+        "matched_processes": {"slam_toolbox": []},
+        "errors": [],
+    }
+    monkeypatch.setattr(main, "_scan_dependency_status", lambda _config: dict(status))
+    monkeypatch.setattr(
+        main,
+        "_scan_command_process_matches",
+        lambda argv: ["13906 /usr/bin/python3 /opt/ros/humble/bin/ros2 launch slam_toolbox online_async_launch.py"],
+    )
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+    launches = []
+    monkeypatch.setattr(main, "_launch_scan_mode_command", lambda argv: launches.append(list(argv)) or (True, "started"))
+
+    result = main._ensure_scan_mode_dependencies("3d")
+
+    assert launches == []
+    assert result["missing_processes"] == ["slam_toolbox"]
+
+
+def test_ensure_scan_mode_dependencies_does_not_launch_when_process_running(monkeypatch) -> None:
+    command = ScanLaunchCommandConfig(
+        command=["ros2", "launch", "slam_toolbox", "online_async_launch.py"],
+        processes=["slam_toolbox"],
+    )
+    monkeypatch.setattr(
+        main,
+        "_scan_mode_config",
+        lambda mode: SimpleNamespace(
+            launch_commands=[command],
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "_scan_dependency_status",
+        lambda _config: {
+            "required_nodes": [],
+            "missing_nodes": [],
+            "started_nodes": [],
+            "required_processes": ["slam_toolbox"],
+            "missing_processes": [],
+            "started_processes": [],
+            "matched_processes": {"slam_toolbox": ["13907 async_slam_toolbox_node"]},
+            "errors": [],
+        },
+    )
+    monkeypatch.setattr(main, "_scan_command_process_matches", lambda argv: [])
+    launches = []
+    monkeypatch.setattr(main, "_launch_scan_mode_command", lambda argv: launches.append(list(argv)) or (True, "started"))
+
+    result = main._ensure_scan_mode_dependencies("3d")
+
+    assert launches == []
+    assert result["started_processes"] == ["slam_toolbox"]
 
 
 def test_ensure_scan_mode_dependencies_skips_command_for_already_running_target(monkeypatch) -> None:
@@ -453,21 +595,22 @@ def test_ensure_scan_mode_dependencies_skips_command_for_already_running_target(
         main,
         "_scan_mode_config",
         lambda mode: SimpleNamespace(
-            required_nodes=["/point_lio", "/slam_toolbox"],
-            required_processes=["point_lio", "slam_toolbox"],
             launch_commands=[
-                ["ros2", "launch", "slam_toolbox", "online_async_launch.py"],
+                ScanLaunchCommandConfig(
+                    command=["ros2", "launch", "slam_toolbox", "online_async_launch.py"],
+                    processes=["slam_toolbox"],
+                ),
             ],
         ),
     )
     status = {
-        "required_nodes": ["/point_lio", "/slam_toolbox"],
-        "missing_nodes": ["/point_lio"],
+        "required_nodes": [],
+        "missing_nodes": [],
         "started_nodes": [],
-        "required_processes": ["point_lio", "slam_toolbox"],
-        "missing_processes": ["point_lio"],
+        "required_processes": ["slam_toolbox"],
+        "missing_processes": [],
         "started_processes": [],
-        "matched_processes": {"point_lio": [], "slam_toolbox": ["11286 async_slam_toolbox_node"]},
+        "matched_processes": {"slam_toolbox": ["11286 async_slam_toolbox_node"]},
         "errors": [],
     }
     monkeypatch.setattr(main, "_scan_dependency_status", lambda _config: dict(status))
@@ -477,7 +620,7 @@ def test_ensure_scan_mode_dependencies_skips_command_for_already_running_target(
     result = main._ensure_scan_mode_dependencies("3d")
 
     assert launches == []
-    assert result["missing_processes"] == ["point_lio"]
+    assert result["missing_processes"] == []
 
 
 def test_check_required_processes_logs_matches_and_missing(monkeypatch, caplog) -> None:
@@ -496,7 +639,6 @@ def test_check_required_processes_logs_matches_and_missing(monkeypatch, caplog) 
 
 
 def test_scan_dependency_status_tracks_existing_process_pids(monkeypatch) -> None:
-    monkeypatch.setattr(main, "_check_required_nodes", lambda nodes: {"required_nodes": list(nodes), "missing_nodes": [], "started_nodes": [], "errors": []})
     monkeypatch.setattr(
         main,
         "_check_required_processes",
@@ -508,7 +650,13 @@ def test_scan_dependency_status_tracks_existing_process_pids(monkeypatch) -> Non
         },
     )
 
-    result = main._scan_dependency_status(SimpleNamespace(required_nodes=["/slam_toolbox"], required_processes=["slam_toolbox"]))
+    result = main._scan_dependency_status(
+        SimpleNamespace(
+            launch_commands=[
+                ScanLaunchCommandConfig(command=["ros2", "launch", "slam_toolbox", "online_async_launch.py"], processes=["slam_toolbox"])
+            ]
+        )
+    )
 
     assert result["tracked_pids"] == [11286]
 
@@ -529,6 +677,46 @@ def test_stop_scan_sends_sigint_to_tracked_existing_pids(monkeypatch) -> None:
 
     assert signals == [(11286, main.signal.SIGINT)]
     assert result["stopped_pids"] == [11286]
+
+
+def test_wait_for_pid_exit_reaps_zombie_child(monkeypatch) -> None:
+    reaped = []
+
+    class FakeProcPath:
+        def exists(self):
+            return True
+
+    monkeypatch.setattr(main, "Path", lambda _value: FakeProcPath())
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(main.os, "waitpid", lambda pid, flags: reaped.append((pid, flags)) or (pid, 0))
+
+    assert main._wait_for_pid_exit(13906) is True
+    assert reaped == [(13906, main.os.WNOHANG)]
+
+
+def test_stop_scan_stops_tracked_pids_before_pattern_fallback(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(main, "LAUNCHED_SCAN_PROCESSES", [])
+    monkeypatch.setattr(main, "LAUNCHED_SCAN_COMMANDS", {})
+    monkeypatch.setattr(main.os, "kill", lambda pid, sig: calls.append(("pid", pid, sig)))
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+
+    def fake_patterns(patterns):
+        calls.append(("patterns", list(patterns)))
+        return {"stopped_patterns": list(patterns), "errors": []}
+
+    monkeypatch.setattr(main, "_terminate_process_patterns", fake_patterns)
+    main.SCAN_SESSION["dependency_status"] = {
+        "started_processes": ["slam_toolbox"],
+        "tracked_pids": [13906],
+    }
+
+    main._stop_launched_scan_processes()
+
+    assert calls == [
+        ("pid", 13906, main.signal.SIGINT),
+        ("patterns", ["slam_toolbox"]),
+    ]
 
 
 def test_stop_scan_stops_launched_scan_processes(monkeypatch) -> None:
@@ -655,6 +843,7 @@ def test_terminate_process_patterns_uses_sigint_without_sigkill(monkeypatch) -> 
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(main.subprocess, "run", fake_run)
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(main, "_list_process_matches", lambda pattern: ["100 point_lio"])
 
     result = main._terminate_process_patterns(["point_lio"])
@@ -662,6 +851,24 @@ def test_terminate_process_patterns_uses_sigint_without_sigkill(monkeypatch) -> 
     assert calls == [["pkill", "-INT", "-f", "point_lio"]]
     assert result["stopped_patterns"] == ["point_lio"]
     assert "still running after SIGINT" in result["errors"][0]
+
+
+def test_terminate_process_patterns_waits_until_process_exits(monkeypatch) -> None:
+    calls = []
+    matches = [["100 slam_toolbox"], ["100 slam_toolbox"], []]
+
+    def fake_run(argv, check=False, capture_output=True, text=True):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(main, "_list_process_matches", lambda pattern: matches.pop(0))
+
+    result = main._terminate_process_patterns(["slam_toolbox"])
+
+    assert calls == [["pkill", "-INT", "-f", "slam_toolbox"]]
+    assert result == {"stopped_patterns": ["slam_toolbox"], "errors": []}
 
 
 def test_stop_scan_3d_only_stops_scan_without_returning_pcd(tmp_path: Path, monkeypatch) -> None:

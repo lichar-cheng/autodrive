@@ -784,7 +784,6 @@ class DesktopClient:
                 "brush_radius": "Brush Radius",
                 "auto_clear_noise": "Auto Clear Noise",
                 "clear_loaded_map": "Clear Loaded Map",
-                "reset_map": "Start Over",
                 "save_map": "Save Map",
                 "load_map": "Load Map",
                 "export_pgm": "Export PGM",
@@ -869,8 +868,6 @@ class DesktopClient:
                 "noise_cleared": "Auto cleared {count} noisy cells",
                 "noise_none": "No isolated noise found",
                 "map_cleared": "Loaded map cleared",
-                "reset_map_done": "Map reset requested. Waiting for new /map data.",
-                "reset_map_failed": "Map reset failed. Check slam_toolbox reset service.",
                 "save_title": "Saved",
                 "save_done": "Map saved:\n{path}",
                 "load_title": "Loaded",
@@ -968,7 +965,6 @@ class DesktopClient:
                 "brush_radius": "画刷半径",
                 "auto_clear_noise": "自动清噪",
                 "clear_loaded_map": "清空已加载地图",
-                "reset_map": "从头开始",
                 "save_map": "保存地图",
                 "load_map": "加载地图",
                 "export_pgm": "导出 PGM",
@@ -1053,8 +1049,6 @@ class DesktopClient:
                 "noise_cleared": "已自动清理 {count} 个噪点",
                 "noise_none": "未发现孤立噪点",
                 "map_cleared": "已清空已加载地图",
-                "reset_map_done": "已请求重置地图，等待新的 /map 数据。",
-                "reset_map_failed": "地图重置失败，请检查 slam_toolbox reset 服务。",
                 "save_title": "已保存",
                 "save_done": "地图已保存：\n{path}",
                 "load_title": "已加载",
@@ -1573,7 +1567,6 @@ class DesktopClient:
             [
                 (self.tr("auto_clear_noise"), self.auto_clear_noise),
                 (self.tr("clear_loaded_map"), self.clear_loaded_map),
-                (self.tr("reset_map"), self.reset_server_map),
                 (self.tr("save_map"), self.save_stcm),
                 (self.tr("load_map"), self.load_stcm),
                 (self.tr("export_pgm"), lambda: self.export_inspector_file("pgm")),
@@ -1944,11 +1937,26 @@ class DesktopClient:
         header_name = str(response.headers.get("X-Scan-PCD-Name", "") or "").strip()
         return header_name or default_name
 
-    def ensure_scan_pcd(self) -> dict[str, Any] | None:
+    def selected_scan_mode(self) -> str:
+        current_scan_mode = str(getattr(self, "scan", {}).get("mode", "2d")).strip().lower()
+        if current_scan_mode == "3d":
+            return "3d"
+        mode_var = getattr(self, "scan_mode_var", None)
+        if mode_var is not None:
+            try:
+                selected = str(mode_var.get()).strip().lower()
+                if selected in {"2d", "3d"}:
+                    return selected
+            except Exception:
+                pass
+        return "2d"
+
+    def ensure_scan_pcd(self, mode: str | None = None) -> dict[str, Any] | None:
         current_bytes = bytes(self.scan.get("pcd_bytes") or b"")
         if current_bytes:
             return {"name": str(self.scan.get("pcd_name") or "map.pcd"), "content": current_bytes}
-        if str(self.scan.get("mode", "2d")).strip().lower() != "3d":
+        scan_mode = str(mode or self.selected_scan_mode()).strip().lower()
+        if scan_mode != "3d":
             return None
         if not self.bridge or not self.bridge.connected:
             messagebox.showwarning(self.tr("export_title"), "pcd_export_unavailable")
@@ -1985,6 +1993,7 @@ class DesktopClient:
                     received = len(content)
                     detail = self.tr("pcd_download_progress", received=format_file_size(received), total=format_file_size(total)) if total > 0 else self.tr("pcd_download_progress_unknown", received=format_file_size(received))
                     self._update_progress_dialog(progress_state, detail, received, total)
+                self.scan["mode"] = "3d"
                 self.scan["pcd_name"] = file_name
                 self.scan["pcd_bytes"] = bytes(content)
                 self.scan["pcd_received_at"] = int(time.time() * 1000)
@@ -3162,16 +3171,6 @@ class DesktopClient:
         self.map_edit_status_var.set(self.tr("map_cleared"))
         self.reset_view()
 
-    def reset_server_map(self) -> None:
-        response = self.call_api("/map/reset", {})
-        if not response or not response.get("ok"):
-            if hasattr(self, "map_edit_status_var"):
-                self.map_edit_status_var.set(self.tr("reset_map_failed"))
-            return
-        self.clear_loaded_map()
-        if hasattr(self, "map_edit_status_var"):
-            self.map_edit_status_var.set(self.tr("reset_map_done"))
-
     def world_to_screen(self, x: float, y: float) -> tuple[float, float]:
         width = max(1, self.canvas.winfo_width())
         height = max(1, self.canvas.winfo_height())
@@ -3560,8 +3559,12 @@ class DesktopClient:
         target = filedialog.asksaveasfilename(parent=self.root, defaultextension=".slam", filetypes=[("SLAM", "*.slam")], initialfile=f"{self.map_name_var.get().strip() or 'desktop_map'}.slam")
         if not target:
             return
-        pcd_file = self.ensure_scan_pcd()
-        if str(self.scan.get("mode", "2d")).strip().lower() == "3d" and not isinstance(pcd_file, dict):
+        scan_mode = self.selected_scan_mode()
+        if scan_mode == "3d":
+            self.scan["mode"] = "3d"
+            bundle["scan_mode"] = "3d"
+        pcd_file = self.ensure_scan_pcd(scan_mode)
+        if scan_mode == "3d" and not isinstance(pcd_file, dict):
             return
         if isinstance(pcd_file, dict):
             bundle["pcd"] = {"included": True, "file": str(pcd_file.get("name") or "map.pcd")}
@@ -3669,7 +3672,7 @@ class DesktopClient:
             "json": (self.inspector["json"], ".json"),
         }
         if kind == "pcd":
-            pcd_file = self.ensure_scan_pcd()
+            pcd_file = self.ensure_scan_pcd(self.selected_scan_mode())
             pcd_bytes = bytes((pcd_file or {}).get("content") or b"")
             if not pcd_bytes:
                 messagebox.showwarning(self.tr("export_title"), "pcd_export_unavailable")
