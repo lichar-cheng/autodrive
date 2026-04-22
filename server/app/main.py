@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import copy
 import hashlib
 import json
@@ -16,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import CONFIG
@@ -147,6 +147,9 @@ SCAN_SESSION = {
 }
 
 LAUNCHED_SCAN_PROCESSES: list[subprocess.Popen[str]] = []
+LAUNCHED_SCAN_COMMANDS: dict[str, list[subprocess.Popen[str]]] = {}
+SCAN_START_LOCK = threading.Lock()
+SCAN_START_CANCEL_SEQ = 0
 SCAN_DEPENDENCY_POLL_ATTEMPTS = 10
 SCAN_DEPENDENCY_POLL_INTERVAL_SEC = 1.0
 SCAN_MAPPING_PREREQ_POLL_ATTEMPTS = 10
@@ -209,6 +212,35 @@ def _reset_scan_session(voxel_size: float | None = None, keep_points: bool = Fal
 def _normalize_scan_mode(mode: str | None) -> str | None:
     normalized = str(mode or "").strip().lower()
     return normalized if normalized in {"2d", "3d"} else None
+
+
+def _scan_pcd_path(mode: str | None = None) -> tuple[Path | None, dict | None]:
+    normalized_mode = _normalize_scan_mode(mode or str(SCAN_SESSION.get("mode", "2d")))
+    if normalized_mode != "3d":
+        return None, {"reason": "pcd_unavailable_for_mode", "error": "pcd is only available in 3d mode", "status_code": 409}
+    pcd_path = _pcd_output_path_for_mode("3d")
+    if pcd_path is None:
+        return None, {"reason": "pcd_path_not_configured", "status_code": 404}
+    if not pcd_path.exists():
+        return None, {"reason": "pcd_file_missing", "error": f"pcd file not found: {pcd_path}", "status_code": 404}
+    return pcd_path, None
+
+
+def _load_scan_pcd_file(mode: str | None = None) -> tuple[dict[str, Any] | None, dict | None]:
+    pcd_path, error = _scan_pcd_path(mode)
+    if error is not None or pcd_path is None:
+        SCAN_SESSION["pcd_transfer_state"] = "error"
+        return None, error
+    try:
+        SCAN_SESSION["pcd_transfer_state"] = "reading"
+        content = pcd_path.read_bytes()
+    except OSError as exc:
+        SCAN_SESSION["pcd_transfer_state"] = "error"
+        return None, {"reason": "pcd_read_failed", "error": str(exc), "status_code": 500}
+    pcd_file = {"name": pcd_path.name, "size": len(content), "content": content}
+    SCAN_SESSION["pcd_file"] = {"name": pcd_path.name, "size": len(content)}
+    SCAN_SESSION["pcd_transfer_state"] = "ready"
+    return pcd_file, None
 
 
 def _scan_mode_config(mode: str) -> Any:
@@ -299,7 +331,51 @@ def _check_required_processes(processes: list[str]) -> dict[str, Any]:
     return {"required_processes": list(processes), "missing_processes": missing, "matched_processes": matched, "errors": errors}
 
 
+def _extract_pid_from_process_line(line: str) -> int | None:
+    parts = str(line).strip().split(maxsplit=1)
+    if not parts:
+        return None
+    try:
+        pid = int(parts[0])
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def _matched_process_pids(matched_processes: dict[str, list[str]]) -> list[int]:
+    pids: list[int] = []
+    for lines in matched_processes.values():
+        for line in lines:
+            pid = _extract_pid_from_process_line(line)
+            if pid is not None:
+                pids.append(pid)
+    return list(dict.fromkeys(pids))
+
+
+def _scan_command_key(argv: list[str]) -> str:
+    return "\x00".join(str(part) for part in argv)
+
+
+def _command_targets_satisfied_dependency(argv: list[str], required_processes: list[str], missing_processes: list[str]) -> bool:
+    command_text = " ".join(str(part).lower() for part in argv)
+    missing = {str(process).lower() for process in missing_processes}
+    targeted = [str(process).lower() for process in required_processes if str(process).lower() in command_text]
+    return bool(targeted) and not any(process in missing for process in targeted)
+
+
 def _launch_scan_mode_command(argv: list[str]) -> tuple[bool, str]:
+    key = _scan_command_key(argv)
+    existing_processes = LAUNCHED_SCAN_COMMANDS.get(key, [])
+    live_processes: list[subprocess.Popen[str]] = []
+    for process in existing_processes:
+        if process.poll() is None:
+            live_processes.append(process)
+    if live_processes:
+        LAUNCHED_SCAN_COMMANDS[key] = live_processes
+        pids = [str(process.pid) for process in live_processes]
+        logger.info("scan dependency command already running argv=%s pids=%s", argv, pids)
+        return True, f"already_running pid={pids[0]}"
+    LAUNCHED_SCAN_COMMANDS[key] = []
     try:
         process = subprocess.Popen(
             argv,
@@ -311,6 +387,7 @@ def _launch_scan_mode_command(argv: list[str]) -> tuple[bool, str]:
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
     LAUNCHED_SCAN_PROCESSES.append(process)
+    LAUNCHED_SCAN_COMMANDS.setdefault(key, []).append(process)
     logger.info("started scan dependency command argv=%s pid=%s", argv, process.pid)
     return True, f"pid={process.pid}"
 
@@ -320,6 +397,10 @@ def _reap_scan_process(process: subprocess.Popen[str]) -> None:
         process.wait()
         if process in LAUNCHED_SCAN_PROCESSES:
             LAUNCHED_SCAN_PROCESSES.remove(process)
+        for key, processes in list(LAUNCHED_SCAN_COMMANDS.items()):
+            LAUNCHED_SCAN_COMMANDS[key] = [item for item in processes if item is not process]
+            if not LAUNCHED_SCAN_COMMANDS[key]:
+                LAUNCHED_SCAN_COMMANDS.pop(key, None)
         logger.info("reaped scan dependency process pid=%s", getattr(process, "pid", "?"))
     except Exception as exc:  # noqa: BLE001
         logger.warning("failed to reap scan dependency process pid=%s err=%s", getattr(process, "pid", "?"), exc)
@@ -338,6 +419,7 @@ def _merge_scan_dependency_status(node_status: dict[str, Any], process_status: d
         "missing_processes": list(process_status.get("missing_processes", [])),
         "started_processes": list(process_status.get("started_processes", [])),
         "matched_processes": copy.deepcopy(process_status.get("matched_processes", {})),
+        "tracked_pids": _matched_process_pids(process_status.get("matched_processes", {})),
         "errors": list(node_status.get("errors", [])) + list(process_status.get("errors", [])),
     }
 
@@ -361,11 +443,29 @@ def _ensure_scan_mode_dependencies(mode: str) -> dict[str, Any]:
         status.get("errors", []),
     )
     if not status["missing_nodes"] and not status["missing_processes"]:
+        status["started_processes"] = list(status.get("required_processes", []))
         return status
     started_nodes: list[str] = list(status.get("started_nodes", []))
     started_processes: list[str] = list(status.get("started_processes", []))
     errors: list[str] = list(status.get("errors", []))
     for command in config.launch_commands:
+        if not status["missing_nodes"] and not status["missing_processes"]:
+            status["started_nodes"] = started_nodes
+            status["started_processes"] = started_processes
+            status["errors"] = errors
+            return status
+        if _command_targets_satisfied_dependency(
+            list(command),
+            list(getattr(config, "required_processes", [])),
+            list(status.get("missing_processes", [])),
+        ):
+            logger.info(
+                "skip scan dependency command; targeted process already running mode=%s command=%s missing_processes=%s",
+                mode,
+                command,
+                status.get("missing_processes", []),
+            )
+            continue
         ok, detail = _launch_scan_mode_command(list(command))
         if not ok:
             errors.append(detail or f"failed to launch {command}")
@@ -394,6 +494,7 @@ def _ensure_scan_mode_dependencies(mode: str) -> dict[str, Any]:
             status["started_nodes"] = started_nodes
             status["started_processes"] = started_processes
             status["errors"] = errors
+            status["tracked_pids"] = _matched_process_pids(status.get("matched_processes", {}))
             logger.info(
                 "scan dependency launch success mode=%s started_nodes=%s started_processes=%s",
                 mode,
@@ -404,7 +505,25 @@ def _ensure_scan_mode_dependencies(mode: str) -> dict[str, Any]:
     status["started_nodes"] = started_nodes
     status["started_processes"] = started_processes
     status["errors"] = errors
+    status["tracked_pids"] = _matched_process_pids(status.get("matched_processes", {}))
     return status
+
+
+def _stop_tracked_scan_pids(pids: list[int]) -> dict[str, Any]:
+    stopped_pids: list[int] = []
+    errors: list[str] = []
+    for pid in dict.fromkeys(int(pid) for pid in pids if int(pid) > 0):
+        logger.info("stopping tracked scan dependency pid=%s signal=SIGINT", pid)
+        try:
+            os.kill(pid, signal.SIGINT)
+            stopped_pids.append(pid)
+        except ProcessLookupError:
+            logger.info("tracked scan dependency pid already exited pid=%s", pid)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"pid={pid}: {exc}")
+    if stopped_pids:
+        time.sleep(0.2)
+    return {"stopped_pids": stopped_pids, "errors": errors}
 
 
 def _stop_launched_scan_processes() -> dict[str, Any]:
@@ -432,9 +551,16 @@ def _stop_launched_scan_processes() -> dict[str, Any]:
             errors.append(f"pid={getattr(process, 'pid', '?')}: {exc}")
             remaining.append(process)
     LAUNCHED_SCAN_PROCESSES[:] = remaining
+    for key, processes in list(LAUNCHED_SCAN_COMMANDS.items()):
+        LAUNCHED_SCAN_COMMANDS[key] = [process for process in processes if process in remaining]
+        if not LAUNCHED_SCAN_COMMANDS[key]:
+            LAUNCHED_SCAN_COMMANDS.pop(key, None)
     pattern_status = _terminate_process_patterns(list(SCAN_SESSION.get("dependency_status", {}).get("started_processes", [])))
     if stopped_pids:
         logger.info("stopped scan dependency processes pids=%s", stopped_pids)
+    tracked_status = _stop_tracked_scan_pids(list(SCAN_SESSION.get("dependency_status", {}).get("tracked_pids", [])))
+    stopped_pids = list(dict.fromkeys(stopped_pids + tracked_status["stopped_pids"]))
+    errors.extend(tracked_status["errors"])
     errors.extend(pattern_status["errors"])
     if errors:
         logger.warning("failed to stop scan dependency processes errors=%s", errors)
@@ -830,6 +956,8 @@ async def diag_stream_stats() -> dict:
 
 @app.post("/scan/start")
 async def start_scan(req: StartScanRequest | None = None) -> dict:
+    global SCAN_START_CANCEL_SEQ
+
     mode = _normalize_scan_mode(req.mode if req is not None else "2d")
     if mode is None:
         return {
@@ -844,49 +972,83 @@ async def start_scan(req: StartScanRequest | None = None) -> dict:
             "scan_active": True,
             "scan_mode": str(SCAN_SESSION["mode"]),
         }
-    dependency_status = _ensure_scan_mode_dependencies(mode)
-    SCAN_SESSION["dependency_status"] = copy.deepcopy(dependency_status)
-    if dependency_status["missing_nodes"] or dependency_status.get("missing_processes") or dependency_status["errors"]:
+    if not SCAN_START_LOCK.acquire(blocking=False):
+        logger.info("scan start ignored because another start is already in progress mode=%s", mode)
         return {
             "ok": False,
-            "reason": "node_start_failed",
+            "reason": "scan_start_in_progress",
             "scan_active": False,
             "scan_mode": mode,
+        }
+    start_cancel_seq = int(SCAN_START_CANCEL_SEQ)
+    try:
+        dependency_status = _ensure_scan_mode_dependencies(mode)
+        SCAN_SESSION["dependency_status"] = copy.deepcopy(dependency_status)
+        if dependency_status["missing_nodes"] or dependency_status.get("missing_processes") or dependency_status["errors"]:
+            return {
+                "ok": False,
+                "reason": "node_start_failed",
+                "scan_active": False,
+                "scan_mode": mode,
+                "dependency_status": dependency_status,
+                "ros_enabled": ros.enabled,
+            }
+        if int(SCAN_START_CANCEL_SEQ) != start_cancel_seq:
+            logger.info("scan start cancelled after dependency start mode=%s", mode)
+            return {
+                "ok": False,
+                "reason": "scan_start_cancelled",
+                "scan_active": False,
+                "scan_mode": mode,
+                "dependency_status": dependency_status,
+                "ros_enabled": ros.enabled,
+            }
+        mapping_prereq = _wait_for_mapping_prereq_after_dependency_start(dependency_status)
+        if not mapping_prereq["ready"]:
+            logger.warning("scan start rejected blockers=%s warnings=%s", mapping_prereq["blockers"], mapping_prereq["warnings"])
+            return {
+                "ok": False,
+                "reason": "mapping_prereq_failed",
+                "scan_active": False,
+                "mapping_prereq": mapping_prereq,
+                "ros_enabled": ros.enabled,
+            }
+        if int(SCAN_START_CANCEL_SEQ) != start_cancel_seq:
+            logger.info("scan start cancelled after mapping prereq mode=%s", mode)
+            return {
+                "ok": False,
+                "reason": "scan_start_cancelled",
+                "scan_active": False,
+                "scan_mode": mode,
+                "dependency_status": dependency_status,
+                "ros_enabled": ros.enabled,
+            }
+        _reset_scan_session()
+        SCAN_SESSION["mode"] = mode
+        SCAN_SESSION["dependency_status"] = copy.deepcopy(dependency_status)
+        SCAN_SESSION["active"] = True
+        SCAN_SESSION["started_at"] = time.time()
+        if ros.enabled and ros.bridge is not None:
+            ros.bridge.set_scan_active(True)
+        else:
+            sim.scanning = True
+        logger.info("scan started")
+        return {
+            "ok": True,
+            "scan_active": True,
+            "scan_mode": mode,
+            "scan_summary": _scan_summary(),
             "dependency_status": dependency_status,
             "ros_enabled": ros.enabled,
         }
-    mapping_prereq = _wait_for_mapping_prereq_after_dependency_start(dependency_status)
-    if not mapping_prereq["ready"]:
-        logger.warning("scan start rejected blockers=%s warnings=%s", mapping_prereq["blockers"], mapping_prereq["warnings"])
-        return {
-            "ok": False,
-            "reason": "mapping_prereq_failed",
-            "scan_active": False,
-            "mapping_prereq": mapping_prereq,
-            "ros_enabled": ros.enabled,
-        }
-    _reset_scan_session()
-    SCAN_SESSION["mode"] = mode
-    SCAN_SESSION["dependency_status"] = copy.deepcopy(dependency_status)
-    SCAN_SESSION["active"] = True
-    SCAN_SESSION["started_at"] = time.time()
-    if ros.enabled and ros.bridge is not None:
-        ros.bridge.set_scan_active(True)
-    else:
-        sim.scanning = True
-    logger.info("scan started")
-    return {
-        "ok": True,
-        "scan_active": True,
-        "scan_mode": mode,
-        "scan_summary": _scan_summary(),
-        "dependency_status": dependency_status,
-        "ros_enabled": ros.enabled,
-    }
+    finally:
+        SCAN_START_LOCK.release()
 
 
 @app.post("/scan/stop")
 async def stop_scan(req: StopScanRequest | None = None) -> dict:
+    global SCAN_START_CANCEL_SEQ
+
     mode = _normalize_scan_mode(req.mode if req is not None else str(SCAN_SESSION.get("mode", "2d")))
     if mode is None:
         return {
@@ -895,6 +1057,7 @@ async def stop_scan(req: StopScanRequest | None = None) -> dict:
             "scan_active": bool(SCAN_SESSION["active"]),
         }
     if not bool(SCAN_SESSION["active"]):
+        SCAN_START_CANCEL_SEQ += 1
         process_stop_status = _stop_launched_scan_processes()
         logger.info("scan stop requested while inactive process_stop_status=%s", process_stop_status)
         return {
@@ -904,6 +1067,7 @@ async def stop_scan(req: StopScanRequest | None = None) -> dict:
             "scan_mode": mode,
             "process_stop_status": process_stop_status,
         }
+    SCAN_START_CANCEL_SEQ += 1
     SCAN_SESSION["active"] = False
     SCAN_SESSION["stopped_at"] = time.time()
     process_stop_status = _stop_launched_scan_processes()
@@ -913,57 +1077,8 @@ async def stop_scan(req: StopScanRequest | None = None) -> dict:
         sim.scanning = False
     logger.info("scan stopped")
     if str(SCAN_SESSION["mode"]) == "3d":
-        pcd_path = _pcd_output_path_for_mode("3d")
-        if pcd_path is None:
-            SCAN_SESSION["pcd_transfer_state"] = "error"
-            return {
-                "ok": False,
-                "reason": "pcd_path_not_configured",
-                "scan_active": False,
-                "scan_mode": "3d",
-                "process_stop_status": process_stop_status,
-            }
-        if not pcd_path.exists():
-            SCAN_SESSION["pcd_transfer_state"] = "error"
-            return {
-                "ok": False,
-                "reason": "pcd_file_missing",
-                "scan_active": False,
-                "scan_mode": "3d",
-                "error": f"pcd file not found: {pcd_path}",
-                "process_stop_status": process_stop_status,
-            }
-        try:
-            SCAN_SESSION["pcd_transfer_state"] = "reading"
-            content = pcd_path.read_bytes()
-        except OSError as exc:
-            SCAN_SESSION["pcd_transfer_state"] = "error"
-            return {
-                "ok": False,
-                "reason": "pcd_read_failed",
-                "scan_active": False,
-                "scan_mode": "3d",
-                "error": str(exc),
-                "process_stop_status": process_stop_status,
-            }
-        encoded = base64.b64encode(content).decode("ascii")
-        pcd_file = {
-            "name": pcd_path.name,
-            "size": len(content),
-            "encoding": "base64",
-            "content": encoded,
-        }
-        SCAN_SESSION["pcd_file"] = copy.deepcopy(pcd_file)
-        SCAN_SESSION["pcd_transfer_state"] = "ready"
-        return {
-            "ok": True,
-            "scan_active": False,
-            "scan_mode": "3d",
-            "scan_summary": _scan_summary(),
-            "pcd_file": pcd_file,
-            "ros_enabled": ros.enabled,
-            "process_stop_status": process_stop_status,
-        }
+        SCAN_SESSION["pcd_transfer_state"] = "idle"
+        SCAN_SESSION["pcd_file"] = None
     return {
         "ok": True,
         "scan_active": False,
@@ -972,6 +1087,47 @@ async def stop_scan(req: StopScanRequest | None = None) -> dict:
         "ros_enabled": ros.enabled,
         "process_stop_status": process_stop_status,
     }
+
+
+@app.get("/scan/pcd", response_model=None)
+async def download_scan_pcd():
+    pcd_path, error = _scan_pcd_path()
+    if error is not None or pcd_path is None:
+        return JSONResponse(
+            {
+                "ok": False,
+                "reason": error["reason"],
+                "error": error.get("error", ""),
+                "scan_mode": str(SCAN_SESSION.get("mode", "2d")),
+            },
+            status_code=int(error.get("status_code", 400)),
+        )
+    try:
+        size = pcd_path.stat().st_size
+    except OSError as exc:
+        SCAN_SESSION["pcd_transfer_state"] = "error"
+        return JSONResponse(
+            {
+                "ok": False,
+                "reason": "pcd_stat_failed",
+                "error": str(exc),
+                "scan_mode": str(SCAN_SESSION.get("mode", "2d")),
+            },
+            status_code=500,
+        )
+    SCAN_SESSION["pcd_transfer_state"] = "ready"
+    SCAN_SESSION["pcd_file"] = {"name": pcd_path.name, "size": int(size)}
+    logger.info("scan pcd download ready name=%s size=%s", pcd_path.name, size)
+    return FileResponse(
+        pcd_path,
+        media_type="application/octet-stream",
+        filename=pcd_path.name,
+        headers={
+            "Content-Length": str(size),
+            "X-Scan-PCD-Name": pcd_path.name,
+            "X-Scan-PCD-Size": str(size),
+        },
+    )
 
 
 @app.post("/scan/reset")
@@ -1083,7 +1239,18 @@ async def save_map(req: SaveMapRequest) -> dict:
     imu = ros.bridge.latest_imu() if ros.enabled and ros.bridge is not None else {}
     filename = f"{req.name}_{int(time.time())}.slam"
     target = map_dir / filename
-    pcd_file = copy.deepcopy(SCAN_SESSION.get("pcd_file"))
+    pcd_file = None
+    if str(SCAN_SESSION.get("mode", "2d")) == "3d":
+        pcd_file, pcd_error = _load_scan_pcd_file("3d")
+        if pcd_error is not None:
+            return {
+                "ok": False,
+                "reason": pcd_error["reason"],
+                "error": pcd_error.get("error", ""),
+                "map_source": _current_map_source(),
+                "scan_summary": _scan_summary(),
+                "scan_mode": str(SCAN_SESSION.get("mode", "2d")),
+            }
     bundle = {
         "version": "slam.v3",
         "scan_mode": str(SCAN_SESSION.get("mode", "2d")),

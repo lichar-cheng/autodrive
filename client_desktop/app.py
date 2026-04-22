@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import logging
@@ -153,6 +152,8 @@ def load_desktop_client_config(config_path: Path | None = None) -> dict[str, Any
         "server_ip": "127.0.0.1",
         "server_port": 8080,
         "username": "admin",
+        "scan_start_timeout_sec": 30.0,
+        "scan_start_cleanup_timeout_sec": 2.0,
     }
     candidates = [config_path] if config_path is not None else [
         runtime_base_dir() / "client_config.json",
@@ -357,6 +358,15 @@ def read_slam_archive(path: str | Path) -> tuple[dict, list[tuple[float, float, 
             pcd_file = {"name": pcd_name, "content": zf.read(pcd_name)}
     points = [struct.unpack("fff", raw[i:i + 12]) for i in range(0, len(raw), 12) if i + 12 <= len(raw)]
     return manifest, points, pcd_file
+
+
+def format_file_size(num_bytes: int) -> str:
+    size = float(max(0, int(num_bytes)))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024.0 or unit == "GB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} GB"
 
 
 KEYUP_STOP_CONFIRM_MS = 50
@@ -783,6 +793,10 @@ class DesktopClient:
                 "export_pcd": "Export PCD",
                 "scan_mode_label": "Scan Mode",
                 "scan_receiving_pcd": "Receiving PCD from server",
+                "pcd_download_title": "Downloading PCD",
+                "pcd_download_progress": "Receiving {received} / {total}",
+                "pcd_download_progress_unknown": "Receiving {received}",
+                "pcd_download_failed": "PCD download failed:\n{error}",
                 "map_view": "Map View",
                 "center_robot": "Center Robot",
                 "center_loaded_map": "Center Loaded Map",
@@ -963,6 +977,10 @@ class DesktopClient:
                 "export_pcd": "导出 PCD",
                 "scan_mode_label": "扫描模式",
                 "scan_receiving_pcd": "正在从服务端接收 PCD",
+                "pcd_download_title": "下载 PCD",
+                "pcd_download_progress": "正在接收 {received} / {total}",
+                "pcd_download_progress_unknown": "正在接收 {received}",
+                "pcd_download_failed": "PCD 下载失败：\n{error}",
                 "map_view": "地图视图",
                 "center_robot": "居中机器人",
                 "center_loaded_map": "居中已加载地图",
@@ -1873,6 +1891,112 @@ class DesktopClient:
         self.stream_health["last_api_error"] = ""
         self.bridge.post_async(path, body)
 
+    def _create_progress_dialog(self, title: str) -> dict[str, Any] | None:
+        if getattr(self, "root", None) is None:
+            return None
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+        ttk.Label(dialog, text=title).pack(anchor=tk.W, padx=12, pady=(12, 6))
+        detail_var = tk.StringVar(value="")
+        ttk.Label(dialog, textvariable=detail_var, wraplength=360).pack(anchor=tk.W, padx=12, pady=(0, 6))
+        progress = ttk.Progressbar(dialog, mode="determinate", length=320, maximum=100)
+        progress.pack(fill=tk.X, padx=12, pady=(0, 12))
+        dialog.update_idletasks()
+        return {"dialog": dialog, "detail_var": detail_var, "progress": progress, "started": False}
+
+    def _update_progress_dialog(self, progress_state: dict[str, Any] | None, detail: str, received: int, total: int) -> None:
+        if not progress_state:
+            return
+        progress_state["detail_var"].set(detail)
+        progress = progress_state["progress"]
+        if total > 0:
+            progress.configure(mode="determinate", maximum=total)
+            progress["value"] = min(received, total)
+        else:
+            progress.configure(mode="indeterminate")
+            if not bool(progress_state.get("started")):
+                progress.start(80)
+                progress_state["started"] = True
+        progress_state["dialog"].update_idletasks()
+
+    def _close_progress_dialog(self, progress_state: dict[str, Any] | None) -> None:
+        if not progress_state:
+            return
+        try:
+            progress = progress_state.get("progress")
+            if progress is not None:
+                progress.stop()
+        except Exception:
+            pass
+        try:
+            progress_state["dialog"].destroy()
+        except Exception:
+            pass
+
+    def _parse_download_filename(self, response: requests.Response, default_name: str = "map.pcd") -> str:
+        content_disposition = str(response.headers.get("Content-Disposition", "") or "")
+        match = re.search(r'filename="?([^";]+)"?', content_disposition)
+        if match:
+            return match.group(1).strip()
+        header_name = str(response.headers.get("X-Scan-PCD-Name", "") or "").strip()
+        return header_name or default_name
+
+    def ensure_scan_pcd(self) -> dict[str, Any] | None:
+        current_bytes = bytes(self.scan.get("pcd_bytes") or b"")
+        if current_bytes:
+            return {"name": str(self.scan.get("pcd_name") or "map.pcd"), "content": current_bytes}
+        if str(self.scan.get("mode", "2d")).strip().lower() != "3d":
+            return None
+        if not self.bridge or not self.bridge.connected:
+            messagebox.showwarning(self.tr("export_title"), "pcd_export_unavailable")
+            return None
+        previous_phase = str(self.scan.get("phase", "idle"))
+        self.scan["phase"] = "receiving_pcd"
+        if hasattr(self, "scan_state_var"):
+            self.scan_state_var.set(self.tr("scan_receiving_pcd"))
+        progress_state = self._create_progress_dialog(self.tr("pcd_download_title"))
+        try:
+            with self.bridge.session.get(f"{self.bridge.http_base}/scan/pcd", timeout=30, stream=True) as response:
+                if response.status_code != 200:
+                    detail = ""
+                    try:
+                        payload = response.json()
+                        detail = str(payload.get("error") or payload.get("reason") or "")
+                    except Exception:
+                        detail = response.text.strip()
+                    messagebox.showwarning(self.tr("export_title"), self.tr("pcd_download_failed", error=detail or f"http {response.status_code}"))
+                    return None
+                total = int(response.headers.get("Content-Length", "0") or response.headers.get("X-Scan-PCD-Size", "0") or 0)
+                file_name = self._parse_download_filename(response)
+                content = bytearray()
+                self._update_progress_dialog(
+                    progress_state,
+                    self.tr("pcd_download_progress", received=format_file_size(0), total=format_file_size(total)) if total > 0 else self.tr("pcd_download_progress_unknown", received=format_file_size(0)),
+                    0,
+                    total,
+                )
+                for chunk in response.iter_content(chunk_size=262144):
+                    if not chunk:
+                        continue
+                    content.extend(chunk)
+                    received = len(content)
+                    detail = self.tr("pcd_download_progress", received=format_file_size(received), total=format_file_size(total)) if total > 0 else self.tr("pcd_download_progress_unknown", received=format_file_size(received))
+                    self._update_progress_dialog(progress_state, detail, received, total)
+                self.scan["pcd_name"] = file_name
+                self.scan["pcd_bytes"] = bytes(content)
+                self.scan["pcd_received_at"] = int(time.time() * 1000)
+                return {"name": file_name, "content": bytes(content)}
+        except Exception as exc:
+            messagebox.showwarning(self.tr("export_title"), self.tr("pcd_download_failed", error=str(exc)))
+            return None
+        finally:
+            self.scan["phase"] = previous_phase or "idle"
+            self._close_progress_dialog(progress_state)
+            self.sync_scan_badges()
+
     def poll_health(self) -> None:
         now = time.monotonic()
         if now - self.last_health_poll_at < HEALTH_POLL_INTERVAL_SEC or not self.bridge or not self.bridge.connected:
@@ -1990,6 +2114,8 @@ class DesktopClient:
         mode = str(getattr(self, "scan_mode_var", None).get() if getattr(self, "scan_mode_var", None) is not None else self.scan.get("mode", "2d")).strip().lower()
         if self.scan.get("phase") == "starting":
             return
+        if self.scan.get("phase") == "waiting_mapping" and bool(self.scan.get("pending_start")):
+            return
         self.scan["phase"] = "starting"
         self.scan["error"] = ""
         self.scan["error_reason"] = ""
@@ -2015,15 +2141,30 @@ class DesktopClient:
         try:
             if hasattr(self, "stream_health"):
                 self.stream_health["last_api_error"] = ""
-            response = self.bridge.post("/scan/start", {"mode": mode}, timeout_sec=30.0)
+            timeout_sec = max(1.0, float(getattr(self, "client_config", {}).get("scan_start_timeout_sec", 30.0)))
+            response = self.bridge.post("/scan/start", {"mode": mode}, timeout_sec=timeout_sec)
         except Exception as exc:
             if hasattr(self, "stream_health"):
                 self.stream_health["retries_http"] += 1
                 self.stream_health["last_api_error"] = str(exc)
             if hasattr(self, "logger"):
                 self.logger.exception("scan start failed")
+            self._cleanup_scan_start_after_timeout(mode)
         if getattr(self, "root", None) is not None:
             self.root.after(0, lambda: self._finish_start_scan(mode, response))
+
+    def _cleanup_scan_start_after_timeout(self, mode: str) -> None:
+        bridge = getattr(self, "bridge", None)
+        if bridge is None:
+            return
+        timeout_sec = max(0.5, float(getattr(self, "client_config", {}).get("scan_start_cleanup_timeout_sec", 2.0)))
+        try:
+            if hasattr(self, "logger"):
+                self.logger.warning("scan start request failed; sending cleanup stop_scan mode=%s timeout=%s", mode, timeout_sec)
+            bridge.post("/scan/stop", {"mode": mode}, retries=0, timeout_sec=timeout_sec, backoff_base_sec=0.0)
+        except Exception as cleanup_exc:
+            if hasattr(self, "logger"):
+                self.logger.warning("scan start cleanup stop_scan failed mode=%s err=%s", mode, cleanup_exc)
 
     def _finish_start_scan(self, mode: str, response: dict | None, show_mapping_warning: bool = True) -> None:
         if hasattr(self, "scan_progress"):
@@ -2039,6 +2180,24 @@ class DesktopClient:
             return
         if not bool(response.get("ok", True)):
             detail = str(response.get("error") or response.get("reason") or "scan_start_failed")
+            if response.get("reason") == "scan_start_cancelled":
+                self.scan["active"] = False
+                self.scan["phase"] = "idle"
+                self.scan["error"] = ""
+                self.scan["error_reason"] = ""
+                self.scan["pending_start"] = False
+                self.scan["pending_mode"] = ""
+                self.sync_scan_badges()
+                return
+            if response.get("reason") == "scan_start_in_progress":
+                self.scan["phase"] = "waiting_mapping"
+                self.scan["error"] = detail
+                self.scan["error_reason"] = "scan_start_in_progress"
+                self.scan["pending_start"] = True
+                self.scan["pending_mode"] = mode
+                if hasattr(self, "scan_state_var"):
+                    self.scan_state_var.set(self.tr("scan_starting"))
+                return
             if response.get("reason") == "mapping_prereq_failed":
                 self.scan["phase"] = "waiting_mapping"
                 self.scan["error"] = detail
@@ -2096,26 +2255,31 @@ class DesktopClient:
             return
         if not bool(response.get("ok", True)):
             detail = str(response.get("error") or response.get("reason") or "scan_stop_failed")
+            if response.get("reason") == "scan_not_active" and isinstance(response.get("process_stop_status"), dict):
+                self.scan["active"] = False
+                self.scan["mode"] = str(response.get("scan_mode") or mode)
+                self.scan["phase"] = "idle"
+                self.scan["error"] = ""
+                self.scan["error_reason"] = ""
+                self.scan["pending_start"] = False
+                self.scan["pending_mode"] = ""
+                self.sync_scan_badges()
+                return
             self.scan["phase"] = "error"
             self.scan["error"] = detail
             self.scan["error_reason"] = str(response.get("reason") or detail)
+            self.scan["pending_start"] = False
+            self.scan["pending_mode"] = ""
             if hasattr(self, "scan_state_var"):
                 self.scan_state_var.set(detail)
             return
         self.scan["active"] = False
         self.scan["mode"] = str(response.get("scan_mode") or mode)
-        pcd_file = response.get("pcd_file")
-        if self.scan["mode"] == "3d" and isinstance(pcd_file, dict):
-            self.scan["phase"] = "receiving_pcd"
-            if hasattr(self, "scan_state_var"):
-                self.scan_state_var.set(self.tr("scan_receiving_pcd"))
-            encoded = str(pcd_file.get("content") or "")
-            self.scan["pcd_name"] = str(pcd_file.get("name") or "map.pcd")
-            self.scan["pcd_bytes"] = base64.b64decode(encoded.encode("ascii")) if encoded else b""
-            self.scan["pcd_received_at"] = int(time.time() * 1000)
         self.scan["phase"] = "idle"
         self.scan["error"] = ""
         self.scan["error_reason"] = ""
+        self.scan["pending_start"] = False
+        self.scan["pending_mode"] = ""
         self.sync_scan_badges()
 
     def clear_scan(self) -> None:
@@ -3393,16 +3557,16 @@ class DesktopClient:
             },
             "radar_points": self.occupied_points(),
         }
-        pcd_file = None
-        if self.scan.get("pcd_bytes"):
-            pcd_name = str(self.scan.get("pcd_name") or "map.pcd")
-            pcd_file = {"name": pcd_name, "content": bytes(self.scan.get("pcd_bytes") or b"")}
-            bundle["pcd"] = {"included": True, "file": pcd_name}
-        else:
-            bundle["pcd"] = {"included": False, "file": ""}
         target = filedialog.asksaveasfilename(parent=self.root, defaultextension=".slam", filetypes=[("SLAM", "*.slam")], initialfile=f"{self.map_name_var.get().strip() or 'desktop_map'}.slam")
         if not target:
             return
+        pcd_file = self.ensure_scan_pcd()
+        if str(self.scan.get("mode", "2d")).strip().lower() == "3d" and not isinstance(pcd_file, dict):
+            return
+        if isinstance(pcd_file, dict):
+            bundle["pcd"] = {"included": True, "file": str(pcd_file.get("name") or "map.pcd")}
+        else:
+            bundle["pcd"] = {"included": False, "file": ""}
         manifest = strip_legacy_trajectory({k: v for k, v in bundle.items() if k != "radar_points"})
         write_slam_archive(target, manifest, bundle["radar_points"], pcd_file)
         self.scan["last_saved_file"] = target
@@ -3505,12 +3669,13 @@ class DesktopClient:
             "json": (self.inspector["json"], ".json"),
         }
         if kind == "pcd":
-            pcd_bytes = bytes(self.scan.get("pcd_bytes") or b"")
+            pcd_file = self.ensure_scan_pcd()
+            pcd_bytes = bytes((pcd_file or {}).get("content") or b"")
             if not pcd_bytes:
                 messagebox.showwarning(self.tr("export_title"), "pcd_export_unavailable")
                 return
             ext = ".pcd"
-            initial_name = str(self.scan.get("pcd_name") or Path(self.inspector["file"]).with_suffix(".pcd").name)
+            initial_name = str((pcd_file or {}).get("name") or self.scan.get("pcd_name") or Path(self.inspector["file"]).with_suffix(".pcd").name)
             path = filedialog.asksaveasfilename(parent=self.root, defaultextension=ext, filetypes=[("PCD", "*.pcd")], initialfile=initial_name)
             if not path:
                 return

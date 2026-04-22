@@ -142,13 +142,14 @@ def test_auth_flow_error_keeps_user_message_but_redacts_sensitive_values() -> No
 
 def test_load_desktop_client_config_reads_local_override(tmp_path: Path) -> None:
     config_path = tmp_path / "client_config.json"
-    config_path.write_text('{"login_required": false, "gateway_ip": "10.0.0.8", "gateway_port": 28080, "server_ip": "10.0.0.9", "server_port": 18080, "username": "debug"}', encoding="utf-8")
+    config_path.write_text('{"login_required": false, "gateway_ip": "10.0.0.8", "gateway_port": 28080, "server_ip": "10.0.0.9", "server_port": 18080, "username": "debug", "scan_start_timeout_sec": 12}', encoding="utf-8")
 
     config = load_desktop_client_config(config_path)
 
     assert config["login_required"] is False
     assert config["gateway_ip"] == "10.0.0.8"
     assert config["server_ip"] == "10.0.0.9"
+    assert config["scan_start_timeout_sec"] == 12
 
 
 def test_resolve_log_file_path_falls_back_to_second_candidate(tmp_path: Path) -> None:
@@ -363,26 +364,74 @@ def test_start_scan_shows_starting_feedback_before_request_returns() -> None:
     assert client.scan["phase"] == "scanning"
 
 
-def test_stop_scan_3d_stores_pcd_payload_and_returns_idle() -> None:
+def test_start_scan_ignores_click_while_waiting_for_mapping() -> None:
+    client = build_minimal_client()
+    client.scan["phase"] = "waiting_mapping"
+    client.scan["pending_start"] = True
+    client.call_api = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("start should not be called"))
+
+    DesktopClient.start_scan(client)
+
+    assert client.scan["phase"] == "waiting_mapping"
+    assert client.scan["pending_start"] is True
+
+
+def test_start_scan_cancelled_returns_idle() -> None:
+    client = build_minimal_client()
+    client.call_api = lambda path, body: {"ok": False, "reason": "scan_start_cancelled", "scan_mode": "3d"}
+    client.scan_mode_var.set("3d")
+
+    DesktopClient.start_scan(client)
+
+    assert client.scan["active"] is False
+    assert client.scan["phase"] == "idle"
+    assert client.scan["pending_start"] is False
+
+
+def test_start_scan_worker_sends_stop_cleanup_after_timeout() -> None:
+    calls = []
+
+    class Bridge:
+        def post(self, path, body, retries=3, timeout_sec=4.0, backoff_base_sec=0.2):
+            calls.append((path, body, retries, timeout_sec, backoff_base_sec))
+            if path == "/scan/start":
+                raise TimeoutError("timed out")
+            return {"ok": True, "scan_mode": "3d"}
+
+    class Root:
+        def after(self, delay, callback):
+            del delay
+            callback()
+
+    client = build_minimal_client()
+    client.bridge = Bridge()
+    client.root = Root()
+    client.client_config = {"scan_start_timeout_sec": 7.0, "scan_start_cleanup_timeout_sec": 1.5}
+    client.stream_health = {"retries_http": 0, "last_api_error": ""}
+    client.logger = types.SimpleNamespace(exception=lambda *args, **kwargs: None, warning=lambda *args, **kwargs: None)
+
+    DesktopClient._start_scan_worker(client, "3d")
+
+    assert calls[0] == ("/scan/start", {"mode": "3d"}, 3, 7.0, 0.2)
+    assert calls[1] == ("/scan/stop", {"mode": "3d"}, 0, 1.5, 0.0)
+    assert client.scan["phase"] == "error"
+    assert client.scan["error_reason"] == "request_failed"
+
+
+def test_stop_scan_3d_returns_idle_without_downloading_pcd() -> None:
     client = build_minimal_client()
     client.scan["active"] = True
     client.scan["mode"] = "3d"
-    client.call_api = lambda path, body: {
-        "ok": True,
-        "scan_mode": "3d",
-        "pcd_file": {
-            "name": "map.pcd",
-            "encoding": "base64",
-            "content": "cGNkLWJ5dGVz",
-        },
-    }
+    client.scan["pcd_name"] = ""
+    client.scan["pcd_bytes"] = b""
+    client.call_api = lambda path, body: {"ok": True, "scan_mode": "3d"}
 
     DesktopClient.stop_scan(client)
 
     assert client.scan["active"] is False
     assert client.scan["phase"] == "idle"
-    assert client.scan["pcd_name"] == "map.pcd"
-    assert client.scan["pcd_bytes"] == b"pcd-bytes"
+    assert client.scan["pcd_name"] == ""
+    assert client.scan["pcd_bytes"] == b""
 
 
 def test_stop_scan_shows_stopping_feedback_before_request_returns() -> None:
@@ -402,6 +451,31 @@ def test_stop_scan_shows_stopping_feedback_before_request_returns() -> None:
 
     assert progress.stopped == 1
     assert client.scan["phase"] == "idle"
+
+
+def test_stop_scan_not_active_cancels_pending_start_and_returns_idle() -> None:
+    client = build_minimal_client()
+    client.scan["active"] = False
+    client.scan["mode"] = "3d"
+    client.scan["phase"] = "waiting_mapping"
+    client.scan["pending_start"] = True
+    client.scan["pending_mode"] = "3d"
+    client.scan["error"] = "tf missing"
+    client.scan["error_reason"] = "mapping_prereq_failed"
+    client.call_api = lambda path, body: {
+        "ok": False,
+        "reason": "scan_not_active",
+        "scan_mode": "3d",
+        "process_stop_status": {"stopped_pids": [1234], "errors": []},
+    }
+
+    DesktopClient.stop_scan(client)
+
+    assert client.scan["phase"] == "idle"
+    assert client.scan["pending_start"] is False
+    assert client.scan["pending_mode"] == ""
+    assert client.scan["error"] == ""
+    assert client.scan["error_reason"] == ""
 
 
 def test_start_scan_persists_server_error_reason_in_status() -> None:
@@ -469,6 +543,78 @@ def test_write_slam_archive_round_trips_optional_pcd(tmp_path: Path) -> None:
     assert pcd_file == {"name": "map.pcd", "content": b"pcd-bytes"}
 
 
+def test_ensure_scan_pcd_downloads_and_stores_bytes() -> None:
+    class Response:
+        def __init__(self) -> None:
+            self.status_code = 200
+            self.headers = {
+                "Content-Length": "9",
+                "Content-Disposition": 'attachment; filename="map.pcd"',
+            }
+            self.text = ""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def iter_content(self, chunk_size: int = 0):
+            del chunk_size
+            yield b"pcd-"
+            yield b"bytes"
+
+    client = build_minimal_client()
+    client.scan["mode"] = "3d"
+    client.bridge = types.SimpleNamespace(
+        connected=True,
+        http_base="http://demo",
+        session=types.SimpleNamespace(get=lambda *args, **kwargs: Response()),
+    )
+    client._create_progress_dialog = lambda title: {"title": title}
+    client._update_progress_dialog = lambda *_args, **_kwargs: None
+    client._close_progress_dialog = lambda *_args, **_kwargs: None
+
+    pcd_file = DesktopClient.ensure_scan_pcd(client)
+
+    assert pcd_file == {"name": "map.pcd", "content": b"pcd-bytes"}
+    assert client.scan["pcd_name"] == "map.pcd"
+    assert client.scan["pcd_bytes"] == b"pcd-bytes"
+
+
+def test_save_stcm_downloads_pcd_before_writing_archive(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "demo.slam"
+    writes = []
+    infos = []
+    monkeypatch.setattr("client_desktop.app.filedialog.asksaveasfilename", lambda **_kwargs: str(target))
+    monkeypatch.setattr("client_desktop.app.write_slam_archive", lambda path, manifest, points, pcd_file: writes.append((path, manifest, points, pcd_file)))
+    monkeypatch.setattr("client_desktop.app.messagebox.showinfo", lambda title, message: infos.append((title, message)))
+
+    client = build_minimal_client()
+    client.map_name_var = DummyVar("demo")
+    client.map_notes_var = DummyVar("")
+    client.camera_refresh_var = DummyVar("")
+    client.pose = {}
+    client.gps = {}
+    client.chassis = {}
+    client.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+    client.inspector = {"file": "", "manifest": None, "points": [], "pgm": "", "yaml": "", "json": "", "meta": {}, "pcd_file": None}
+    client.rebuild_path_nodes = lambda: None
+    client.apply_scan_fusion_config_from_ui = lambda: {"voxel_size": 0.1, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
+    client.active_voxel_size = lambda: 0.1
+    client.should_use_server_grid = lambda: False
+    client.browser_occupancy = lambda: {"occupied_cells": [], "free_cells": [], "map_fence_xy": [], "voxel_size": 0.1, "scan_fusion": {}}
+    client.occupied_points = lambda: [[1.0, 2.0, 1.0]]
+    client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
+    client.ensure_scan_pcd = lambda: {"name": "map.pcd", "content": b"pcd-bytes"}
+
+    DesktopClient.save_stcm(client)
+
+    assert writes
+    assert writes[0][3] == {"name": "map.pcd", "content": b"pcd-bytes"}
+    assert infos
+
+
 def test_export_pcd_warns_when_no_pcd_exists(monkeypatch) -> None:
     warnings = []
     monkeypatch.setattr("client_desktop.app.messagebox.showwarning", lambda title, message: warnings.append((title, message)))
@@ -494,6 +640,24 @@ def test_export_pcd_writes_current_pcd_bytes(tmp_path: Path, monkeypatch) -> Non
     client.scan["pcd_bytes"] = b"pcd-bytes"
     client.inspector = {"file": "demo.slam", "manifest": None, "points": [], "pgm": "", "yaml": "", "json": "", "meta": {}, "pcd_file": None}
     client.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+
+    DesktopClient.export_inspector_file(client, "pcd")
+
+    assert exported.read_bytes() == b"pcd-bytes"
+    assert infos
+
+
+def test_export_pcd_downloads_when_local_copy_missing(tmp_path: Path, monkeypatch) -> None:
+    exported = tmp_path / "downloaded.pcd"
+    infos = []
+    monkeypatch.setattr("client_desktop.app.filedialog.asksaveasfilename", lambda **_kwargs: str(exported))
+    monkeypatch.setattr("client_desktop.app.messagebox.showinfo", lambda title, message: infos.append((title, message)))
+
+    client = build_minimal_client()
+    client.inspector = {"file": "demo.slam", "manifest": None, "points": [], "pgm": "", "yaml": "", "json": "", "meta": {}, "pcd_file": None}
+    client.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+    client.scan["mode"] = "3d"
+    client.ensure_scan_pcd = lambda: {"name": "map.pcd", "content": b"pcd-bytes"}
 
     DesktopClient.export_inspector_file(client, "pcd")
 

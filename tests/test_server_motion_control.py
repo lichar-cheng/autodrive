@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import logging
 import subprocess
 import zipfile
@@ -181,6 +180,40 @@ def test_start_scan_rejects_when_scan_already_active(monkeypatch) -> None:
     assert result["reason"] == "scan_already_active"
 
 
+def test_start_scan_rejects_when_another_start_is_in_progress(monkeypatch) -> None:
+    monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=False, bridge=None, reason="disabled"))
+    main._reset_scan_session()
+    assert main.SCAN_START_LOCK.acquire(blocking=False)
+    try:
+        result = asyncio.run(main.start_scan(StartScanRequest(mode="3d")))
+    finally:
+        main.SCAN_START_LOCK.release()
+
+    assert result["ok"] is False
+    assert result["reason"] == "scan_start_in_progress"
+
+
+def test_start_scan_obeys_cancel_seq_changed_during_dependency_start(monkeypatch) -> None:
+    bridge = FakeBridge()
+    monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
+    main._reset_scan_session()
+    start_seq = int(main.SCAN_START_CANCEL_SEQ)
+
+    def fake_dependencies(mode):
+        del mode
+        main.SCAN_START_CANCEL_SEQ = start_seq + 1
+        return {"required_nodes": ["/slam_toolbox"], "missing_nodes": [], "started_nodes": ["/slam_toolbox"], "required_processes": ["slam_toolbox"], "missing_processes": [], "started_processes": ["slam_toolbox"], "errors": []}
+
+    monkeypatch.setattr(main, "_ensure_scan_mode_dependencies", fake_dependencies)
+
+    result = asyncio.run(main.start_scan(StartScanRequest(mode="3d")))
+
+    assert result["ok"] is False
+    assert result["reason"] == "scan_start_cancelled"
+    assert main.SCAN_SESSION["active"] is False
+    assert bridge.scan_states == []
+
+
 def test_start_scan_returns_node_start_failed_when_dependencies_fail(monkeypatch) -> None:
     bridge = FakeBridge()
     monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
@@ -357,6 +390,34 @@ def test_launch_scan_mode_command_does_not_stream_child_output(monkeypatch) -> N
     assert thread_calls == []
 
 
+def test_launch_scan_mode_command_skips_duplicate_running_command(monkeypatch) -> None:
+    popen_calls = []
+
+    class FakeProcess:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(
+        main.subprocess,
+        "Popen",
+        lambda *args, **kwargs: popen_calls.append((args, kwargs)) or FakeProcess(),
+    )
+    monkeypatch.setattr(main, "LAUNCHED_SCAN_PROCESSES", [])
+    monkeypatch.setattr(main, "LAUNCHED_SCAN_COMMANDS", {})
+    command = ["ros2", "launch", "slam_toolbox", "online_async_launch.py"]
+
+    first_ok, first_detail = main._launch_scan_mode_command(command)
+    second_ok, second_detail = main._launch_scan_mode_command(command)
+
+    assert first_ok is True
+    assert first_detail == "pid=4321"
+    assert second_ok is True
+    assert second_detail == "already_running pid=4321"
+    assert len(popen_calls) == 1
+
+
 def test_ensure_scan_mode_dependencies_launches_when_process_missing(monkeypatch) -> None:
     monkeypatch.setattr(
         main,
@@ -387,6 +448,38 @@ def test_ensure_scan_mode_dependencies_launches_when_process_missing(monkeypatch
     assert result["started_processes"] == ["point_lio"]
 
 
+def test_ensure_scan_mode_dependencies_skips_command_for_already_running_target(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main,
+        "_scan_mode_config",
+        lambda mode: SimpleNamespace(
+            required_nodes=["/point_lio", "/slam_toolbox"],
+            required_processes=["point_lio", "slam_toolbox"],
+            launch_commands=[
+                ["ros2", "launch", "slam_toolbox", "online_async_launch.py"],
+            ],
+        ),
+    )
+    status = {
+        "required_nodes": ["/point_lio", "/slam_toolbox"],
+        "missing_nodes": ["/point_lio"],
+        "started_nodes": [],
+        "required_processes": ["point_lio", "slam_toolbox"],
+        "missing_processes": ["point_lio"],
+        "started_processes": [],
+        "matched_processes": {"point_lio": [], "slam_toolbox": ["11286 async_slam_toolbox_node"]},
+        "errors": [],
+    }
+    monkeypatch.setattr(main, "_scan_dependency_status", lambda _config: dict(status))
+    launches = []
+    monkeypatch.setattr(main, "_launch_scan_mode_command", lambda argv: launches.append(argv) or (True, "started"))
+
+    result = main._ensure_scan_mode_dependencies("3d")
+
+    assert launches == []
+    assert result["missing_processes"] == ["point_lio"]
+
+
 def test_check_required_processes_logs_matches_and_missing(monkeypatch, caplog) -> None:
     process_lines = {
         "point_lio": ["100 /opt/ros/point_lio"],
@@ -400,6 +493,42 @@ def test_check_required_processes_logs_matches_and_missing(monkeypatch, caplog) 
     assert result["missing_processes"] == ["slam_toolbox"]
     assert result["matched_processes"]["point_lio"] == ["100 /opt/ros/point_lio"]
     assert "scan process check required=['point_lio', 'slam_toolbox'] missing=['slam_toolbox']" in caplog.text
+
+
+def test_scan_dependency_status_tracks_existing_process_pids(monkeypatch) -> None:
+    monkeypatch.setattr(main, "_check_required_nodes", lambda nodes: {"required_nodes": list(nodes), "missing_nodes": [], "started_nodes": [], "errors": []})
+    monkeypatch.setattr(
+        main,
+        "_check_required_processes",
+        lambda names: {
+            "required_processes": list(names),
+            "missing_processes": [],
+            "matched_processes": {"slam_toolbox": ["11286 /opt/ros/humble/lib/slam_toolbox/async_slam_toolbox_node"]},
+            "errors": [],
+        },
+    )
+
+    result = main._scan_dependency_status(SimpleNamespace(required_nodes=["/slam_toolbox"], required_processes=["slam_toolbox"]))
+
+    assert result["tracked_pids"] == [11286]
+
+
+def test_stop_scan_sends_sigint_to_tracked_existing_pids(monkeypatch) -> None:
+    signals = []
+    monkeypatch.setattr(main.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(main, "LAUNCHED_SCAN_PROCESSES", [])
+    monkeypatch.setattr(main, "LAUNCHED_SCAN_COMMANDS", {})
+    monkeypatch.setattr(main, "_terminate_process_patterns", lambda patterns: {"stopped_patterns": list(patterns), "errors": []})
+    main.SCAN_SESSION["dependency_status"] = {
+        "started_processes": ["slam_toolbox"],
+        "tracked_pids": [11286],
+    }
+
+    result = main._stop_launched_scan_processes()
+
+    assert signals == [(11286, main.signal.SIGINT)]
+    assert result["stopped_pids"] == [11286]
 
 
 def test_stop_scan_stops_launched_scan_processes(monkeypatch) -> None:
@@ -535,7 +664,7 @@ def test_terminate_process_patterns_uses_sigint_without_sigkill(monkeypatch) -> 
     assert "still running after SIGINT" in result["errors"][0]
 
 
-def test_stop_scan_3d_returns_base64_pcd_when_file_exists(tmp_path: Path, monkeypatch) -> None:
+def test_stop_scan_3d_only_stops_scan_without_returning_pcd(tmp_path: Path, monkeypatch) -> None:
     bridge = FakeBridge()
     pcd = tmp_path / "map.pcd"
     pcd.write_bytes(b"pcd-bytes")
@@ -550,9 +679,9 @@ def test_stop_scan_3d_returns_base64_pcd_when_file_exists(tmp_path: Path, monkey
 
     assert result["ok"] is True
     assert result["scan_mode"] == "3d"
-    assert result["pcd_file"]["name"] == "map.pcd"
-    assert result["pcd_file"]["content"] == base64.b64encode(b"pcd-bytes").decode("ascii")
+    assert "pcd_file" not in result
     assert bridge.scan_states == [False]
+    assert main.SCAN_SESSION["pcd_file"] is None
 
 
 def test_stop_scan_3d_requires_configured_pcd_path(monkeypatch) -> None:
@@ -564,10 +693,9 @@ def test_stop_scan_3d_requires_configured_pcd_path(monkeypatch) -> None:
     main.SCAN_SESSION["active"] = True
     main.SCAN_SESSION["mode"] = "3d"
 
-    result = asyncio.run(main.stop_scan(StopScanRequest(mode="3d")))
+    result = asyncio.run(main.download_scan_pcd())
 
-    assert result["ok"] is False
-    assert result["reason"] == "pcd_path_not_configured"
+    assert result.status_code == 404
 
 
 def test_stop_scan_3d_rejects_missing_pcd_file(tmp_path: Path, monkeypatch) -> None:
@@ -579,10 +707,24 @@ def test_stop_scan_3d_rejects_missing_pcd_file(tmp_path: Path, monkeypatch) -> N
     main.SCAN_SESSION["active"] = True
     main.SCAN_SESSION["mode"] = "3d"
 
-    result = asyncio.run(main.stop_scan(StopScanRequest(mode="3d")))
+    result = asyncio.run(main.download_scan_pcd())
 
-    assert result["ok"] is False
-    assert result["reason"] == "pcd_file_missing"
+    assert result.status_code == 404
+
+
+def test_download_scan_pcd_returns_file_response(tmp_path: Path, monkeypatch) -> None:
+    pcd = tmp_path / "map.pcd"
+    pcd.write_bytes(b"pcd-bytes")
+    monkeypatch.setattr(main, "_pcd_output_path_for_mode", lambda mode: pcd)
+    main._reset_scan_session()
+    main.SCAN_SESSION["mode"] = "3d"
+
+    result = asyncio.run(main.download_scan_pcd())
+
+    assert result.status_code == 200
+    assert result.headers["x-scan-pcd-name"] == "map.pcd"
+    assert result.headers["x-scan-pcd-size"] == "9"
+    assert main.SCAN_SESSION["pcd_file"] == {"name": "map.pcd", "size": 9}
 
 
 def test_health_includes_mapping_prereq_summary(monkeypatch) -> None:
@@ -678,6 +820,8 @@ def test_save_map_writes_new_slam_layout_without_pcd(tmp_path: Path, monkeypatch
 def test_save_map_writes_optional_pcd_into_slam(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(main, "latest_points", [(1.0, 2.0, 1.0)])
     monkeypatch.setattr(main, "map_dir", tmp_path)
+    pcd = tmp_path / "map.pcd"
+    pcd.write_bytes(b"pcd-bytes")
     monkeypatch.setattr(
         main,
         "ros",
@@ -696,7 +840,7 @@ def test_save_map_writes_optional_pcd_into_slam(tmp_path: Path, monkeypatch) -> 
     )
     main._reset_scan_session()
     main.SCAN_SESSION["mode"] = "3d"
-    main.SCAN_SESSION["pcd_file"] = {"name": "map.pcd", "content": b"pcd-bytes"}
+    monkeypatch.setattr(main, "_pcd_output_path_for_mode", lambda mode: pcd)
 
     result = asyncio.run(main.save_map(SaveMapRequest(name="demo3d", notes="demo", voxel_size=0.1, reset_after_save=False)))
 
@@ -706,6 +850,27 @@ def test_save_map_writes_optional_pcd_into_slam(tmp_path: Path, monkeypatch) -> 
     with zipfile.ZipFile(target, "r") as zf:
         assert set(zf.namelist()) == {"manifest.json", "map_points.bin", "map.pcd"}
         assert zf.read("map.pcd") == b"pcd-bytes"
+
+
+def test_save_map_3d_fails_when_pcd_file_missing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "latest_points", [(1.0, 2.0, 1.0)])
+    monkeypatch.setattr(main, "map_dir", tmp_path)
+    monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=False, bridge=None, reason="disabled"))
+    monkeypatch.setattr(
+        main,
+        "sim",
+        SimpleNamespace(
+            state=SimpleNamespace(x=0.0, y=0.0, yaw=0.0, poi=[], path=[], trajectory=[], gps_track=[], chassis_track=[]),
+        ),
+    )
+    main._reset_scan_session()
+    main.SCAN_SESSION["mode"] = "3d"
+    monkeypatch.setattr(main, "_pcd_output_path_for_mode", lambda mode: tmp_path / "missing.pcd")
+
+    result = asyncio.run(main.save_map(SaveMapRequest(name="demo3d", notes="demo", voxel_size=0.1, reset_after_save=False)))
+
+    assert result["ok"] is False
+    assert result["reason"] == "pcd_file_missing"
 
 
 def test_reset_map_calls_bridge_and_clears_cached_points(monkeypatch) -> None:
