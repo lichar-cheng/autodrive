@@ -440,22 +440,6 @@ def pose_progress_exceeds_threshold(
     return abs(yaw_delta) >= float(min_rotation_rad)
 
 
-class LatestScanFrameBuffer:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._latest: dict[str, Any] | None = None
-
-    def submit(self, frame: dict[str, Any]) -> None:
-        with self._lock:
-            self._latest = frame
-
-    def pop_latest(self) -> dict[str, Any] | None:
-        with self._lock:
-            frame = self._latest
-            self._latest = None
-            return frame
-
-
 def prune_scan_cache(scan: dict[str, Any], config: dict[str, Any]) -> None:
     occupied = scan.get("occupied")
     free = scan.get("free")
@@ -532,48 +516,6 @@ def _raytrace(scan: dict[str, Any], start_x: int, start_y: int, end_x: int, end_
     for step in range(steps):
         t = step / steps
         _mark_free(scan, round(start_x + dx * t), round(start_y + dy * t))
-
-
-def process_scan_frame(
-    scan: dict[str, Any],
-    points: list[Any],
-    pose: dict[str, Any],
-    keyframe: bool,
-    config: dict[str, Any],
-    logger: logging.Logger | None = None,
-) -> bool:
-    if not scan.get("active") or not points:
-        return False
-    if should_skip_scan_by_turn(float(pose.get("wz", 0.0)), keyframe, config):
-        return False
-    if not pose_progress_exceeds_threshold(scan.get("last_accum_pose"), pose):
-        return False
-    scan["raw_points"] += len(points)
-    pose_x = float(pose.get("x", 0.0))
-    pose_y = float(pose.get("y", 0.0))
-    robot_ix, robot_iy = _world_to_cell(scan, pose_x, pose_y)
-    changed = False
-    for point in points:
-        if not isinstance(point, (list, tuple)) or len(point) < 2:
-            if logger is not None:
-                logger.warning("skip invalid lidar point payload=%s", point)
-            continue
-        world_x, world_y = float(point[0]), float(point[1])
-        intensity = float(point[2]) if len(point) > 2 else 1.0
-        ix, iy = _world_to_cell(scan, world_x, world_y)
-        if keyframe:
-            _raytrace(scan, robot_ix, robot_iy, ix, iy)
-        _mark_occupied(scan, ix, iy, intensity)
-        changed = True
-    if not changed:
-        return False
-    scan["last_accum_pose"] = {
-        "x": float(pose.get("x", 0.0)),
-        "y": float(pose.get("y", 0.0)),
-        "yaw": float(pose.get("yaw", 0.0)),
-    }
-    prune_scan_cache(scan, config)
-    return True
 
 
 def runtime_base_dir() -> Path:
@@ -1166,9 +1108,6 @@ class DesktopClient:
         }
         self.server_grid = {"active": False, "resolution": 0.0, "occupied_cells": [], "free_cells": [], "stamp": 0.0}
         self.scan_lock = threading.Lock()
-        self.scan_frame_buffer = LatestScanFrameBuffer()
-        self.scan_worker_event = threading.Event()
-        self.scan_worker_stop = threading.Event()
         self.canvas_dirty = True
         self.canvas_revision = 0
         self.last_render_revision = -1
@@ -1291,8 +1230,6 @@ class DesktopClient:
         self.root.bind("<Button-5>", self.on_mousewheel)
         self.root.bind("<Button-1>", self.on_root_click, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.scan_worker = threading.Thread(target=self._scan_worker_loop, daemon=True, name="scan-worker")
-        self.scan_worker.start()
         self.control_sender_thread = threading.Thread(target=self._control_sender_loop, daemon=True, name="control-sender")
         self.control_sender_thread.start()
         self.tick()
@@ -2049,40 +1986,6 @@ class DesktopClient:
                     self.camera_inbox[cam_id] = {"objects": payload.get("objects", []), "meta": {"seq": msg.get("seq"), "stamp": msg.get("stamp"), "received_at_ms": int(time.time() * 1000)}}
         self.camera_refresh_var.set(build_camera_refresh_text(self.camera_inbox))
 
-    def queue_scan_frame(self, points: list[Any], stamp: float, keyframe: bool) -> None:
-        if not self.scan["active"] or not points:
-            return
-        frame = {
-            "points": points,
-            "stamp": float(stamp),
-            "keyframe": bool(keyframe),
-            "pose": dict(self.pose_for_stamp(stamp)),
-            "config": self.effective_scan_fusion_config(),
-        }
-        self.scan_frame_buffer.submit(frame)
-        self.scan_worker_event.set()
-
-    def _scan_worker_loop(self) -> None:
-        while not self.scan_worker_stop.is_set():
-            self.scan_worker_event.wait(timeout=0.2)
-            self.scan_worker_event.clear()
-            while True:
-                frame = self.scan_frame_buffer.pop_latest()
-                if frame is None:
-                    break
-                with self.scan_lock:
-                    changed = process_scan_frame(
-                        self.scan,
-                        points=frame["points"],
-                        pose=frame["pose"],
-                        keyframe=bool(frame["keyframe"]),
-                        config=frame["config"],
-                        logger=self.logger if hasattr(self, "logger") else None,
-                    )
-                if changed:
-                    self.scan_badges_dirty = True
-                    self.mark_canvas_dirty()
-
     def start_scan(self) -> None:
         mode = str(getattr(self, "scan_mode_var", None).get() if getattr(self, "scan_mode_var", None) is not None else self.scan.get("mode", "2d")).strip().lower()
         if self.scan.get("phase") == "starting":
@@ -2402,31 +2305,6 @@ class DesktopClient:
 
     def raytrace(self, start_x: int, start_y: int, end_x: int, end_y: int) -> None:
         _raytrace(self.scan, start_x, start_y, end_x, end_y)
-
-    def pose_for_stamp(self, stamp: float) -> dict:
-        if not self.pose_history:
-            return self.odom
-        best = self.pose_history[-1]
-        best_delta = abs(best["stamp"] - stamp)
-        for item in self.pose_history:
-            delta = abs(item["stamp"] - stamp)
-            if delta < best_delta:
-                best = item
-                best_delta = delta
-        return best["pose"]
-
-    def accumulate_points(self, points: list, stamp: float, keyframe: bool) -> None:
-        with self.scan_lock:
-            changed = process_scan_frame(
-                self.scan,
-                points=points,
-                pose=self.pose_for_stamp(stamp),
-                keyframe=keyframe,
-                config=self.apply_scan_fusion_config_from_ui(),
-                logger=self.logger,
-            )
-        if changed:
-            self.sync_scan_badges()
 
     def filtered_occupancy_cells(self) -> list[dict]:
         config = self.effective_scan_fusion_config()
@@ -3694,10 +3572,6 @@ class DesktopClient:
         self.control_sender_event.set()
         if hasattr(self, "control_sender_thread") and self.control_sender_thread.is_alive():
             self.control_sender_thread.join(timeout=1.0)
-        self.scan_worker_stop.set()
-        self.scan_worker_event.set()
-        if hasattr(self, "scan_worker") and self.scan_worker.is_alive():
-            self.scan_worker.join(timeout=1.0)
         self.root.destroy()
 
     def run(self) -> None:

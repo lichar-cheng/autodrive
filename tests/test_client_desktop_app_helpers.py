@@ -5,7 +5,6 @@ import types
 from client_desktop.app import (
     AuthFlowError,
     DesktopClient,
-    LatestScanFrameBuffer,
     MAX_MESSAGES_DRAIN_PER_TICK,
     bootstrap_authenticated_bridge,
     build_camera_refresh_text,
@@ -19,7 +18,6 @@ from client_desktop.app import (
     normalize_http_base_url,
     normalize_server_ws_url,
     parse_camera_topic_id,
-    process_scan_frame,
     redact_sensitive_text,
     resolve_log_file_path,
     read_slam_archive,
@@ -1128,7 +1126,6 @@ def test_consume_messages_stores_server_grid_payload() -> None:
     client.camera_refresh_var = Var()
     client.mark_canvas_dirty = lambda: None
     client.sync_scan_badges = lambda: None
-    client.queue_scan_frame = lambda *_args, **_kwargs: None
     client.validate_message = lambda msg: True
     client.consume_messages = DesktopClient.consume_messages.__get__(client, DesktopClient)
 
@@ -1186,8 +1183,6 @@ def test_consume_messages_does_not_queue_lidar_for_map_accumulation() -> None:
     client.last_message_at_ms = 0
     client.camera_refresh_var = Var()
     client.mark_canvas_dirty = lambda: None
-    queued = []
-    client.queue_scan_frame = lambda *_args, **_kwargs: queued.append("queued")
     client.validate_message = lambda msg: True
     client.sync_scan_badges = lambda: None
 
@@ -1205,7 +1200,6 @@ def test_consume_messages_does_not_queue_lidar_for_map_accumulation() -> None:
 
     DesktopClient.consume_messages(client)
 
-    assert queued == []
     assert client.scan["front_frames"] == 1
 
 
@@ -1292,173 +1286,6 @@ def test_start_scan_waits_when_server_rejects_prereq(monkeypatch) -> None:
     assert warnings
 
 
-def test_latest_scan_frame_buffer_keeps_only_latest_frame() -> None:
-    buffer = LatestScanFrameBuffer()
-
-    buffer.submit({"seq": 1})
-    buffer.submit({"seq": 2})
-
-    assert buffer.pop_latest()["seq"] == 2
-    assert buffer.pop_latest() is None
-
-
-def test_process_scan_frame_skips_stationary_pose() -> None:
-    scan = {
-        "active": True,
-        "raw_points": 0,
-        "voxel": 0.2,
-        "occupied": {},
-        "free": {},
-        "last_accum_pose": {"x": 0.0, "y": 0.0, "yaw": 0.0},
-    }
-    changed = process_scan_frame(
-        scan,
-        points=[[1.0, 0.0, 1.0]],
-        pose={"x": 0.01, "y": 0.0, "yaw": 0.01, "wz": 0.0},
-        keyframe=False,
-        config={"voxel_size": 0.2, "occupied_min_hits": 1, "occupied_over_free_ratio": 0.0, "turn_skip_wz": 0.2, "skip_turn_frames": True},
-    )
-
-    assert changed is False
-    assert scan["raw_points"] == 0
-    assert scan["occupied"] == {}
-
-
-def test_process_scan_frame_updates_scan_and_prunes_noise() -> None:
-    scan = {
-        "active": True,
-        "raw_points": 0,
-        "voxel": 0.2,
-        "occupied": {},
-        "free": {},
-        "last_accum_pose": None,
-    }
-    changed = process_scan_frame(
-        scan,
-        points=[[1.0, 0.0, 0.9]],
-        pose={"x": 0.0, "y": 0.0, "yaw": 0.0, "wz": 0.0},
-        keyframe=True,
-        config={"voxel_size": 0.2, "occupied_min_hits": 1, "occupied_over_free_ratio": 0.0, "turn_skip_wz": 0.2, "skip_turn_frames": True},
-    )
-
-    assert changed is True
-    assert scan["raw_points"] == 1
-    assert scan["occupied"]
-    assert scan["last_accum_pose"]["x"] == 0.0
-    assert scan["free"]
-
-
-def test_process_scan_frame_uses_world_points_without_reapplying_pose_transform() -> None:
-    scan = {
-        "active": True,
-        "raw_points": 0,
-        "voxel": 0.2,
-        "occupied": {},
-        "free": {},
-        "last_accum_pose": None,
-    }
-    changed = process_scan_frame(
-        scan,
-        points=[[3.0, 3.0, 0.9]],
-        pose={"x": 2.0, "y": 3.0, "yaw": 0.0, "wz": 0.0},
-        keyframe=False,
-        config={"voxel_size": 0.2, "occupied_min_hits": 1, "occupied_over_free_ratio": 0.0, "turn_skip_wz": 0.2, "skip_turn_frames": True},
-    )
-
-    assert changed is True
-    assert "15:15" in scan["occupied"]
-
-
-def test_process_scan_frame_does_not_rotate_world_points_by_robot_yaw() -> None:
-    scan = {
-        "active": True,
-        "raw_points": 0,
-        "voxel": 0.2,
-        "occupied": {},
-        "free": {},
-        "last_accum_pose": None,
-    }
-    changed = process_scan_frame(
-        scan,
-        points=[[2.0, 4.0, 0.9]],
-        pose={"x": 8.0, "y": 9.0, "yaw": 1.57079632679, "wz": 0.0},
-        keyframe=False,
-        config={"voxel_size": 0.2, "occupied_min_hits": 1, "occupied_over_free_ratio": 0.0, "turn_skip_wz": 0.2, "skip_turn_frames": True},
-    )
-
-    assert changed is True
-    assert "10:20" in scan["occupied"]
-
-
-def test_process_scan_frame_only_updates_free_cells_for_keyframes() -> None:
-    scan = {
-        "active": True,
-        "raw_points": 0,
-        "voxel": 0.2,
-        "occupied": {},
-        "free": {},
-        "last_accum_pose": None,
-    }
-    non_keyframe = process_scan_frame(
-        scan,
-        points=[[2.0, 0.0, 1.0]],
-        pose={"x": 0.0, "y": 0.0, "yaw": 0.0, "wz": 0.0},
-        keyframe=False,
-        config={"voxel_size": 0.2, "occupied_min_hits": 1, "occupied_over_free_ratio": 0.0, "turn_skip_wz": 0.2, "skip_turn_frames": True},
-    )
-
-    assert non_keyframe is True
-    assert scan["free"] == {}
-
-    scan["last_accum_pose"] = None
-    keyframe = process_scan_frame(
-        scan,
-        points=[[2.0, 0.0, 1.0]],
-        pose={"x": 0.0, "y": 0.0, "yaw": 0.0, "wz": 0.0},
-        keyframe=True,
-        config={"voxel_size": 0.2, "occupied_min_hits": 1, "occupied_over_free_ratio": 0.0, "turn_skip_wz": 0.2, "skip_turn_frames": True},
-    )
-
-    assert keyframe is True
-    assert scan["free"]
-
-def test_process_scan_frame_keeps_free_history_after_robot_moves() -> None:
-    scan = {
-        "active": True,
-        "raw_points": 0,
-        "voxel": 0.2,
-        "occupied": {},
-        "free": {},
-        "last_accum_pose": None,
-    }
-    config = {
-        "voxel_size": 0.2,
-        "occupied_min_hits": 1,
-        "occupied_over_free_ratio": 0.0,
-        "turn_skip_wz": 0.2,
-        "skip_turn_frames": True,
-    }
-
-    first = process_scan_frame(
-        scan,
-        points=[[2.0, 0.0, 1.0]],
-        pose={"x": 0.0, "y": 0.0, "yaw": 0.0, "wz": 0.0},
-        keyframe=True,
-        config=config,
-    )
-    second = process_scan_frame(
-        scan,
-        points=[[4.0, 0.0, 1.0]],
-        pose={"x": 1.0, "y": 0.0, "yaw": 0.0, "wz": 0.0},
-        keyframe=True,
-        config=config,
-    )
-
-    assert first is True
-    assert second is True
-    assert any(int(cell["ix"]) < 5 for cell in scan["free"].values())
-
-
 def test_coalesce_stream_messages_prefers_latest_pose_and_lidar() -> None:
     messages = [
         {"topic": "/robot/pose", "stamp": 1.0, "payload": {"x": 1}},
@@ -1501,8 +1328,6 @@ def test_consume_messages_coalesces_and_prioritizes_pose_updates() -> None:
     client.scan = {"front_frames": 0, "rear_frames": 0, "active": True}
     client.last_scan = {"front": {}, "rear": {}}
     client.validate_message = lambda msg: True
-    queued = []
-    client.queue_scan_frame = lambda points, stamp, keyframe: queued.append((points, stamp, keyframe))
     dirty = []
     client.mark_canvas_dirty = lambda: dirty.append("dirty")
 
@@ -1513,7 +1338,6 @@ def test_consume_messages_coalesces_and_prioritizes_pose_updates() -> None:
     DesktopClient.consume_messages(client)
 
     assert client.pose == {"x": 9.0}
-    assert queued == []
     assert dirty
 
 

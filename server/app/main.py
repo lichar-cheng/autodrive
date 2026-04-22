@@ -299,25 +299,12 @@ def _check_required_processes(processes: list[str]) -> dict[str, Any]:
     return {"required_processes": list(processes), "missing_processes": missing, "matched_processes": matched, "errors": errors}
 
 
-def _stream_process_output(stream: Any, level: int, prefix: str) -> None:
-    try:
-        for raw_line in iter(stream.readline, ""):
-            line = str(raw_line).rstrip()
-            if line:
-                logger.log(level, "%s %s", prefix, line)
-    finally:
-        try:
-            stream.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-
 def _launch_scan_mode_command(argv: list[str]) -> tuple[bool, str]:
     try:
         process = subprocess.Popen(
             argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             text=True,
             start_new_session=True,
         )
@@ -325,19 +312,21 @@ def _launch_scan_mode_command(argv: list[str]) -> tuple[bool, str]:
         return False, str(exc)
     LAUNCHED_SCAN_PROCESSES.append(process)
     logger.info("started scan dependency command argv=%s pid=%s", argv, process.pid)
-    if process.stdout is not None:
-        threading.Thread(
-            target=_stream_process_output,
-            args=(process.stdout, logging.INFO, f"[scan-launch:{process.pid}:stdout]"),
-            daemon=True,
-        ).start()
-    if process.stderr is not None:
-        threading.Thread(
-            target=_stream_process_output,
-            args=(process.stderr, logging.WARNING, f"[scan-launch:{process.pid}:stderr]"),
-            daemon=True,
-        ).start()
     return True, f"pid={process.pid}"
+
+
+def _reap_scan_process(process: subprocess.Popen[str]) -> None:
+    try:
+        process.wait()
+        if process in LAUNCHED_SCAN_PROCESSES:
+            LAUNCHED_SCAN_PROCESSES.remove(process)
+        logger.info("reaped scan dependency process pid=%s", getattr(process, "pid", "?"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("failed to reap scan dependency process pid=%s err=%s", getattr(process, "pid", "?"), exc)
+
+
+def _reap_scan_process_async(process: subprocess.Popen[str]) -> None:
+    threading.Thread(target=_reap_scan_process, args=(process,), daemon=True).start()
 
 
 def _merge_scan_dependency_status(node_status: dict[str, Any], process_status: dict[str, Any]) -> dict[str, Any]:
@@ -405,6 +394,12 @@ def _ensure_scan_mode_dependencies(mode: str) -> dict[str, Any]:
             status["started_nodes"] = started_nodes
             status["started_processes"] = started_processes
             status["errors"] = errors
+            logger.info(
+                "scan dependency launch success mode=%s started_nodes=%s started_processes=%s",
+                mode,
+                status["started_nodes"],
+                status["started_processes"],
+            )
             return status
     status["started_nodes"] = started_nodes
     status["started_processes"] = started_processes
@@ -422,12 +417,16 @@ def _stop_launched_scan_processes() -> dict[str, Any]:
             os.killpg(process.pid, signal.SIGINT)
             stopped_pids.append(int(process.pid))
             try:
-                if process.poll() is None:
-                    process.wait(timeout=3.0)
+                process.wait(timeout=3.0 if process.poll() is None else 0.1)
             except subprocess.TimeoutExpired:
                 errors.append(f"pid={process.pid}: did not exit after SIGINT")
                 remaining.append(process)
+                _reap_scan_process_async(process)
         except ProcessLookupError:
+            try:
+                process.wait(timeout=0.1)
+            except Exception:  # noqa: BLE001
+                pass
             logger.info("scan dependency process group already exited pid=%s", getattr(process, "pid", "?"))
         except Exception as exc:  # noqa: BLE001
             errors.append(f"pid={getattr(process, 'pid', '?')}: {exc}")

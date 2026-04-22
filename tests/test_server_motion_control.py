@@ -278,6 +278,85 @@ def test_ensure_scan_mode_dependencies_launches_missing_nodes(monkeypatch) -> No
     assert result["started_nodes"] == ["/point_lio"]
 
 
+def test_ensure_scan_mode_dependencies_logs_launch_success(monkeypatch, caplog) -> None:
+    monkeypatch.setattr(
+        main,
+        "_scan_mode_config",
+        lambda mode: SimpleNamespace(
+            required_nodes=["/point_lio"],
+            required_processes=["point_lio"],
+            launch_commands=[["ros2", "launch", "point_lio", "mapping.launch.py"]],
+        ),
+    )
+    states = iter(
+        [
+            {
+                "required_nodes": ["/point_lio"],
+                "missing_nodes": ["/point_lio"],
+                "started_nodes": [],
+                "required_processes": ["point_lio"],
+                "missing_processes": ["point_lio"],
+                "started_processes": [],
+                "errors": [],
+            },
+            {
+                "required_nodes": ["/point_lio"],
+                "missing_nodes": [],
+                "started_nodes": [],
+                "required_processes": ["point_lio"],
+                "missing_processes": [],
+                "started_processes": [],
+                "errors": [],
+            },
+        ]
+    )
+    monkeypatch.setattr(main, "_scan_dependency_status", lambda _config: next(states))
+    monkeypatch.setattr(main, "_launch_scan_mode_command", lambda argv: (True, "started"))
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+
+    with caplog.at_level(logging.INFO, logger="autodrive.server"):
+        result = main._ensure_scan_mode_dependencies("3d")
+
+    assert result["started_nodes"] == ["/point_lio"]
+    assert result["started_processes"] == ["point_lio"]
+    assert "scan dependency launch success mode=3d" in caplog.text
+
+
+def test_launch_scan_mode_command_does_not_stream_child_output(monkeypatch) -> None:
+    popen_calls = []
+    thread_calls = []
+
+    class FakeProcess:
+        pid = 4321
+        stdout = object()
+        stderr = object()
+
+    monkeypatch.setattr(
+        main.subprocess,
+        "Popen",
+        lambda argv, stdout, stderr, text, start_new_session: popen_calls.append(
+            {
+                "argv": argv,
+                "stdout": stdout,
+                "stderr": stderr,
+                "text": text,
+                "start_new_session": start_new_session,
+            }
+        )
+        or FakeProcess(),
+    )
+    monkeypatch.setattr(main.threading, "Thread", lambda *args, **kwargs: thread_calls.append((args, kwargs)))
+    monkeypatch.setattr(main, "LAUNCHED_SCAN_PROCESSES", [])
+
+    ok, detail = main._launch_scan_mode_command(["ros2", "launch", "slam_toolbox", "online_async_launch.py"])
+
+    assert ok is True
+    assert detail == "pid=4321"
+    assert popen_calls[0]["stdout"] is main.subprocess.DEVNULL
+    assert popen_calls[0]["stderr"] is main.subprocess.DEVNULL
+    assert thread_calls == []
+
+
 def test_ensure_scan_mode_dependencies_launches_when_process_missing(monkeypatch) -> None:
     monkeypatch.setattr(
         main,
@@ -353,14 +432,17 @@ def test_stop_scan_stops_launched_scan_processes(monkeypatch) -> None:
 def test_stop_scan_attempts_process_group_even_when_launch_parent_exited(monkeypatch) -> None:
     class FakeProcess:
         pid = 1234
+        waited = False
 
         def poll(self):
             return 0
 
         def wait(self, timeout=None):
+            self.waited = True
             return 0
 
-    monkeypatch.setattr(main, "LAUNCHED_SCAN_PROCESSES", [FakeProcess()])
+    process = FakeProcess()
+    monkeypatch.setattr(main, "LAUNCHED_SCAN_PROCESSES", [process])
     killed_groups = []
     monkeypatch.setattr(main.os, "killpg", lambda pid, sig: killed_groups.append((pid, sig)))
 
@@ -369,6 +451,7 @@ def test_stop_scan_attempts_process_group_even_when_launch_parent_exited(monkeyp
     assert result["stopped_pids"] == [1234]
     assert main.LAUNCHED_SCAN_PROCESSES == []
     assert killed_groups == [(1234, main.signal.SIGINT)]
+    assert process.waited is True
 
 
 def test_stop_scan_falls_back_to_started_process_patterns(monkeypatch) -> None:
@@ -401,6 +484,38 @@ def test_stop_scan_reports_timeout_without_sigkill(monkeypatch) -> None:
 
     assert killed_groups == [(1234, main.signal.SIGINT)]
     assert "did not exit after SIGINT" in result["errors"][0]
+
+
+def test_stop_scan_timeout_starts_background_reaper(monkeypatch) -> None:
+    class FakeProcess:
+        pid = 1234
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(cmd="ros2 launch", timeout=timeout)
+            return 0
+
+    starts = []
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        def start(self):
+            starts.append((self.args, self.kwargs))
+
+    monkeypatch.setattr(main, "LAUNCHED_SCAN_PROCESSES", [FakeProcess()])
+    monkeypatch.setattr(main.os, "killpg", lambda pid, sig: None)
+    monkeypatch.setattr(main.threading, "Thread", lambda *args, **kwargs: FakeThread(*args, **kwargs))
+
+    main._stop_launched_scan_processes()
+
+    assert len(starts) == 1
+    assert starts[0][1]["daemon"] is True
 
 
 def test_terminate_process_patterns_uses_sigint_without_sigkill(monkeypatch) -> None:
