@@ -1,90 +1,108 @@
 # Desktop Client
 
-`client_desktop` is the native Tk desktop client for AutoDrive map tooling.
+`client_desktop` is the native Tk desktop client for AutoDrive map capture, map editing, export, and motion-control tooling.
 
 ## Current Coverage
 
-The desktop client now tracks the browser client feature set closely:
-
-- WebSocket stream connection with reconnect, ping/pong, checksum/seq/lag diagnostics, and `/health` polling
-- Scan accumulation and map canvas rendering
+- WebSocket stream connection with reconnect, ping/pong, per-topic seq/checksum diagnostics, and low-frequency `/health` polling
 - 2D / 3D scan mode selection
-- Local `.slam` map save and load
-- Map exports for `ZIP`, `PGM`, `YAML`, `JSON`, and `PCD`
-- Second-stage map editing
-- Noise erase and obstacle-line drawing
-- POI add, batch POI add, delete, geo apply, and clipboard copy
+- Scan accumulation and occupancy-grid map rendering
+- Local `.slam` save and load
+- Native map import from `.zip`, `.yaml`, `.yml`, and `.pgm`
+- Export to `ZIP`, `PGM`, `YAML`, `JSON`, and `PCD`
+- Second-stage map editing on occupancy grid
+- POI add, batch add, delete, and clipboard copy
 - Path connect by POI name
 - Path connect by free-point clicks
 - Obstacle-aware path planning with safety clearance
 - Auto loop generation and closed-loop validation
-- Move controls with repeated keyboard driving and stop-on-keyup
-- Buffered camera snapshot refresh
+- Repeated keyboard drive with stop-on-keyup confirmation
 - Panel visibility toggles
 
-## Keyboard Drive Notes
+## Keyboard Drive
 
-Move control uses three parameters together:
+The desktop client now drives the server with repeated `POST /control/target` requests, plus `POST /control/stop` on explicit stop paths.
 
-- `cmd duration`: how long each `/control/move` command stays effective on the server.
-- `repeat (ms)`: how often the desktop client resends the current keyboard command while a key is held.
-- `stop on keyup`: when enabled, key release schedules a short confirmation window before sending `/control/stop`.
+Relevant behavior:
 
-Recommended relationship:
+- `repeat (ms)` controls how often the held keyboard target is resent. Default is `120ms`.
+- `stop on keyup` delays the final stop confirmation briefly to absorb key auto-repeat jitter.
+- The keyup confirmation window is `50ms`.
+- If the client stops sending targets, the server-side hold expires and the server publishes stop for safety.
 
-- Keep `repeat (ms)` slightly smaller than `cmd duration`.
-- Default values `cmd duration=0.15` and `repeat=120ms` are intended to overlap, so motion remains continuous while the key is held.
+Recommended setting:
 
-Why `stop on keyup` previously felt blunt:
-
-- Continuous keyboard drive is implemented by repeated short-duration `/control/move` commands.
-- Some platforms emit repeat-related `KeyRelease/KeyPress` jitter while a key is still physically held.
-- The desktop client now delays `keyup` stop confirmation briefly before sending `/control/stop`, so auto-repeat jitter does not interrupt motion, while real key release still stops quickly.
-
-Current behavior:
-
-- `stop on keyup` enabled: smooth hold motion, quick stop on real key release.
-- `stop on keyup` disabled: movement stops only when the repeated move commands stop arriving and their server-side `cmd duration` expires.
+- Keep `repeat (ms)` well below the server hold window.
+- The current desktop default of `120ms` matches the current server control keepalive well.
 
 ## Mapping Prerequisites
 
-The desktop client no longer treats `/health` as a high-frequency connection probe.
+The desktop client does not use `/health` as a high-frequency connection probe.
 
-- WebSocket state, message gap, lag, and API errors are still detected directly by the client.
-- `/health` is polled at a lower frequency and is mainly used to display server-side mapping readiness summary.
-- If the server rejects `/scan/start` because TF, odom, or lidar prerequisites are not ready, the desktop client shows the returned blockers directly.
+- Connection quality is primarily inferred from WebSocket state, message gap, lag, and API failures.
+- `/health` is polled at low frequency to surface server-side mapping readiness summary.
+- If the server rejects `/scan/start` because odom, lidar, or TF prerequisites are not ready, the returned blockers are shown directly.
 
 ## 2D / 3D Scan Modes
 
-- `2D` mode starts the normal map scan flow and asks the server to verify or launch the configured 2D ROS dependency nodes before scanning.
-- `3D` mode uses the same live `/map` view during scanning, but when scanning stops the desktop client waits for the server to return the configured `pcd` file produced by the 3D stack.
-- While the `pcd` file is being received, the desktop client shows a receiving state.
-- If dependency checks, node startup, stop, `pcd` lookup, or transfer fail, the desktop client keeps the last error in scan status and also shows a warning dialog.
+- `2d` starts the normal occupancy-grid map flow.
+- `3d` uses the same live map view while scanning, then can fetch the configured `pcd` file produced by the 3D stack.
+- If dependency checks, node startup, stop, `pcd` lookup, or transfer fail, the desktop client keeps the error in scan status and also shows a warning dialog.
 
 ## `.slam` Archive Layout
 
-The desktop client now writes the new `.slam` archive layout:
+The desktop client writes the current `slam.v4` archive layout:
 
 - `manifest.json`
-- `map_points.bin`
-- `map.pcd` only when the user explicitly saves a 3D project with `2D + PCD`
+- `grid.bin`
+- optional `map.pcd`
 
-2D sessions save only `manifest.json` and `map_points.bin`.
+`grid.bin` stores the occupancy grid as packed `int8` values:
 
-3D sessions now have two save payload choices:
+- `-1`: unknown
+- `0`: free / safe
+- `100`: occupied / obstacle
 
-- `2D only` (default): writes only `manifest.json` and `map_points.bin`
-- `2D + PCD`: writes `manifest.json`, `map_points.bin`, and `map.pcd`
+`manifest.json` stores the grid metadata plus POI, path, notes, pose, GPS, chassis, and scan summary.
 
-This keeps `.slam` as the editable project format while making `pcd` inclusion explicit instead of automatic.
+3D save behavior:
 
-## Export Formats
+- `2D only`: writes `manifest.json` and `grid.bin`
+- `2D + PCD`: also includes `map.pcd`
 
-- `Export ZIP` writes a deployment-oriented archive containing:
-  - `map.pgm`
-  - `map.yaml`
-  - `map.json`
-- `Export PCD` keeps the current behavior and only works when the current session or loaded `.slam` has `pcd` content available.
+## Load and Export
+
+### Load
+
+The desktop client can load:
+
+- `.slam`
+- `.zip`
+- `.yaml` / `.yml`
+- `.pgm`
+
+ZIP import behavior:
+
+- The ZIP must contain a YAML file and the referenced PGM.
+- The client looks for `map.yaml`, `map.yml`, or any `*.yaml` / `*.yml`.
+- `map.json` inside the ZIP is optional and is not required for import.
+
+### Export
+
+`Export ZIP` writes a deployment-oriented archive containing:
+
+- `map.pgm`
+- `map.yaml`
+- `map.json`
+
+`Export PCD` only works when the current session or loaded `.slam` has `pcd` content available.
+
+After `Export PCD` succeeds, the desktop client clears the cached PCD bytes from the current session instead of keeping them resident in memory.
+
+## Notes on Resolution
+
+- Path planning now uses the active map grid resolution.
+- `scan["voxel"]` still exists for scan-fusion and no-grid fallback behavior, but it is no longer the source of truth for path planning when an occupancy grid is active.
 
 ## Run
 

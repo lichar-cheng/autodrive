@@ -11,7 +11,7 @@ from typing import Any
 class NativeMapImport:
     file_name: str
     manifest: dict[str, Any]
-    radar_points: list[tuple[float, float, float]]
+    occupancy_grid: dict[str, Any]
 
 
 class NativeMapImportTool:
@@ -39,30 +39,31 @@ class NativeMapImportTool:
         occupied_thresh = float(metadata.get("occupied_thresh", 0.65))
         free_thresh = float(metadata.get("free_thresh", 0.196))
 
-        occupied_cells: list[dict[str, float | int]] = []
-        free_cells: list[dict[str, int]] = []
-        radar_points: list[tuple[float, float, float]] = []
-        origin_ix = float(origin[0]) / resolution
-        origin_iy = float(origin[1]) / resolution
+        grid_data = [-1] * (width * height)
         for row in range(height):
             for col in range(width):
                 value = int(pixels[row * width + col])
                 normalized = max(0.0, min(1.0, value / 255.0))
                 occupancy = normalized if negate else (1.0 - normalized)
-                ix = round(origin_ix + col)
-                iy = round(origin_iy + (height - 1 - row))
-                world_x = float(origin[0]) + col * resolution
-                world_y = float(origin[1]) + (height - 1 - row) * resolution
+                grid_index = (height - 1 - row) * width + col
                 if occupancy >= occupied_thresh:
-                    occupied_cells.append({"ix": ix, "iy": iy, "hits": 3, "intensity": 1.0})
-                    radar_points.append((round(world_x, 4), round(world_y, 4), 1.0))
+                    grid_data[grid_index] = 100
                 elif occupancy <= free_thresh:
-                    free_cells.append({"ix": ix, "iy": iy, "hits": 3})
+                    grid_data[grid_index] = 0
+
+        occupancy_grid = {
+            "width": width,
+            "height": height,
+            "resolution": resolution,
+            "origin": {"x": float(origin[0]), "y": float(origin[1])},
+            "data": grid_data,
+        }
 
         manifest = {
-            "version": "stcm.v2",
+            "version": "slam.v4",
             "source": "imported",
             "map_source": "native_pgm_yaml",
+            "map_storage": "occupancy_grid",
             "notes": json.dumps(
                 {
                     "text": f"Imported from native map {yaml_path.name}",
@@ -81,17 +82,20 @@ class NativeMapImportTool:
                 "turn_skip_wz": 0.45,
                 "skip_turn_frames": True,
             },
-            "browser_occupancy": {
-                "voxel_size": resolution,
-                "occupied_cells": occupied_cells,
-                "free_cells": free_cells,
+            "occupancy_grid": {
+                "width": width,
+                "height": height,
+                "resolution": resolution,
+                "origin": {"x": float(origin[0]), "y": float(origin[1])},
+                "encoding": "int8",
+                "values": {"unknown": -1, "free": 0, "occupied": 100},
             },
             "poi": [],
             "path": [],
             "gps_track": [],
             "chassis_track": [],
         }
-        return NativeMapImport(file_name=yaml_path.name, manifest=manifest, radar_points=radar_points)
+        return NativeMapImport(file_name=yaml_path.name, manifest=manifest, occupancy_grid=occupancy_grid)
 
     @staticmethod
     def _parse_yaml(path: Path) -> dict[str, Any]:

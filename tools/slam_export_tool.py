@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import json
-import struct
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,7 +11,7 @@ from typing import Any
 @dataclass
 class LoadedSlam:
     manifest: dict[str, Any]
-    radar_points: list[tuple[float, float, float]]
+    occupancy_grid: dict[str, Any]
 
 
 @dataclass
@@ -48,28 +47,23 @@ class SlamExportTool:
         occupied_thresh = float(metadata.get("occupied_thresh", 0.65))
         free_thresh = float(metadata.get("free_thresh", 0.196))
 
-        occupied_cells: list[dict[str, float | int]] = []
-        free_cells: list[dict[str, int]] = []
-        radar_points: list[tuple[float, float, float]] = []
+        grid_data = [-1] * (width * height)
         for row in range(height):
             for col in range(width):
                 value = int(pixels[row * width + col])
                 normalized = max(0.0, min(1.0, value / 255.0))
                 occupancy = normalized if negate else (1.0 - normalized)
-                iy = round((float(origin[1]) / resolution) + (height - 1 - row))
-                ix = round((float(origin[0]) / resolution) + col)
-                world_x = float(origin[0]) + col * resolution
-                world_y = float(origin[1]) + (height - 1 - row) * resolution
+                grid_index = (height - 1 - row) * width + col
                 if occupancy >= occupied_thresh:
-                    occupied_cells.append({"ix": ix, "iy": iy, "hits": 3, "intensity": 1.0})
-                    radar_points.append((round(world_x, 4), round(world_y, 4), 1.0))
+                    grid_data[grid_index] = 100
                 elif occupancy <= free_thresh:
-                    free_cells.append({"ix": ix, "iy": iy, "hits": 3})
+                    grid_data[grid_index] = 0
 
         manifest = {
-            "version": "stcm.v2",
+            "version": "slam.v4",
             "source": "imported",
             "map_source": "native_pgm_yaml",
+            "map_storage": "occupancy_grid",
             "notes": json.dumps(
                 {
                     "text": f"Imported from native map {yaml_path.name}",
@@ -88,44 +82,51 @@ class SlamExportTool:
                 "turn_skip_wz": 0.45,
                 "skip_turn_frames": True,
             },
-            "browser_occupancy": {
-                "voxel_size": resolution,
-                "occupied_cells": occupied_cells,
-                "free_cells": free_cells,
+            "occupancy_grid": {
+                "width": width,
+                "height": height,
+                "resolution": resolution,
+                "origin": {"x": float(origin[0]), "y": float(origin[1])},
+                "encoding": "int8",
+                "values": {"unknown": -1, "free": 0, "occupied": 100},
             },
             "poi": [],
             "path": [],
             "gps_track": [],
             "chassis_track": [],
         }
-        return LoadedSlam(manifest=manifest, radar_points=radar_points)
+        return LoadedSlam(
+            manifest=manifest,
+            occupancy_grid={
+                "width": width,
+                "height": height,
+                "resolution": resolution,
+                "origin": {"x": float(origin[0]), "y": float(origin[1])},
+                "data": grid_data,
+            },
+        )
 
     @staticmethod
     def load(path: str | Path) -> LoadedSlam:
         slam_path = Path(path)
         with zipfile.ZipFile(slam_path, "r") as zf:
             manifest = json.loads(zf.read("manifest.json"))
-            blob = zf.read("radar_points.bin")
-        radar_points = [
-            struct.unpack("fff", blob[index : index + 12])
-            for index in range(0, len(blob), 12)
-            if index + 12 <= len(blob)
-        ]
-        return LoadedSlam(manifest=manifest, radar_points=radar_points)
+            blob = zf.read("grid.bin")
+        occupancy_grid = dict(manifest.get("occupancy_grid") or {})
+        occupancy_grid["data"] = [value - 256 if value >= 128 else value for value in blob]
+        return LoadedSlam(manifest=manifest, occupancy_grid=occupancy_grid)
 
     @staticmethod
     def build_exports(
         source_file: str,
         manifest: dict[str, Any],
-        radar_points: list[tuple[float, float, float]] | list[list[float]],
+        occupancy_grid: dict[str, Any],
         resolution: float,
         padding_cells: int = 8,
     ) -> ExportArtifacts:
-        pgm = SlamExportTool._build_pgm(manifest, radar_points, resolution, padding_cells)
+        pgm = SlamExportTool._build_pgm(occupancy_grid, resolution, padding_cells)
         yaml_text = SlamExportTool._build_yaml(source_file, resolution, pgm["origin"])
         export_manifest = dict(manifest)
-        export_manifest.pop("browser_occupancy", None)
-        export_manifest.pop("trajectory", None)
         json_text = json.dumps(
             {
                 "source_file": source_file,
@@ -159,7 +160,7 @@ class SlamExportTool:
         artifacts = SlamExportTool.build_exports(
             slam_path.name,
             loaded.manifest,
-            loaded.radar_points,
+            loaded.occupancy_grid,
             resolution=resolution,
             padding_cells=padding_cells,
         )
@@ -172,72 +173,39 @@ class SlamExportTool:
 
     @staticmethod
     def _build_pgm(
-        manifest: dict[str, Any],
-        radar_points: list[tuple[float, float, float]] | list[list[float]],
+        occupancy_grid: dict[str, Any],
         resolution: float,
         padding_cells: int,
     ) -> dict[str, Any]:
-        browser = manifest.get("browser_occupancy") if isinstance(manifest.get("browser_occupancy"), dict) else {}
-        occupancy_voxel = max(0.02, float(browser.get("voxel_size", resolution)))
-        occupied_cells = browser.get("occupied_cells") if isinstance(browser.get("occupied_cells"), list) else None
-
-        occupied_set: set[tuple[int, int]] = set()
-        min_cell_x = float("inf")
-        max_cell_x = float("-inf")
-        min_cell_y = float("inf")
-        max_cell_y = float("-inf")
-
-        if occupied_cells:
-            for cell in occupied_cells:
-                ix = round(float(cell.get("ix", 0)))
-                iy = round(float(cell.get("iy", 0)))
-                occupied_set.add((ix, iy))
-                min_cell_x = min(min_cell_x, ix)
-                max_cell_x = max(max_cell_x, ix)
-                min_cell_y = min(min_cell_y, iy)
-                max_cell_y = max(max_cell_y, iy)
-        else:
-            if not radar_points:
-                raise ValueError("No radar points in SLAM")
-            for point in radar_points:
-                ix = round(float(point[0]) / resolution)
-                iy = round(float(point[1]) / resolution)
-                occupied_set.add((ix, iy))
-                min_cell_x = min(min_cell_x, ix)
-                max_cell_x = max(max_cell_x, ix)
-                min_cell_y = min(min_cell_y, iy)
-                max_cell_y = max(max_cell_y, iy)
-
-        padded_min_x = int(min_cell_x) - padding_cells
-        padded_min_y = int(min_cell_y) - padding_cells
-        padded_max_x = int(max_cell_x) + padding_cells
-        padded_max_y = int(max_cell_y) + padding_cells
-        width = max(1, padded_max_x - padded_min_x + 1)
-        height = max(1, padded_max_y - padded_min_y + 1)
-        grid = [205] * (width * height)
-
-        for ix, iy in occupied_set:
-            x = ix - padded_min_x
-            y = iy - padded_min_y
-            flipped_y = height - 1 - y
-            grid[flipped_y * width + x] = 0
-
+        del padding_cells
+        resolution = max(0.02, float(occupancy_grid.get("resolution", resolution)))
+        width = int(occupancy_grid.get("width", 0) or 0)
+        height = int(occupancy_grid.get("height", 0) or 0)
+        data = [int(value) for value in occupancy_grid.get("data", [])]
+        if width <= 0 or height <= 0 or len(data) != width * height:
+            raise ValueError("No occupancy grid in SLAM")
         rows = []
         for row in range(height):
-            start = row * width
-            rows.append(" ".join(str(grid[start + col]) for col in range(width)))
-
+            source_row = height - 1 - row
+            start = source_row * width
+            values = []
+            for col in range(width):
+                value = data[start + col]
+                values.append("0" if value >= 50 else "254" if value == 0 else "205")
+            rows.append(" ".join(values))
+        origin_meta = occupancy_grid.get("origin") if isinstance(occupancy_grid.get("origin"), dict) else {}
+        occupied_cells = sum(1 for value in data if int(value) >= 50)
         return {
             "pgm": f"P2\n# Generated from SLAM occupancy\n{width} {height}\n255\n" + "\n".join(rows) + "\n",
-            "origin": [round(padded_min_x * occupancy_voxel, 3), round(padded_min_y * occupancy_voxel, 3), 0],
+            "origin": [round(float(origin_meta.get("x", 0.0)), 3), round(float(origin_meta.get("y", 0.0)), 3), 0],
             "width": width,
             "height": height,
-            "occupied_cells": len(occupied_set),
+            "occupied_cells": occupied_cells,
             "bounds": {
-                "minX": round(min_cell_x * occupancy_voxel, 3),
-                "maxX": round(max_cell_x * occupancy_voxel, 3),
-                "minY": round(min_cell_y * occupancy_voxel, 3),
-                "maxY": round(max_cell_y * occupancy_voxel, 3),
+                "minX": round(float(origin_meta.get("x", 0.0)), 3),
+                "maxX": round(float(origin_meta.get("x", 0.0)) + width * resolution, 3),
+                "minY": round(float(origin_meta.get("y", 0.0)), 3),
+                "maxY": round(float(origin_meta.get("y", 0.0)) + height * resolution, 3),
             },
         }
 

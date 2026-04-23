@@ -174,6 +174,7 @@ def test_start_scan_waits_for_mapping_prereq_after_dependencies(monkeypatch) -> 
     monkeypatch.setattr(main, "_mapping_prereq_summary", lambda: prereq_checks.pop(0))
     monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
     main._reset_scan_session()
+    main.SCAN_SESSION["mode"] = "2d"
 
     result = asyncio.run(main.start_scan(StartScanRequest(mode="2d")))
 
@@ -966,7 +967,7 @@ def test_health_includes_mapping_prereq_summary(monkeypatch) -> None:
     assert result["mapping_blockers"] == []
     assert "ws stream unstable" in result["mapping_warnings"]
     assert "no websocket clients connected" in result["mapping_warnings"]
-    assert result["scan_mode"] == "2d"
+    assert result["scan_mode"] == "3d"
     assert result["dependency_status"]["required_nodes"] == []
     assert result["pcd_transfer_state"] == "idle"
 
@@ -1026,6 +1027,7 @@ def test_save_map_writes_new_slam_layout_without_pcd(tmp_path: Path, monkeypatch
         ),
     )
     main._reset_scan_session()
+    main.SCAN_SESSION["mode"] = "2d"
 
     result = asyncio.run(main.save_map(SaveMapRequest(name="demo", notes="demo", voxel_size=0.1, reset_after_save=False)))
 
@@ -1033,7 +1035,7 @@ def test_save_map_writes_new_slam_layout_without_pcd(tmp_path: Path, monkeypatch
     assert result["contains"]["pcd"] is False
     target = Path(result["file"])
     with zipfile.ZipFile(target, "r") as zf:
-        assert set(zf.namelist()) == {"manifest.json", "map_points.bin"}
+        assert set(zf.namelist()) == {"manifest.json", "grid.bin"}
 
 
 def test_save_map_writes_optional_pcd_into_slam(tmp_path: Path, monkeypatch) -> None:
@@ -1067,7 +1069,7 @@ def test_save_map_writes_optional_pcd_into_slam(tmp_path: Path, monkeypatch) -> 
     assert result["contains"]["pcd"] is True
     target = Path(result["file"])
     with zipfile.ZipFile(target, "r") as zf:
-        assert set(zf.namelist()) == {"manifest.json", "map_points.bin", "map.pcd"}
+        assert set(zf.namelist()) == {"manifest.json", "grid.bin", "map.pcd"}
         assert zf.read("map.pcd") == b"pcd-bytes"
 
 

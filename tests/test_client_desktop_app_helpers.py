@@ -25,11 +25,12 @@ from client_desktop.app import (
     read_slam_archive,
     safe_focus_widget,
     safe_mode_translation_key,
-    strip_legacy_trajectory,
     should_clear_focus_on_click,
     write_slam_archive,
     zoom_scale_factor,
 )
+from client_desktop.logic import Point
+from client_desktop.native_map_import import NativeMapImportTool
 
 
 class DummyVar:
@@ -330,14 +331,6 @@ def test_reset_view_defaults_to_80px_without_map_bounds() -> None:
     assert client.view["scale"] == 80.0
 
 
-def test_strip_legacy_trajectory_removes_exported_trajectory() -> None:
-    manifest = {"poi": [], "path": [], "trajectory": [{"id": "old"}]}
-    cleaned = strip_legacy_trajectory(manifest)
-
-    assert "trajectory" not in cleaned
-    assert "trajectory" in manifest
-
-
 def test_start_scan_sends_selected_mode_and_updates_phase() -> None:
     client = build_minimal_client()
     calls = []
@@ -517,15 +510,19 @@ def test_health_ready_retries_mapping_prereq_pending_scan() -> None:
     assert client.scan["pending_start"] is False
 
 
-def test_write_slam_archive_omits_pcd_for_2d(tmp_path: Path) -> None:
+def test_write_slam_archive_writes_grid_bin_for_2d(tmp_path: Path) -> None:
     target = tmp_path / "demo.slam"
+    grid = {"width": 2, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}, "data": [0, 100]}
 
-    write_slam_archive(target, {"version": "slam.v3", "scan_mode": "2d"}, [(1.0, 2.0, 3.0)], None)
+    write_slam_archive(target, {"version": "slam.v4", "scan_mode": "2d"}, grid, None)
 
-    manifest, points, pcd_file = read_slam_archive(target)
+    manifest, loaded_grid, pcd_file = read_slam_archive(target)
 
+    with zipfile.ZipFile(target, "r") as zf:
+        assert set(zf.namelist()) == {"manifest.json", "grid.bin"}
     assert manifest["scan_mode"] == "2d"
-    assert points == [(1.0, 2.0, 3.0)]
+    assert manifest["map_storage"] == "occupancy_grid"
+    assert loaded_grid["data"] == [0, 100]
     assert pcd_file is None
 
 
@@ -534,15 +531,15 @@ def test_write_slam_archive_round_trips_optional_pcd(tmp_path: Path) -> None:
 
     write_slam_archive(
         target,
-        {"version": "slam.v3", "scan_mode": "3d"},
-        [(1.0, 2.0, 3.0)],
+        {"version": "slam.v4", "scan_mode": "3d"},
+        {"width": 1, "height": 2, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}, "data": [-1, 100]},
         {"name": "map.pcd", "content": b"pcd-bytes"},
     )
 
-    manifest, points, pcd_file = read_slam_archive(target)
+    manifest, grid, pcd_file = read_slam_archive(target)
 
     assert manifest["scan_mode"] == "3d"
-    assert points == [(1.0, 2.0, 3.0)]
+    assert grid["data"] == [-1, 100]
     assert pcd_file == {"name": "map.pcd", "content": b"pcd-bytes"}
 
 
@@ -606,8 +603,6 @@ def test_save_stcm_uses_selected_scan_mode_but_defaults_3d_save_to_2d_only(tmp_p
     client.apply_scan_fusion_config_from_ui = lambda: {"voxel_size": 0.1, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
     client.active_voxel_size = lambda: 0.1
     client.should_use_server_grid = lambda: False
-    client.browser_occupancy = lambda: {"occupied_cells": [], "free_cells": [], "map_fence_xy": [], "voxel_size": 0.1, "scan_fusion": {}}
-    client.occupied_points = lambda: [[1.0, 2.0, 1.0]]
     client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
     client.scan["mode"] = "2d"
     client.scan_mode_var = DummyVar("3d")
@@ -646,8 +641,6 @@ def test_save_stcm_downloads_pcd_when_actual_scan_mode_is_3d(tmp_path: Path, mon
     client.apply_scan_fusion_config_from_ui = lambda: {"voxel_size": 0.1, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
     client.active_voxel_size = lambda: 0.1
     client.should_use_server_grid = lambda: False
-    client.browser_occupancy = lambda: {"occupied_cells": [], "free_cells": [], "map_fence_xy": [], "voxel_size": 0.1, "scan_fusion": {}}
-    client.occupied_points = lambda: [[1.0, 2.0, 1.0]]
     client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
     client.scan["mode"] = "3d"
     client.scan_mode_var = DummyVar("2d")
@@ -687,8 +680,6 @@ def test_save_stcm_logs_mode_snapshot_before_writing_archive(tmp_path: Path, mon
     client.apply_scan_fusion_config_from_ui = lambda: {"voxel_size": 0.1, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
     client.active_voxel_size = lambda: 0.1
     client.should_use_server_grid = lambda: False
-    client.browser_occupancy = lambda: {"occupied_cells": [], "free_cells": [], "map_fence_xy": [], "voxel_size": 0.1, "scan_fusion": {}}
-    client.occupied_points = lambda: [[1.0, 2.0, 1.0]]
     client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
     client.scan["mode"] = "2d"
     client.scan_mode_var = DummyVar("3d")
@@ -697,7 +688,7 @@ def test_save_stcm_logs_mode_snapshot_before_writing_archive(tmp_path: Path, mon
 
     matching = [entry for entry in logs if entry[1].startswith("save_stcm requested")]
     assert matching
-    assert matching[0][2] == ("2d", "3d", "2d_only", False, 0, 1)
+    assert matching[0][2] == ("2d", "3d", "2d_only", False, 0, 0)
 
 
 def test_choose_3d_save_payload_defaults_to_2d_only(monkeypatch) -> None:
@@ -729,8 +720,6 @@ def test_save_stcm_3d_default_uses_2d_only_without_requesting_pcd(tmp_path: Path
     client.apply_scan_fusion_config_from_ui = lambda: {"voxel_size": 0.1, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
     client.active_voxel_size = lambda: 0.1
     client.should_use_server_grid = lambda: False
-    client.browser_occupancy = lambda: {"occupied_cells": [], "free_cells": [], "map_fence_xy": [], "voxel_size": 0.1, "scan_fusion": {}}
-    client.occupied_points = lambda: [[1.0, 2.0, 1.0]]
     client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
     client.scan["mode"] = "2d"
     client.scan_mode_var = DummyVar("3d")
@@ -765,8 +754,6 @@ def test_save_stcm_3d_with_pcd_requests_and_writes_pcd(tmp_path: Path, monkeypat
     client.apply_scan_fusion_config_from_ui = lambda: {"voxel_size": 0.1, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
     client.active_voxel_size = lambda: 0.1
     client.should_use_server_grid = lambda: False
-    client.browser_occupancy = lambda: {"occupied_cells": [], "free_cells": [], "map_fence_xy": [], "voxel_size": 0.1, "scan_fusion": {}}
-    client.occupied_points = lambda: [[1.0, 2.0, 1.0]]
     client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
     client.scan["mode"] = "2d"
     client.scan_mode_var = DummyVar("3d")
@@ -801,8 +788,6 @@ def test_save_stcm_3d_with_pcd_aborts_when_pcd_missing(tmp_path: Path, monkeypat
     client.apply_scan_fusion_config_from_ui = lambda: {"voxel_size": 0.1, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
     client.active_voxel_size = lambda: 0.1
     client.should_use_server_grid = lambda: False
-    client.browser_occupancy = lambda: {"occupied_cells": [], "free_cells": [], "map_fence_xy": [], "voxel_size": 0.1, "scan_fusion": {}}
-    client.occupied_points = lambda: [[1.0, 2.0, 1.0]]
     client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
     client.scan["mode"] = "2d"
     client.scan_mode_var = DummyVar("3d")
@@ -833,8 +818,6 @@ def test_save_stcm_3d_cancelled_payload_choice_aborts(tmp_path: Path, monkeypatc
     client.apply_scan_fusion_config_from_ui = lambda: {"voxel_size": 0.1, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
     client.active_voxel_size = lambda: 0.1
     client.should_use_server_grid = lambda: False
-    client.browser_occupancy = lambda: {"occupied_cells": [], "free_cells": [], "map_fence_xy": [], "voxel_size": 0.1, "scan_fusion": {}}
-    client.occupied_points = lambda: [[1.0, 2.0, 1.0]]
     client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
     client.scan["mode"] = "2d"
     client.scan_mode_var = DummyVar("3d")
@@ -925,23 +908,70 @@ def test_export_zip_writes_pgm_name_referenced_by_yaml(tmp_path: Path, monkeypat
     assert loaded[0][1]["map_source"] == "native_pgm_yaml"
 
 
-def test_set_inspector_bundle_state_strips_engineering_occupancy_from_export_json() -> None:
+def test_set_inspector_bundle_state_keeps_grid_export_metadata() -> None:
     client = build_minimal_client()
-    client.build_pgm_export = lambda manifest, points, resolution: {"pgm": "P2\n1 1\n255\n0\n", "origin": [0.0, 0.0, 0.0]}
+    client.build_pgm_export = lambda manifest, grid, resolution: {"pgm": "P2\n1 1\n255\n0\n", "origin": [0.0, 0.0, 0.0]}
     client.build_yaml_export = lambda file_name, resolution, origin: "image: map.pgm\n"
     manifest = {
         "scan_mode": "2d",
-        "occupancy": {"occupied_cells": [{"ix": 1, "iy": 2}], "free_cells": [{"ix": 3, "iy": 4}]},
-        "browser_occupancy": {"occupied_cells": [{"ix": 5, "iy": 6}], "free_cells": [{"ix": 7, "iy": 8}]},
+        "occupancy_grid": {"width": 1, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}},
         "poi": [],
         "path": [],
     }
 
-    DesktopClient.set_inspector_bundle_state(client, "demo.slam", manifest, [])
+    DesktopClient.set_inspector_bundle_state(client, "demo.slam", manifest, {"width": 1, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}, "data": [100]})
 
     export_json = json.loads(client.inspector["json"])
-    assert "browser_occupancy" not in export_json
-    assert "occupancy" not in export_json
+    assert export_json["occupancy_grid"]["width"] == 1
+
+
+def test_set_inspector_bundle_state_defers_large_pgm_generation() -> None:
+    client = build_minimal_client()
+    client.build_pgm_export = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("pgm should be lazy"))
+    manifest = {
+        "scan_mode": "2d",
+        "occupancy_grid": {"width": 2, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}},
+        "poi": [],
+        "path": [],
+    }
+
+    DesktopClient.set_inspector_bundle_state(
+        client,
+        "demo.slam",
+        manifest,
+        {"width": 2, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}, "data": [0, 100]},
+    )
+
+    assert client.inspector["pgm"] == ""
+    assert client.inspector["yaml"] == ""
+    assert client.inspector["grid"]["data"] == [0, 100]
+
+
+def test_draw_occupancy_grid_image_uses_cached_revision_without_hash(monkeypatch) -> None:
+    class Canvas:
+        def __init__(self) -> None:
+            self.images = []
+
+        def winfo_width(self) -> int:
+            return 100
+
+        def winfo_height(self) -> int:
+            return 100
+
+        def create_image(self, x, y, image=None, anchor=None):
+            self.images.append((x, y, image, anchor))
+
+    client = build_minimal_client()
+    client.canvas = Canvas()
+    client.view = {"pan_x": 0.0, "pan_y": 0.0, "scale": 10.0}
+    client.map_photo = object()
+    client.map_photo_key = (7, 0, 2, 0, 2, 2, 2)
+    grid = {"active": True, "width": 2, "height": 2, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}, "data": [0, 100, -1, 0], "_revision": 7}
+    monkeypatch.setattr("client_desktop.app.grid_to_bytes", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("grid should not be hashed during draw")))
+
+    DesktopClient.draw_occupancy_grid_image(client, grid)
+
+    assert client.canvas.images
 
 
 def test_load_stcm_imports_export_zip_via_native_map_import(tmp_path: Path, monkeypatch) -> None:
@@ -957,7 +987,11 @@ def test_load_stcm_imports_export_zip_via_native_map_import(tmp_path: Path, monk
     imported = []
     monkeypatch.setattr(
         "client_desktop.app.NativeMapImportTool.import_map",
-        lambda path: imported.append(Path(path)) or types.SimpleNamespace(file_name="map.yaml", manifest={"scan_mode": "2d", "poi": [], "path": [], "browser_occupancy": {"occupied_cells": [], "free_cells": [], "voxel_size": 0.1}}, radar_points=[]),
+        lambda path: imported.append(Path(path)) or types.SimpleNamespace(
+            file_name="map.yaml",
+            manifest={"scan_mode": "2d", "poi": [], "path": [], "occupancy_grid": {"width": 1, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}}},
+            occupancy_grid={"width": 1, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}, "data": [100]},
+        ),
     )
 
     client = build_minimal_client()
@@ -970,6 +1004,39 @@ def test_load_stcm_imports_export_zip_via_native_map_import(tmp_path: Path, monk
     assert imported
     assert imported[0].suffix == ".yaml"
     assert imported[0].name == "map.yaml"
+
+
+def test_native_map_import_reads_pgm_directly_into_occupancy_grid(tmp_path: Path) -> None:
+    yaml_path = tmp_path / "native.yaml"
+    pgm_path = tmp_path / "native.pgm"
+    pgm_path.write_text("P2\n3 2\n255\n0 205 254\n254 0 205\n", encoding="utf-8")
+    yaml_path.write_text(
+        "\n".join(
+            [
+                "image: native.pgm",
+                "mode: trinary",
+                "resolution: 0.5",
+                "origin: [1.0, 2.0, 0.0]",
+                "negate: 0",
+                "occupied_thresh: 0.65",
+                "free_thresh: 0.196",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = NativeMapImportTool.import_map(yaml_path)
+
+    assert loaded.manifest["map_storage"] == "occupancy_grid"
+    assert loaded.manifest["occupancy_grid"]["width"] == 3
+    assert loaded.occupancy_grid == {
+        "width": 3,
+        "height": 2,
+        "resolution": 0.5,
+        "origin": {"x": 1.0, "y": 2.0},
+        "data": [0, 100, -1, 100, -1, 0],
+    }
+    assert "browser_occupancy" not in loaded.manifest
 
 
 def test_export_pcd_writes_current_pcd_bytes(tmp_path: Path, monkeypatch) -> None:
@@ -987,6 +1054,9 @@ def test_export_pcd_writes_current_pcd_bytes(tmp_path: Path, monkeypatch) -> Non
     DesktopClient.export_inspector_file(client, "pcd")
 
     assert exported.read_bytes() == b"pcd-bytes"
+    assert client.scan["pcd_name"] == ""
+    assert client.scan["pcd_bytes"] == b""
+    assert client.scan["pcd_received_at"] == 0
     assert infos
 
 
@@ -1000,11 +1070,17 @@ def test_export_pcd_downloads_when_local_copy_missing(tmp_path: Path, monkeypatc
     client.inspector = {"file": "demo.slam", "manifest": None, "points": [], "pgm": "", "yaml": "", "json": "", "meta": {}, "pcd_file": None}
     client.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
     client.scan["mode"] = "3d"
+    client.scan["pcd_name"] = "cached.pcd"
+    client.scan["pcd_bytes"] = b"stale"
+    client.scan["pcd_received_at"] = 123
     client.ensure_scan_pcd = lambda mode=None: {"name": "map.pcd", "content": b"pcd-bytes"}
 
     DesktopClient.export_inspector_file(client, "pcd")
 
     assert exported.read_bytes() == b"pcd-bytes"
+    assert client.scan["pcd_name"] == ""
+    assert client.scan["pcd_bytes"] == b""
+    assert client.scan["pcd_received_at"] == 0
     assert infos
 
 
@@ -1066,6 +1142,32 @@ def test_move_click_uses_async_api_for_stop() -> None:
     DesktopClient.move_click(client, "stop")
 
     assert calls == [("async", "/control/stop", {})]
+
+
+def test_build_segment_uses_active_grid_resolution_for_path_planning(monkeypatch) -> None:
+    client = build_minimal_client()
+    client.path_clearance_var = DummyVar("0.05")
+    client.number = DesktopClient.number.__get__(client, DesktopClient)
+    client.point_to_payload = DesktopClient.point_to_payload.__get__(client, DesktopClient)
+    client.active_voxel_size = lambda: 0.5
+    client.occupied_lookup = lambda: {}
+    client.segment_seed = 1
+    captured = {}
+
+    def fake_plan_path_points(start, end, voxel_size, occupied_cells, clearance):
+        captured["voxel_size"] = voxel_size
+        captured["occupied_cells"] = occupied_cells
+        captured["clearance"] = clearance
+        return [start, end]
+
+    monkeypatch.setattr("client_desktop.app.plan_path_points", fake_plan_path_points)
+
+    seg = DesktopClient.build_segment(client, Point(x=0.0, y=0.0), Point(x=1.0, y=1.0), "auto")
+
+    assert captured["voxel_size"] == 0.5
+    assert captured["occupied_cells"] == {}
+    assert captured["clearance"] == 0.05
+    assert seg["id"] == "seg-1"
 
 
 def test_send_control_command_now_uses_fast_timeout_without_retries() -> None:
@@ -1404,194 +1506,6 @@ def test_on_key_release_updates_control_target_for_remaining_keys() -> None:
     assert ensured == ["loop"]
 
 
-def test_browser_occupancy_includes_scan_fusion_metadata() -> None:
-    class Var:
-        def __init__(self, value) -> None:
-            self.value = value
-
-        def get(self):
-            return self.value
-
-        def set(self, value) -> None:
-            self.value = value
-
-    client = DesktopClient.__new__(DesktopClient)
-    client.scan = {"voxel": 0.06, "occupied": {"1:2": {"ix": 1, "iy": 2, "hits": 1, "intensity": 0.8}}, "free": {}}
-    client.scan_fusion = {"preset": "indoor_sensitive", "voxel_size": 0.06, "occupied_min_hits": 1, "occupied_over_free_ratio": 0.55, "turn_skip_wz": 0.6, "skip_turn_frames": False}
-    client.scan_fusion_preset_var = Var("indoor_sensitive")
-    client.voxel_var = Var("0.06")
-    client.occupied_min_hits_var = Var("1")
-    client.occupied_over_free_ratio_var = Var("0.55")
-    client.turn_skip_wz_var = Var("0.60")
-    client.skip_turn_frames_var = Var(False)
-    client.number = DesktopClient.number.__get__(client, DesktopClient)
-    client.effective_scan_fusion_config = DesktopClient.effective_scan_fusion_config.__get__(client, DesktopClient)
-
-    payload = DesktopClient.browser_occupancy(client)
-
-    assert "preset" not in payload["scan_fusion"]
-    assert payload["scan_fusion"]["occupied_min_hits"] == 1
-    assert payload["occupied_cells"] == [{"ix": 1, "iy": 2, "hits": 1, "intensity": 0.8}]
-
-
-def test_browser_occupancy_filters_out_non_occupied_cells() -> None:
-    class Var:
-        def __init__(self, value) -> None:
-            self.value = value
-
-        def get(self):
-            return self.value
-
-        def set(self, value) -> None:
-            self.value = value
-
-    client = DesktopClient.__new__(DesktopClient)
-    client.scan = {
-        "voxel": 0.2,
-        "occupied": {
-            "1:1": {"ix": 1, "iy": 1, "hits": 1, "intensity": 0.4},
-            "2:2": {"ix": 2, "iy": 2, "hits": 4, "intensity": 0.9},
-        },
-        "free": {"1:1": {"ix": 1, "iy": 1, "hits": 3}},
-    }
-    client.scan_fusion = {"preset": "indoor_balanced", "voxel_size": 0.2, "occupied_min_hits": 3, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
-    client.scan_fusion_preset_var = Var("indoor_balanced")
-    client.voxel_var = Var("0.20")
-    client.occupied_min_hits_var = Var("3")
-    client.occupied_over_free_ratio_var = Var("0.75")
-    client.turn_skip_wz_var = Var("0.45")
-    client.skip_turn_frames_var = Var(True)
-    client.number = DesktopClient.number.__get__(client, DesktopClient)
-    client.effective_scan_fusion_config = DesktopClient.effective_scan_fusion_config.__get__(client, DesktopClient)
-    client.filtered_occupancy_cells = DesktopClient.filtered_occupancy_cells.__get__(client, DesktopClient)
-
-    payload = DesktopClient.browser_occupancy(client)
-
-    assert payload["occupied_cells"] == [{"ix": 2, "iy": 2, "hits": 4, "intensity": 0.9}]
-
-
-def test_browser_occupancy_filters_out_hidden_free_cells() -> None:
-    class Var:
-        def __init__(self, value) -> None:
-            self.value = value
-
-        def get(self):
-            return self.value
-
-        def set(self, value) -> None:
-            self.value = value
-
-    client = DesktopClient.__new__(DesktopClient)
-    client.scan = {
-        "voxel": 0.2,
-        "occupied": {
-            "1:1": {"ix": 1, "iy": 1, "hits": 5, "intensity": 0.9},
-        },
-        "free": {
-            "1:1": {"ix": 1, "iy": 1, "hits": 3},
-            "2:2": {"ix": 2, "iy": 2, "hits": 4},
-        },
-    }
-    client.scan_fusion = {"preset": "indoor_balanced", "voxel_size": 0.2, "occupied_min_hits": 3, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
-    client.scan_fusion_preset_var = Var("indoor_balanced")
-    client.voxel_var = Var("0.20")
-    client.occupied_min_hits_var = Var("3")
-    client.occupied_over_free_ratio_var = Var("0.75")
-    client.turn_skip_wz_var = Var("0.45")
-    client.skip_turn_frames_var = Var(True)
-    client.number = DesktopClient.number.__get__(client, DesktopClient)
-    client.effective_scan_fusion_config = DesktopClient.effective_scan_fusion_config.__get__(client, DesktopClient)
-
-    payload = DesktopClient.browser_occupancy(client)
-
-    assert payload["free_cells"] == [{"ix": 2, "iy": 2, "hits": 4}]
-
-
-def test_server_grid_browser_occupancy_overrides_local_scan_when_not_editing_loaded_map() -> None:
-    class Var:
-        def __init__(self, value) -> None:
-            self.value = value
-
-        def get(self):
-            return self.value
-
-    client = DesktopClient.__new__(DesktopClient)
-    client.scan = {
-        "voxel": 0.2,
-        "occupied": {"9:9": {"ix": 9, "iy": 9, "hits": 5, "intensity": 0.9}},
-        "free": {},
-    }
-    client.server_grid = {
-        "active": True,
-        "resolution": 0.5,
-        "occupied_cells": [{"ix": 1, "iy": 2, "hits": 3, "intensity": 1.0}],
-        "free_cells": [{"ix": 3, "iy": 4, "hits": 2}],
-    }
-    client.edit = {"loaded_from_stcm": False}
-    client.scan_fusion = {"preset": "indoor_balanced", "voxel_size": 0.2, "occupied_min_hits": 3, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
-    client.scan_fusion_preset_var = Var("indoor_balanced")
-    client.voxel_var = Var("0.20")
-    client.occupied_min_hits_var = Var("3")
-    client.occupied_over_free_ratio_var = Var("0.75")
-    client.turn_skip_wz_var = Var("0.45")
-    client.skip_turn_frames_var = Var(True)
-    client.number = DesktopClient.number.__get__(client, DesktopClient)
-    client.effective_scan_fusion_config = DesktopClient.effective_scan_fusion_config.__get__(client, DesktopClient)
-
-    payload = DesktopClient.browser_occupancy(client)
-
-    assert payload["voxel_size"] == 0.5
-    assert payload["occupied_cells"] == [{"ix": 1, "iy": 2, "hits": 3, "intensity": 1.0}]
-    assert payload["free_cells"] == [{"ix": 3, "iy": 4, "hits": 2}]
-
-
-def test_browser_occupancy_includes_closed_map_fence_from_server_grid() -> None:
-    client = build_minimal_client()
-    client.server_grid = {
-        "active": True,
-        "resolution": 0.5,
-        "occupied_cells": [{"ix": 1, "iy": 2, "hits": 3, "intensity": 1.0}],
-        "free_cells": [],
-        "origin": {"x": -1.0, "y": 2.0},
-        "width": 4,
-        "height": 3,
-    }
-    client.edit = {"loaded_from_stcm": False}
-    client.active_map_fence_xy = DesktopClient.active_map_fence_xy.__get__(client, DesktopClient)
-    client.effective_scan_fusion_config = lambda: {}
-
-    payload = DesktopClient.browser_occupancy(client)
-
-    assert payload["map_fence_xy"] == [
-        {"x": -1.0, "y": 2.0},
-        {"x": 1.0, "y": 2.0},
-        {"x": 1.0, "y": 3.5},
-        {"x": -1.0, "y": 3.5},
-        {"x": -1.0, "y": 2.0},
-    ]
-
-
-def test_browser_occupancy_includes_closed_map_fence_from_active_cells() -> None:
-    client = build_minimal_client()
-    client.scan["voxel"] = 0.5
-    client.active_occupancy_cells = lambda: [{"ix": 2, "iy": 1, "hits": 3, "intensity": 1.0}]
-    client.active_free_cells = lambda: [{"ix": 4, "iy": 3, "hits": 1}]
-    client.active_voxel_size = lambda: 0.5
-    client.should_use_server_grid = lambda: False
-    client.active_map_fence_xy = DesktopClient.active_map_fence_xy.__get__(client, DesktopClient)
-    client.effective_scan_fusion_config = lambda: {}
-
-    payload = DesktopClient.browser_occupancy(client)
-
-    assert payload["map_fence_xy"] == [
-        {"x": 1.0, "y": 0.5},
-        {"x": 2.5, "y": 0.5},
-        {"x": 2.5, "y": 2.0},
-        {"x": 1.0, "y": 2.0},
-        {"x": 1.0, "y": 0.5},
-    ]
-
-
 def test_consume_messages_stores_server_grid_payload() -> None:
     import queue
 
@@ -1643,11 +1557,8 @@ def test_consume_messages_stores_server_grid_payload() -> None:
     assert client.server_grid["active"] is True
     assert client.server_grid["resolution"] == 0.4
     assert client.server_grid["data"] == [-1, 0, 100, 50, -1, 0]
-    assert client.server_grid["occupied_cells"] == [
-        {"ix": 2, "iy": 0, "hits": 3, "intensity": 1.0},
-        {"ix": 0, "iy": 1, "hits": 3, "intensity": 1.0},
-    ]
-    assert client.server_grid["free_cells"] == [{"ix": 1, "iy": 0, "hits": 3}, {"ix": 2, "iy": 1, "hits": 3}]
+    assert client.server_grid["occupied_cells"] == []
+    assert client.server_grid["free_cells"] == []
 
 
 def test_consume_messages_does_not_queue_lidar_for_map_accumulation() -> None:

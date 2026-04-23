@@ -6,18 +6,18 @@ import java.util.Map;
 
 public final class LoadedSlam {
     private final Map<String, Object> manifest;
-    private final List<SlamPoint> radarPoints;
+    private final Map<String, Object> occupancyGrid;
 
-    public LoadedSlam(Map<String, Object> manifest, List<SlamPoint> radarPoints) {
+    public LoadedSlam(Map<String, Object> manifest, Map<String, Object> occupancyGrid) {
         this.manifest = new LinkedHashMap<String, Object>(manifest);
-        this.radarPoints = List.copyOf(radarPoints);
+        this.occupancyGrid = new LinkedHashMap<String, Object>(occupancyGrid);
     }
 
     public Map<String, Object> getManifest() {
         return manifest;
     }
 
-    public List<SlamPoint> getRadarPoints() {
-        return radarPoints;
+    public Map<String, Object> getOccupancyGrid() {
+        return occupancyGrid;
     }
 }

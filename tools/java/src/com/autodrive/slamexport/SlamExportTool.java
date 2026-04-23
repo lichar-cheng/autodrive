@@ -2,8 +2,6 @@ package com.autodrive.slamexport;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -15,13 +13,8 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
-
-import javax.script.ScriptEngine;
-import javax.script.ScriptEngineManager;
-import javax.script.ScriptException;
 
 public final class SlamExportTool {
     private static final DecimalFormat THREE_DECIMAL = new DecimalFormat("0.000", DecimalFormatSymbols.getInstance(Locale.US));
@@ -31,60 +24,47 @@ public final class SlamExportTool {
 
     public static LoadedSlam load(Path path) throws IOException {
         byte[] manifestBytes = null;
-        byte[] radarBytes = null;
+        byte[] gridBytes = null;
         try (ZipInputStream zis = new ZipInputStream(Files.newInputStream(path))) {
             ZipEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
                 if ("manifest.json".equals(entry.getName())) {
                     manifestBytes = readAllBytes(zis);
-                } else if ("radar_points.bin".equals(entry.getName())) {
-                    radarBytes = readAllBytes(zis);
+                } else if ("grid.bin".equals(entry.getName())) {
+                    gridBytes = readAllBytes(zis);
                 }
             }
         }
-        if (manifestBytes == null || radarBytes == null) {
-            throw new IOException(".slam archive must contain manifest.json and radar_points.bin");
+        if (manifestBytes == null || gridBytes == null) {
+            throw new IOException(".slam archive must contain manifest.json and grid.bin");
         }
-        return new LoadedSlam(parseManifest(new String(manifestBytes, StandardCharsets.UTF_8)), parseRadarPoints(radarBytes));
+        Map<String, Object> manifest = parseManifest(new String(manifestBytes, StandardCharsets.UTF_8));
+        Map<String, Object> occupancyGrid = buildOccupancyGrid(manifest, gridBytes);
+        return new LoadedSlam(manifest, occupancyGrid);
     }
 
     @SuppressWarnings("unchecked")
     public static Map<String, Object> parseManifest(String jsonText) throws IOException {
-        ScriptEngine engine = new ScriptEngineManager().getEngineByName("javascript");
-        if (engine == null) {
-            throw new IOException("JavaScript engine unavailable for JSON parsing");
-        }
         try {
-            Object parsed = engine.eval("Java.asJSONCompatible(" + jsonText + ")");
+            Object parsed = new JsonParser(jsonText).parse();
             if (!(parsed instanceof Map)) {
                 throw new IOException("manifest.json must decode to an object");
             }
             return (Map<String, Object>) deepCopy(parsed);
-        } catch (ScriptException exc) {
+        } catch (RuntimeException exc) {
             throw new IOException("Failed to parse manifest.json", exc);
         }
     }
 
-    public static List<SlamPoint> parseRadarPoints(byte[] data) {
-        List<SlamPoint> points = new ArrayList<SlamPoint>();
-        ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
-        while (buffer.remaining() >= 12) {
-            points.add(new SlamPoint(buffer.getFloat(), buffer.getFloat(), buffer.getFloat()));
-        }
-        return points;
-    }
-
-    public static ExportArtifacts buildExports(String sourceFile, Map<String, Object> manifest, List<SlamPoint> points, double resolution, int paddingCells) {
-        PgmMetadata pgm = buildPgm(sourceFile, manifest, points, resolution, paddingCells);
-        String yaml = buildYamlText(sourceFile, resolution, pgm.getOrigin());
+    public static ExportArtifacts buildExports(String sourceFile, Map<String, Object> manifest, Map<String, Object> occupancyGrid, double resolution, int paddingCells) {
+        PgmMetadata pgm = buildPgm(occupancyGrid, resolution, paddingCells);
+        String yaml = buildYamlText(sourceFile, getDouble(occupancyGrid, "resolution", resolution), pgm.getOrigin());
         Map<String, Object> exportManifest = deepCopyMap(manifest);
-        exportManifest.remove("browser_occupancy");
-        exportManifest.remove("trajectory");
 
         Map<String, Object> mapYaml = new LinkedHashMap<String, Object>();
         mapYaml.put("image", replaceExtension(sourceFile, ".pgm"));
         mapYaml.put("mode", "trinary");
-        mapYaml.put("resolution", resolution);
+        mapYaml.put("resolution", getDouble(occupancyGrid, "resolution", resolution));
         mapYaml.put("origin", pgm.getOrigin());
         mapYaml.put("negate", 0);
         mapYaml.put("occupied_thresh", 0.65);
@@ -107,7 +87,7 @@ public final class SlamExportTool {
 
     public static ExportArtifacts export(Path slamPath, Path outputDir, double resolution, int paddingCells) throws IOException {
         LoadedSlam loaded = load(slamPath);
-        ExportArtifacts artifacts = buildExports(slamPath.getFileName().toString(), loaded.getManifest(), loaded.getRadarPoints(), resolution, paddingCells);
+        ExportArtifacts artifacts = buildExports(slamPath.getFileName().toString(), loaded.getManifest(), loaded.getOccupancyGrid(), resolution, paddingCells);
         Files.createDirectories(outputDir);
         String stem = baseName(slamPath.getFileName().toString());
         Files.writeString(outputDir.resolve(stem + ".pgm"), artifacts.getPgmText(), StandardCharsets.UTF_8);
@@ -117,64 +97,14 @@ public final class SlamExportTool {
     }
 
     @SuppressWarnings("unchecked")
-    private static PgmMetadata buildPgm(String sourceFile, Map<String, Object> manifest, List<SlamPoint> points, double resolution, int paddingCells) {
-        Map<String, Object> browser = manifest.get("browser_occupancy") instanceof Map
-            ? (Map<String, Object>) manifest.get("browser_occupancy")
-            : null;
-        double occupancyVoxel = Math.max(0.02, getDouble(browser, "voxel_size", resolution));
-        List<Object> occupiedCells = browser != null && browser.get("occupied_cells") instanceof List
-            ? (List<Object>) browser.get("occupied_cells")
-            : null;
-
-        long minCellX = Long.MAX_VALUE;
-        long maxCellX = Long.MIN_VALUE;
-        long minCellY = Long.MAX_VALUE;
-        long maxCellY = Long.MIN_VALUE;
-        Set<String> occupied = new LinkedHashSet<String>();
-
-        if (occupiedCells != null && !occupiedCells.isEmpty()) {
-            for (Object item : occupiedCells) {
-                Map<String, Object> cell = (Map<String, Object>) item;
-                long ix = Math.round(getDouble(cell, "ix", 0.0));
-                long iy = Math.round(getDouble(cell, "iy", 0.0));
-                minCellX = Math.min(minCellX, ix);
-                maxCellX = Math.max(maxCellX, ix);
-                minCellY = Math.min(minCellY, iy);
-                maxCellY = Math.max(maxCellY, iy);
-                occupied.add(ix + ":" + iy);
-            }
-        } else {
-            if (points.isEmpty()) {
-                throw new IllegalArgumentException("No radar points in SLAM");
-            }
-            for (SlamPoint point : points) {
-                long ix = Math.round(point.getX() / resolution);
-                long iy = Math.round(point.getY() / resolution);
-                minCellX = Math.min(minCellX, ix);
-                maxCellX = Math.max(maxCellX, ix);
-                minCellY = Math.min(minCellY, iy);
-                maxCellY = Math.max(maxCellY, iy);
-                occupied.add(ix + ":" + iy);
-            }
-        }
-
-        long paddedMinX = minCellX - paddingCells;
-        long paddedMinY = minCellY - paddingCells;
-        long paddedMaxX = maxCellX + paddingCells;
-        long paddedMaxY = maxCellY + paddingCells;
-        int width = Math.max(1, (int) (paddedMaxX - paddedMinX + 1));
-        int height = Math.max(1, (int) (paddedMaxY - paddedMinY + 1));
-        int[] grid = new int[width * height];
-        for (int i = 0; i < grid.length; i++) {
-            grid[i] = 205;
-        }
-
-        for (String cellKey : occupied) {
-            String[] parts = cellKey.split(":");
-            int ix = (int) (Long.parseLong(parts[0]) - paddedMinX);
-            int iy = (int) (Long.parseLong(parts[1]) - paddedMinY);
-            int flippedY = height - 1 - iy;
-            grid[flippedY * width + ix] = 0;
+    private static PgmMetadata buildPgm(Map<String, Object> occupancyGrid, double resolution, int paddingCells) {
+        paddingCells = 0;
+        int width = (int) Math.round(getDouble(occupancyGrid, "width", 0.0));
+        int height = (int) Math.round(getDouble(occupancyGrid, "height", 0.0));
+        double gridResolution = Math.max(0.02, getDouble(occupancyGrid, "resolution", resolution));
+        List<Object> data = occupancyGrid.get("data") instanceof List ? (List<Object>) occupancyGrid.get("data") : List.of();
+        if (width <= 0 || height <= 0 || data.size() != width * height) {
+            throw new IllegalArgumentException("No occupancy grid in SLAM");
         }
 
         StringBuilder rows = new StringBuilder();
@@ -184,23 +114,46 @@ public final class SlamExportTool {
             if (row > 0) {
                 rows.append("\n");
             }
-            int start = row * width;
+            int start = (height - 1 - row) * width;
             for (int col = 0; col < width; col++) {
                 if (col > 0) {
                     rows.append(" ");
                 }
-                rows.append(grid[start + col]);
+                int value = getInt(data.get(start + col), -1);
+                rows.append(value >= 50 ? 0 : value == 0 ? 254 : 205);
             }
         }
         rows.append("\n");
 
-        List<Double> origin = List.of(round3(paddedMinX * occupancyVoxel), round3(paddedMinY * occupancyVoxel), 0.0);
+        Map<String, Object> originMeta = occupancyGrid.get("origin") instanceof Map ? (Map<String, Object>) occupancyGrid.get("origin") : Map.of();
+        double originX = getDouble(originMeta, "x", 0.0);
+        double originY = getDouble(originMeta, "y", 0.0);
+        int occupiedCount = 0;
+        for (Object value : data) {
+            if (getInt(value, -1) >= 50) {
+                occupiedCount += 1;
+            }
+        }
+        List<Double> origin = List.of(round3(originX), round3(originY), 0.0);
         Map<String, Double> bounds = new LinkedHashMap<String, Double>();
-        bounds.put("minX", round3(minCellX * occupancyVoxel));
-        bounds.put("maxX", round3(maxCellX * occupancyVoxel));
-        bounds.put("minY", round3(minCellY * occupancyVoxel));
-        bounds.put("maxY", round3(maxCellY * occupancyVoxel));
-        return new PgmMetadata(rows.toString(), width, height, origin, occupied.size(), bounds);
+        bounds.put("minX", round3(originX));
+        bounds.put("maxX", round3(originX + width * gridResolution));
+        bounds.put("minY", round3(originY));
+        bounds.put("maxY", round3(originY + height * gridResolution));
+        return new PgmMetadata(rows.toString(), width, height, origin, occupiedCount, bounds);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> buildOccupancyGrid(Map<String, Object> manifest, byte[] gridBytes) {
+        Map<String, Object> occupancyGrid = manifest.get("occupancy_grid") instanceof Map
+            ? deepCopyMap((Map<String, Object>) manifest.get("occupancy_grid"))
+            : new LinkedHashMap<String, Object>();
+        List<Integer> data = new ArrayList<Integer>();
+        for (byte value : gridBytes) {
+            data.add((int) value);
+        }
+        occupancyGrid.put("data", data);
+        return occupancyGrid;
     }
 
     private static String buildYamlText(String fileName, double resolution, List<Double> origin) {
@@ -243,6 +196,20 @@ public final class SlamExportTool {
         if (value instanceof String) {
             try {
                 return Double.parseDouble((String) value);
+            } catch (NumberFormatException ignored) {
+                return defaultValue;
+            }
+        }
+        return defaultValue;
+    }
+
+    private static int getInt(Object value, int defaultValue) {
+        if (value instanceof Number) {
+            return ((Number) value).intValue();
+        }
+        if (value instanceof String) {
+            try {
+                return Integer.parseInt((String) value);
             } catch (NumberFormatException ignored) {
                 return defaultValue;
             }
@@ -335,5 +302,193 @@ public final class SlamExportTool {
 
     private static double round3(double value) {
         return Double.parseDouble(THREE_DECIMAL.format(value));
+    }
+
+    private static final class JsonParser {
+        private final String text;
+        private int index = 0;
+
+        JsonParser(String text) {
+            this.text = text;
+        }
+
+        Object parse() {
+            Object value = parseValue();
+            skipWhitespace();
+            if (index != text.length()) {
+                throw new IllegalArgumentException("Unexpected trailing JSON content");
+            }
+            return value;
+        }
+
+        private Object parseValue() {
+            skipWhitespace();
+            if (index >= text.length()) {
+                throw new IllegalArgumentException("Unexpected end of JSON");
+            }
+            char ch = text.charAt(index);
+            if (ch == '{') {
+                return parseObject();
+            }
+            if (ch == '[') {
+                return parseArray();
+            }
+            if (ch == '"') {
+                return parseString();
+            }
+            if (ch == 't') {
+                expect("true");
+                return Boolean.TRUE;
+            }
+            if (ch == 'f') {
+                expect("false");
+                return Boolean.FALSE;
+            }
+            if (ch == 'n') {
+                expect("null");
+                return null;
+            }
+            return parseNumber();
+        }
+
+        private Map<String, Object> parseObject() {
+            LinkedHashMap<String, Object> map = new LinkedHashMap<String, Object>();
+            expect("{");
+            skipWhitespace();
+            if (peek('}')) {
+                index += 1;
+                return map;
+            }
+            while (true) {
+                String key = parseString();
+                skipWhitespace();
+                expect(":");
+                map.put(key, parseValue());
+                skipWhitespace();
+                if (peek('}')) {
+                    index += 1;
+                    return map;
+                }
+                expect(",");
+            }
+        }
+
+        private List<Object> parseArray() {
+            List<Object> list = new ArrayList<Object>();
+            expect("[");
+            skipWhitespace();
+            if (peek(']')) {
+                index += 1;
+                return list;
+            }
+            while (true) {
+                list.add(parseValue());
+                skipWhitespace();
+                if (peek(']')) {
+                    index += 1;
+                    return list;
+                }
+                expect(",");
+            }
+        }
+
+        private String parseString() {
+            expect("\"");
+            StringBuilder builder = new StringBuilder();
+            while (index < text.length()) {
+                char ch = text.charAt(index++);
+                if (ch == '"') {
+                    return builder.toString();
+                }
+                if (ch != '\\') {
+                    builder.append(ch);
+                    continue;
+                }
+                if (index >= text.length()) {
+                    throw new IllegalArgumentException("Invalid JSON escape");
+                }
+                char escaped = text.charAt(index++);
+                switch (escaped) {
+                    case '"':
+                    case '\\':
+                    case '/':
+                        builder.append(escaped);
+                        break;
+                    case 'b':
+                        builder.append('\b');
+                        break;
+                    case 'f':
+                        builder.append('\f');
+                        break;
+                    case 'n':
+                        builder.append('\n');
+                        break;
+                    case 'r':
+                        builder.append('\r');
+                        break;
+                    case 't':
+                        builder.append('\t');
+                        break;
+                    case 'u':
+                        if (index + 4 > text.length()) {
+                            throw new IllegalArgumentException("Invalid unicode escape");
+                        }
+                        builder.append((char) Integer.parseInt(text.substring(index, index + 4), 16));
+                        index += 4;
+                        break;
+                    default:
+                        throw new IllegalArgumentException("Unsupported JSON escape: \\" + escaped);
+                }
+            }
+            throw new IllegalArgumentException("Unterminated JSON string");
+        }
+
+        private Number parseNumber() {
+            int start = index;
+            if (peek('-')) {
+                index += 1;
+            }
+            while (index < text.length() && Character.isDigit(text.charAt(index))) {
+                index += 1;
+            }
+            boolean isFloat = false;
+            if (peek('.')) {
+                isFloat = true;
+                index += 1;
+                while (index < text.length() && Character.isDigit(text.charAt(index))) {
+                    index += 1;
+                }
+            }
+            if (peek('e') || peek('E')) {
+                isFloat = true;
+                index += 1;
+                if (peek('+') || peek('-')) {
+                    index += 1;
+                }
+                while (index < text.length() && Character.isDigit(text.charAt(index))) {
+                    index += 1;
+                }
+            }
+            String raw = text.substring(start, index);
+            return isFloat ? Double.parseDouble(raw) : Long.parseLong(raw);
+        }
+
+        private void skipWhitespace() {
+            while (index < text.length() && Character.isWhitespace(text.charAt(index))) {
+                index += 1;
+            }
+        }
+
+        private boolean peek(char ch) {
+            return index < text.length() && text.charAt(index) == ch;
+        }
+
+        private void expect(String expected) {
+            skipWhitespace();
+            if (!text.startsWith(expected, index)) {
+                throw new IllegalArgumentException("Expected " + expected);
+            }
+            index += expected.length();
+        }
     }
 }

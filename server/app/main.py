@@ -69,6 +69,7 @@ sim = Simulator(bus, rate_hz=CONFIG.sim_rate_hz, points_per_scan=CONFIG.lidar_po
 ros: RosRuntime = RosRuntime(enabled=False, reason="ROS runtime not initialized")
 map_dir = Path("data/maps")
 latest_points: list[tuple[float, float, float]] = []
+latest_occupancy_grid: dict[str, Any] | None = None
 seq_by_topic: dict[str, int] = defaultdict(int)
 ws_clients: set[int] = set()
 motion_command_seq = 0
@@ -815,6 +816,43 @@ def _occupancy_payload_to_points(payload: dict[str, Any]) -> list[tuple[float, f
     ]
 
 
+def _occupancy_payload_to_grid(payload: dict[str, Any]) -> dict[str, Any] | None:
+    data = [int(value) for value in payload.get("data", [])] if isinstance(payload.get("data"), list) else []
+    width = int(payload.get("width", 0) or 0)
+    height = int(payload.get("height", 0) or 0)
+    if data and width > 0 and height > 0 and len(data) == width * height:
+        origin = payload.get("origin") if isinstance(payload.get("origin"), dict) else {}
+        return {
+            "width": width,
+            "height": height,
+            "resolution": max(0.02, float(payload.get("resolution", 0.05) or 0.05)),
+            "origin": {"x": float(origin.get("x", 0.0)), "y": float(origin.get("y", 0.0))},
+            "data": [100 if value >= 50 else 0 if value >= 0 else -1 for value in data],
+        }
+    points = _occupancy_payload_to_points(payload)
+    if not points:
+        return None
+    resolution = max(0.02, float(payload.get("resolution", 0.05) or 0.05))
+    min_ix = min(round(point[0] / resolution) for point in points)
+    max_ix = max(round(point[0] / resolution) for point in points)
+    min_iy = min(round(point[1] / resolution) for point in points)
+    max_iy = max(round(point[1] / resolution) for point in points)
+    width = max_ix - min_ix + 1
+    height = max_iy - min_iy + 1
+    grid_data = [-1] * (width * height)
+    for x, y, _intensity in points:
+        ix = round(x / resolution) - min_ix
+        iy = round(y / resolution) - min_iy
+        grid_data[iy * width + ix] = 100
+    return {
+        "width": width,
+        "height": height,
+        "resolution": resolution,
+        "origin": {"x": round(min_ix * resolution, 6), "y": round(min_iy * resolution, 6)},
+        "data": grid_data,
+    }
+
+
 def _effective_control_target(now: float | None = None) -> tuple[float, float, bool, bool]:
     now = time.time() if now is None else float(now)
     updated_at = float(CONTROL_TARGET.get("updated_at", 0.0) or 0.0)
@@ -1291,7 +1329,7 @@ async def add_poi(req: AddPoiRequest) -> dict:
 
 @app.post("/map/reset")
 async def reset_map() -> dict:
-    global latest_points
+    global latest_points, latest_occupancy_grid
 
     if not (ros.enabled and ros.bridge is not None):
         return {"ok": False, "reason": "ros_unavailable", "map_source": _current_map_source()}
@@ -1309,9 +1347,14 @@ async def reset_map() -> dict:
 @app.post("/map/save")
 async def save_map(req: SaveMapRequest) -> dict:
     points_to_save = _current_map_points()
+    grid_to_save = copy.deepcopy(latest_occupancy_grid)
     if req.voxel_size is not None:
         SCAN_SESSION["voxel_size"] = max(0.02, float(req.voxel_size))
     if not points_to_save:
+        return {"ok": False, "reason": "map_unavailable", "map_source": _current_map_source(), "scan_summary": _scan_summary()}
+    if not isinstance(grid_to_save, dict):
+        grid_to_save = _occupancy_payload_to_grid({"occupied": [{"x": x, "y": y} for x, y, _intensity in points_to_save], "resolution": float(SCAN_SESSION["voxel_size"])})
+    if not isinstance(grid_to_save, dict):
         return {"ok": False, "reason": "map_unavailable", "map_source": _current_map_source(), "scan_summary": _scan_summary()}
     logger.info(
         "map save requested name=%s session_mode=%s active=%s point_count=%s",
@@ -1349,7 +1392,7 @@ async def save_map(req: SaveMapRequest) -> dict:
                 "scan_mode": str(SCAN_SESSION.get("mode", "2d")),
             }
     bundle = {
-        "version": "slam.v3",
+        "version": "slam.v4",
         "scan_mode": str(SCAN_SESSION.get("mode", "2d")),
         "notes": req.notes,
         "created_at": time.time(),
@@ -1365,7 +1408,7 @@ async def save_map(req: SaveMapRequest) -> dict:
         "chassis_track": sim.state.chassis_track,
         "scan_summary": _scan_summary(),
         "ros_diag": _ros_diag(),
-        "radar_points": points_to_save,
+        "occupancy_grid": grid_to_save,
     }
     if isinstance(pcd_file, dict):
         bundle["pcd_file"] = pcd_file
@@ -1379,7 +1422,7 @@ async def save_map(req: SaveMapRequest) -> dict:
             "trajectory": len(sim.state.trajectory),
             "gps_track": len(sim.state.gps_track),
             "chassis_track": len(sim.state.chassis_track),
-            "radar_points": len(points_to_save),
+            "grid_cells": int(grid_to_save["width"]) * int(grid_to_save["height"]),
             "pcd": isinstance(pcd_file, dict),
         },
         "scan_summary": _scan_summary(),
@@ -1400,10 +1443,23 @@ async def save_map(req: SaveMapRequest) -> dict:
 
 @app.post("/map/load")
 async def load_map(req: LoadMapRequest) -> dict:
-    global latest_points
+    global latest_points, latest_occupancy_grid
 
     bundle = load_stcm(map_dir / req.filename)
-    latest_points = [tuple(p) for p in bundle.get("radar_points", [])]
+    grid = bundle.get("occupancy_grid") if isinstance(bundle.get("occupancy_grid"), dict) else {}
+    latest_occupancy_grid = copy.deepcopy(grid) if isinstance(grid, dict) else None
+    latest_points = []
+    if isinstance(grid, dict):
+        width = int(grid.get("width", 0) or 0)
+        resolution = max(0.02, float(grid.get("resolution", 0.05) or 0.05))
+        origin = grid.get("origin") if isinstance(grid.get("origin"), dict) else {}
+        origin_x = float(origin.get("x", 0.0))
+        origin_y = float(origin.get("y", 0.0))
+        for index, value in enumerate(grid.get("data", [])):
+            if int(value) >= 50:
+                row = index // width
+                col = index % width
+                latest_points.append((origin_x + col * resolution, origin_y + row * resolution, 1.0))
     sim.state.poi = bundle.get("poi", [])
     sim.state.path = bundle.get("path", [])
     sim.state.trajectory = bundle.get("trajectory", [])
@@ -1489,7 +1545,7 @@ async def ws_stream(websocket: WebSocket) -> None:
                     continue
 
     async def enqueue_topic(topic: str) -> None:
-        global latest_points
+        global latest_points, latest_occupancy_grid
 
         async for message in bus.subscribe(topic):
             now = time.time()
@@ -1508,6 +1564,7 @@ async def ws_stream(websocket: WebSocket) -> None:
                 SCAN_SESSION["raw_points"] += len(message["payload"].get("points", []))
             elif topic == "/map/grid":
                 latest_points = _occupancy_payload_to_points(message["payload"])
+                latest_occupancy_grid = _occupancy_payload_to_grid(message["payload"])
 
             outbound_message = message
             if topic in {"/lidar/front", "/lidar/rear"}:
