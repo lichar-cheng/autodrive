@@ -325,6 +325,23 @@ def strip_legacy_trajectory(manifest: dict) -> dict:
     return cleaned
 
 
+def build_export_json_manifest(manifest: dict) -> dict:
+    export_manifest = strip_legacy_trajectory(manifest)
+    export_manifest.pop("browser_occupancy", None)
+    export_manifest.pop("occupancy", None)
+    export_manifest.pop("pcd_file", None)
+    return export_manifest
+
+
+def export_zip_entry_names(file_name: str) -> dict[str, str]:
+    stem = Path(str(file_name or "map_export")).stem or "map_export"
+    return {
+        "pgm": f"{stem}.pgm",
+        "yaml": f"{stem}.yaml",
+        "json": f"{stem}.json",
+    }
+
+
 def write_slam_archive(path: str | Path, manifest: dict, points: list[list[float]] | list[tuple[float, float, float]], pcd_file: dict[str, Any] | None) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -786,9 +803,7 @@ class DesktopClient:
                 "clear_loaded_map": "Clear Loaded Map",
                 "save_map": "Save Map",
                 "load_map": "Load Map",
-                "export_pgm": "Export PGM",
-                "export_yaml": "Export YAML",
-                "export_json": "Export JSON",
+                "export_zip": "Export ZIP",
                 "export_pcd": "Export PCD",
                 "scan_mode_label": "Scan Mode",
                 "scan_receiving_pcd": "Receiving PCD from server",
@@ -967,9 +982,7 @@ class DesktopClient:
                 "clear_loaded_map": "清空已加载地图",
                 "save_map": "保存地图",
                 "load_map": "加载地图",
-                "export_pgm": "导出 PGM",
-                "export_yaml": "导出 YAML",
-                "export_json": "导出 JSON",
+                "export_zip": "导出 ZIP",
                 "export_pcd": "导出 PCD",
                 "scan_mode_label": "扫描模式",
                 "scan_receiving_pcd": "正在从服务端接收 PCD",
@@ -1098,7 +1111,7 @@ class DesktopClient:
 
         self.scan = {
             "active": False,
-            "mode": "2d",
+            "mode": "3d",
             "phase": "idle",
             "error": "",
             "error_reason": "",
@@ -1569,9 +1582,7 @@ class DesktopClient:
                 (self.tr("clear_loaded_map"), self.clear_loaded_map),
                 (self.tr("save_map"), self.save_stcm),
                 (self.tr("load_map"), self.load_stcm),
-                (self.tr("export_pgm"), lambda: self.export_inspector_file("pgm")),
-                (self.tr("export_yaml"), lambda: self.export_inspector_file("yaml")),
-                (self.tr("export_json"), lambda: self.export_inspector_file("json")),
+                (self.tr("export_zip"), lambda: self.export_inspector_file("zip")),
                 (self.tr("export_pcd"), lambda: self.export_inspector_file("pcd")),
             ],
             min_button_width=145,
@@ -1954,8 +1965,25 @@ class DesktopClient:
     def ensure_scan_pcd(self, mode: str | None = None) -> dict[str, Any] | None:
         current_bytes = bytes(self.scan.get("pcd_bytes") or b"")
         if current_bytes:
+            if hasattr(self, "logger") and hasattr(self.logger, "info"):
+                self.logger.info(
+                    "ensure_scan_pcd using cached bytes requested_mode=%s current_scan_mode=%s cached_name=%s cached_bytes=%s",
+                    str(mode or "").strip().lower() or "auto",
+                    str(self.scan.get("mode", "2d")).strip().lower(),
+                    str(self.scan.get("pcd_name") or "map.pcd"),
+                    len(current_bytes),
+                )
             return {"name": str(self.scan.get("pcd_name") or "map.pcd"), "content": current_bytes}
         scan_mode = str(mode or self.selected_scan_mode()).strip().lower()
+        if hasattr(self, "logger") and hasattr(self.logger, "info"):
+            bridge = getattr(self, "bridge", None)
+            self.logger.info(
+                "ensure_scan_pcd requested_mode=%s selected_scan_mode=%s current_scan_mode=%s has_bridge=%s",
+                scan_mode,
+                self.selected_scan_mode(),
+                str(self.scan.get("mode", "2d")).strip().lower(),
+                bool(bridge and bridge.connected),
+            )
         if scan_mode != "3d":
             return None
         if not self.bridge or not self.bridge.connected:
@@ -1968,6 +1996,13 @@ class DesktopClient:
         progress_state = self._create_progress_dialog(self.tr("pcd_download_title"))
         try:
             with self.bridge.session.get(f"{self.bridge.http_base}/scan/pcd", timeout=30, stream=True) as response:
+                if hasattr(self, "logger") and hasattr(self.logger, "info"):
+                    self.logger.info(
+                        "ensure_scan_pcd response status=%s requested_mode=%s current_scan_mode=%s",
+                        response.status_code,
+                        scan_mode,
+                        str(self.scan.get("mode", "2d")).strip().lower(),
+                    )
                 if response.status_code != 200:
                     detail = ""
                     try:
@@ -1975,6 +2010,14 @@ class DesktopClient:
                         detail = str(payload.get("error") or payload.get("reason") or "")
                     except Exception:
                         detail = response.text.strip()
+                    if hasattr(self, "logger") and hasattr(self.logger, "warning"):
+                        self.logger.warning(
+                            "ensure_scan_pcd rejected status=%s requested_mode=%s current_scan_mode=%s detail=%s",
+                            response.status_code,
+                            scan_mode,
+                            str(self.scan.get("mode", "2d")).strip().lower(),
+                            detail,
+                        )
                     messagebox.showwarning(self.tr("export_title"), self.tr("pcd_download_failed", error=detail or f"http {response.status_code}"))
                     return None
                 total = int(response.headers.get("Content-Length", "0") or response.headers.get("X-Scan-PCD-Size", "0") or 0)
@@ -1997,8 +2040,17 @@ class DesktopClient:
                 self.scan["pcd_name"] = file_name
                 self.scan["pcd_bytes"] = bytes(content)
                 self.scan["pcd_received_at"] = int(time.time() * 1000)
+                if hasattr(self, "logger") and hasattr(self.logger, "info"):
+                    self.logger.info("ensure_scan_pcd downloaded file_name=%s bytes=%s", file_name, len(content))
                 return {"name": file_name, "content": bytes(content)}
         except Exception as exc:
+            if hasattr(self, "logger") and hasattr(self.logger, "warning"):
+                self.logger.warning(
+                    "ensure_scan_pcd exception requested_mode=%s current_scan_mode=%s err=%s",
+                    scan_mode,
+                    str(self.scan.get("mode", "2d")).strip().lower(),
+                    exc,
+                )
             messagebox.showwarning(self.tr("export_title"), self.tr("pcd_download_failed", error=str(exc)))
             return None
         finally:
@@ -2121,6 +2173,14 @@ class DesktopClient:
 
     def start_scan(self) -> None:
         mode = str(getattr(self, "scan_mode_var", None).get() if getattr(self, "scan_mode_var", None) is not None else self.scan.get("mode", "2d")).strip().lower()
+        if hasattr(self, "logger") and hasattr(self.logger, "info"):
+            self.logger.info(
+                "start_scan clicked selected_mode=%s current_scan_mode=%s phase=%s active=%s",
+                mode,
+                str(self.scan.get("mode", "2d")).strip().lower(),
+                str(self.scan.get("phase", "idle")),
+                bool(self.scan.get("active", False)),
+            )
         if self.scan.get("phase") == "starting":
             return
         if self.scan.get("phase") == "waiting_mapping" and bool(self.scan.get("pending_start")):
@@ -2176,6 +2236,14 @@ class DesktopClient:
                 self.logger.warning("scan start cleanup stop_scan failed mode=%s err=%s", mode, cleanup_exc)
 
     def _finish_start_scan(self, mode: str, response: dict | None, show_mapping_warning: bool = True) -> None:
+        if hasattr(self, "logger") and hasattr(self.logger, "info"):
+            self.logger.info(
+                "finish_start_scan mode=%s response_ok=%s response_scan_mode=%s response_reason=%s",
+                mode,
+                None if response is None else bool(response.get("ok", True)),
+                None if response is None else response.get("scan_mode"),
+                None if response is None else response.get("reason"),
+            )
         if hasattr(self, "scan_progress"):
             self.scan_progress.stop()
         if response is None:
@@ -2242,6 +2310,14 @@ class DesktopClient:
 
     def stop_scan(self) -> None:
         mode = str(self.scan.get("mode", "2d")).strip().lower()
+        if hasattr(self, "logger") and hasattr(self.logger, "info"):
+            self.logger.info(
+                "stop_scan clicked requested_mode=%s current_scan_mode=%s phase=%s active=%s",
+                mode,
+                str(self.scan.get("mode", "2d")).strip().lower(),
+                str(self.scan.get("phase", "idle")),
+                bool(self.scan.get("active", False)),
+            )
         self.scan["phase"] = "stopping"
         if hasattr(self, "scan_state_var"):
             self.scan_state_var.set(self.tr("scan_stopping"))
@@ -3493,8 +3569,7 @@ class DesktopClient:
         resolution = float(config["voxel_size"])
         pgm = self.build_pgm_export(manifest, points, resolution)
         yaml_text = self.build_yaml_export(file_name, resolution, pgm["origin"])
-        export_manifest = strip_legacy_trajectory(manifest)
-        export_manifest.pop("browser_occupancy", None)
+        export_manifest = build_export_json_manifest(manifest)
         self.inspector = {
             "file": file_name,
             "manifest": manifest,
@@ -3506,10 +3581,52 @@ class DesktopClient:
             "pcd_file": dict(manifest.get("pcd") or {}) if isinstance(manifest.get("pcd"), dict) else None,
         }
 
+    def choose_3d_save_payload(self) -> str | None:
+        if getattr(self, "root", None) is None:
+            return "2d_only"
+        dialog = tk.Toplevel(self.root)
+        dialog.title("3D Save Options")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        choice_var = tk.StringVar(value="2d_only")
+        result = {"value": None}
+
+        body = ttk.Frame(dialog, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text="Choose whether to include the current PCD in the project archive.", wraplength=320, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 8))
+        ttk.Radiobutton(body, text="2D only", variable=choice_var, value="2d_only").pack(anchor=tk.W, pady=2)
+        ttk.Radiobutton(body, text="2D + PCD", variable=choice_var, value="2d_pcd").pack(anchor=tk.W, pady=2)
+
+        actions = ttk.Frame(body)
+        actions.pack(fill=tk.X, pady=(10, 0))
+
+        def confirm() -> None:
+            result["value"] = str(choice_var.get() or "2d_only").strip().lower()
+            dialog.destroy()
+
+        def cancel() -> None:
+            result["value"] = None
+            dialog.destroy()
+
+        ttk.Button(actions, text="Save", command=confirm).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(actions, text="Cancel", command=cancel).pack(side=tk.LEFT)
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.wait_visibility()
+        dialog.focus_set()
+        dialog.wait_window()
+        return result["value"]
+
     def save_stcm(self) -> None:
         self.rebuild_path_nodes()
         config = self.apply_scan_fusion_config_from_ui()
         voxel_size = self.active_voxel_size()
+        current_scan_mode = str(self.scan.get("mode", "2d")).strip().lower()
+        if current_scan_mode not in {"2d", "3d"}:
+            current_scan_mode = "2d"
+        selected_scan_mode = str(self.selected_scan_mode()).strip().lower()
+        if selected_scan_mode not in {"2d", "3d"}:
+            selected_scan_mode = current_scan_mode
         notes = {
             "text": self.map_notes_var.get().strip(),
             "voxelSize": voxel_size,
@@ -3520,7 +3637,7 @@ class DesktopClient:
         }
         bundle = {
             "version": "slam.v3",
-            "scan_mode": str(self.scan.get("mode", "2d")),
+            "scan_mode": selected_scan_mode,
             "notes": json.dumps(notes, ensure_ascii=False, indent=2),
             "created_at": time.time(),
             "source": "desktop",
@@ -3559,12 +3676,35 @@ class DesktopClient:
         target = filedialog.asksaveasfilename(parent=self.root, defaultextension=".slam", filetypes=[("SLAM", "*.slam")], initialfile=f"{self.map_name_var.get().strip() or 'desktop_map'}.slam")
         if not target:
             return
-        scan_mode = self.selected_scan_mode()
+        scan_mode = selected_scan_mode
+        payload_choice = "2d_only"
         if scan_mode == "3d":
-            self.scan["mode"] = "3d"
-            bundle["scan_mode"] = "3d"
-        pcd_file = self.ensure_scan_pcd(scan_mode)
-        if scan_mode == "3d" and not isinstance(pcd_file, dict):
+            selected_payload = self.choose_3d_save_payload()
+            if selected_payload is None:
+                return
+            payload_choice = str(selected_payload or "2d_only").strip().lower()
+            if payload_choice not in {"2d_only", "2d_pcd"}:
+                payload_choice = "2d_only"
+        bundle["save_payload"] = payload_choice
+        if hasattr(self, "logger") and hasattr(self.logger, "info"):
+            self.logger.info(
+                "save_stcm requested current_scan_mode=%s selected_scan_mode=%s payload_choice=%s has_cached_pcd=%s cached_pcd_bytes=%s point_count=%s",
+                current_scan_mode,
+                selected_scan_mode,
+                payload_choice,
+                bool(self.scan.get("pcd_bytes")),
+                len(bytes(self.scan.get("pcd_bytes") or b"")),
+                len(bundle["radar_points"]),
+            )
+        pcd_file = self.ensure_scan_pcd(scan_mode) if scan_mode == "3d" and payload_choice == "2d_pcd" else None
+        if scan_mode == "3d" and payload_choice == "2d_pcd" and not isinstance(pcd_file, dict):
+            if hasattr(self, "logger") and hasattr(self.logger, "warning"):
+                self.logger.warning(
+                    "save_stcm aborted missing_pcd current_scan_mode=%s selected_scan_mode=%s payload_choice=%s",
+                    current_scan_mode,
+                    selected_scan_mode,
+                    payload_choice,
+                )
             return
         if isinstance(pcd_file, dict):
             bundle["pcd"] = {"included": True, "file": str(pcd_file.get("name") or "map.pcd")}
@@ -3586,6 +3726,25 @@ class DesktopClient:
         suffix = Path(target).suffix.lower()
         if suffix in {".yaml", ".yml", ".pgm"}:
             loaded = NativeMapImportTool.import_map(target)
+            file_name = loaded.file_name
+            manifest = loaded.manifest
+            points = loaded.radar_points
+            pcd_file = None
+        elif suffix == ".zip":
+            with tempfile.TemporaryDirectory(prefix="native_map_zip_") as temp_dir:
+                temp_path = Path(temp_dir)
+                with zipfile.ZipFile(target, "r") as zf:
+                    zf.extractall(temp_path)
+                yaml_candidates = [
+                    temp_path / "map.yaml",
+                    temp_path / "map.yml",
+                    *sorted(temp_path.glob("*.yaml")),
+                    *sorted(temp_path.glob("*.yml")),
+                ]
+                yaml_path = next((candidate for candidate in yaml_candidates if candidate.exists()), None)
+                if yaml_path is None:
+                    raise FileNotFoundError("export zip missing map.yaml")
+                loaded = NativeMapImportTool.import_map(yaml_path)
             file_name = loaded.file_name
             manifest = loaded.manifest
             points = loaded.radar_points
@@ -3666,11 +3825,19 @@ class DesktopClient:
         if not self.inspector["file"]:
             messagebox.showwarning(self.tr("export_title"), self.tr("export_need_map"))
             return
-        mapping = {
-            "pgm": (self.inspector["pgm"], ".pgm"),
-            "yaml": (self.inspector["yaml"], ".yaml"),
-            "json": (self.inspector["json"], ".json"),
-        }
+        if kind == "zip":
+            initial_name = f"{Path(self.inspector['file']).stem or 'map_export'}.zip"
+            path = filedialog.asksaveasfilename(parent=self.root, defaultextension=".zip", filetypes=[("ZIP", "*.zip")], initialfile=initial_name)
+            if not path:
+                return
+            entry_names = export_zip_entry_names(str(self.inspector["file"] or "map_export"))
+            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(entry_names["pgm"], str(self.inspector["pgm"] or ""))
+                zf.writestr(entry_names["yaml"], str(self.inspector["yaml"] or ""))
+                zf.writestr(entry_names["json"], str(self.inspector["json"] or ""))
+            self.logger.info("map export kind=%s path=%s", kind, path)
+            messagebox.showinfo(self.tr("export_title"), self.tr("export_done", kind=kind.upper(), path=path))
+            return
         if kind == "pcd":
             pcd_file = self.ensure_scan_pcd(self.selected_scan_mode())
             pcd_bytes = bytes((pcd_file or {}).get("content") or b"")
@@ -3686,13 +3853,6 @@ class DesktopClient:
             self.logger.info("map export kind=%s path=%s", kind, path)
             messagebox.showinfo(self.tr("export_title"), self.tr("export_done", kind=kind.upper(), path=path))
             return
-        content, ext = mapping[kind]
-        path = filedialog.asksaveasfilename(parent=self.root, defaultextension=ext, filetypes=[(kind.upper(), f"*{ext}")], initialfile=Path(self.inspector["file"]).with_suffix(ext).name)
-        if not path:
-            return
-        Path(path).write_text(content, encoding="utf-8")
-        self.logger.info("map export kind=%s path=%s", kind, path)
-        messagebox.showinfo(self.tr("export_title"), self.tr("export_done", kind=kind.upper(), path=path))
 
     def render_text_panels(self) -> None:
         self.write_text(

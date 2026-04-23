@@ -893,9 +893,18 @@ def test_stop_scan_3d_only_stops_scan_without_returning_pcd(tmp_path: Path, monk
 
 def test_stop_scan_3d_requires_configured_pcd_path(monkeypatch) -> None:
     bridge = FakeBridge()
+    logs = []
     monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
     monkeypatch.setattr(main, "sim", SimpleNamespace(_running=False, scanning=False))
     monkeypatch.setattr(main, "_pcd_output_path_for_mode", lambda mode: None)
+    monkeypatch.setattr(
+        main,
+        "logger",
+        SimpleNamespace(
+            info=lambda msg, *args: logs.append(("info", msg, args)),
+            warning=lambda msg, *args: logs.append(("warning", msg, args)),
+        ),
+    )
     main._reset_scan_session()
     main.SCAN_SESSION["active"] = True
     main.SCAN_SESSION["mode"] = "3d"
@@ -903,6 +912,9 @@ def test_stop_scan_3d_requires_configured_pcd_path(monkeypatch) -> None:
     result = asyncio.run(main.download_scan_pcd())
 
     assert result.status_code == 404
+    matching = [entry for entry in logs if entry[1].startswith("scan pcd request rejected")]
+    assert matching
+    assert matching[0][2] == ("3d", True, "pcd_path_not_configured", "")
 
 
 def test_stop_scan_3d_rejects_missing_pcd_file(tmp_path: Path, monkeypatch) -> None:

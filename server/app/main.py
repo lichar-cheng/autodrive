@@ -126,7 +126,7 @@ SERVER_RUNTIME = {
 
 SCAN_SESSION = {
     "active": False,
-    "mode": "2d",
+    "mode": "3d",
     "started_at": 0.0,
     "stopped_at": 0.0,
     "voxel_size": 0.12,
@@ -190,7 +190,7 @@ def _thin_points(points: list[list[float]] | list[tuple[float, float, float]], l
 
 def _reset_scan_session(voxel_size: float | None = None, keep_points: bool = False) -> None:
     SCAN_SESSION["active"] = False
-    SCAN_SESSION["mode"] = "2d"
+    SCAN_SESSION["mode"] = "3d"
     SCAN_SESSION["started_at"] = 0.0
     SCAN_SESSION["stopped_at"] = 0.0
     SCAN_SESSION["front_frames"] = 0
@@ -1017,7 +1017,13 @@ async def diag_stream_stats() -> dict:
 async def start_scan(req: StartScanRequest | None = None) -> dict:
     global SCAN_START_CANCEL_SEQ
 
-    mode = _normalize_scan_mode(req.mode if req is not None else "2d")
+    mode = _normalize_scan_mode(req.mode if req is not None else "3d")
+    logger.info(
+        "scan start requested requested_mode=%s session_mode=%s active=%s",
+        req.mode if req is not None else None,
+        str(SCAN_SESSION.get("mode", "2d")),
+        bool(SCAN_SESSION["active"]),
+    )
     if mode is None:
         return {
             "ok": False,
@@ -1091,7 +1097,7 @@ async def start_scan(req: StartScanRequest | None = None) -> dict:
             ros.bridge.set_scan_active(True)
         else:
             sim.scanning = True
-        logger.info("scan started")
+        logger.info("scan started mode=%s active=%s", mode, bool(SCAN_SESSION["active"]))
         return {
             "ok": True,
             "scan_active": True,
@@ -1109,6 +1115,12 @@ async def stop_scan(req: StopScanRequest | None = None) -> dict:
     global SCAN_START_CANCEL_SEQ
 
     mode = _normalize_scan_mode(req.mode if req is not None else str(SCAN_SESSION.get("mode", "2d")))
+    logger.info(
+        "scan stop requested requested_mode=%s session_mode=%s active=%s",
+        req.mode if req is not None else None,
+        str(SCAN_SESSION.get("mode", "2d")),
+        bool(SCAN_SESSION["active"]),
+    )
     if mode is None:
         return {
             "ok": False,
@@ -1134,7 +1146,7 @@ async def stop_scan(req: StopScanRequest | None = None) -> dict:
         ros.bridge.set_scan_active(False)
     else:
         sim.scanning = False
-    logger.info("scan stopped")
+    logger.info("scan stopped session_mode=%s active=%s", str(SCAN_SESSION.get("mode", "2d")), bool(SCAN_SESSION["active"]))
     if str(SCAN_SESSION["mode"]) == "3d":
         SCAN_SESSION["pcd_transfer_state"] = "idle"
         SCAN_SESSION["pcd_file"] = None
@@ -1150,8 +1162,21 @@ async def stop_scan(req: StopScanRequest | None = None) -> dict:
 
 @app.get("/scan/pcd", response_model=None)
 async def download_scan_pcd():
+    logger.info(
+        "scan pcd request session_mode=%s active=%s transfer_state=%s",
+        str(SCAN_SESSION.get("mode", "2d")),
+        bool(SCAN_SESSION.get("active", False)),
+        str(SCAN_SESSION.get("pcd_transfer_state", "idle")),
+    )
     pcd_path, error = _scan_pcd_path()
     if error is not None or pcd_path is None:
+        logger.warning(
+            "scan pcd request rejected session_mode=%s active=%s reason=%s error=%s",
+            str(SCAN_SESSION.get("mode", "2d")),
+            bool(SCAN_SESSION.get("active", False)),
+            error["reason"],
+            error.get("error", ""),
+        )
         return JSONResponse(
             {
                 "ok": False,
@@ -1288,6 +1313,13 @@ async def save_map(req: SaveMapRequest) -> dict:
         SCAN_SESSION["voxel_size"] = max(0.02, float(req.voxel_size))
     if not points_to_save:
         return {"ok": False, "reason": "map_unavailable", "map_source": _current_map_source(), "scan_summary": _scan_summary()}
+    logger.info(
+        "map save requested name=%s session_mode=%s active=%s point_count=%s",
+        req.name,
+        str(SCAN_SESSION.get("mode", "2d")),
+        bool(SCAN_SESSION.get("active", False)),
+        len(points_to_save),
+    )
 
     pose = ros.bridge.latest_pose() if ros.enabled and ros.bridge is not None else {
         "x": sim.state.x,
@@ -1302,6 +1334,12 @@ async def save_map(req: SaveMapRequest) -> dict:
     if str(SCAN_SESSION.get("mode", "2d")) == "3d":
         pcd_file, pcd_error = _load_scan_pcd_file("3d")
         if pcd_error is not None:
+            logger.warning(
+                "map save missing_pcd session_mode=%s reason=%s error=%s",
+                str(SCAN_SESSION.get("mode", "2d")),
+                pcd_error["reason"],
+                pcd_error.get("error", ""),
+            )
             return {
                 "ok": False,
                 "reason": pcd_error["reason"],
@@ -1350,6 +1388,13 @@ async def save_map(req: SaveMapRequest) -> dict:
     }
     if getattr(req, "reset_after_save", False):
         _reset_scan_session(voxel_size=float(SCAN_SESSION["voxel_size"]))
+    logger.info(
+        "map save completed file=%s session_mode=%s included_pcd=%s point_count=%s",
+        str(target),
+        str(SCAN_SESSION.get("mode", "2d")),
+        isinstance(pcd_file, dict),
+        len(points_to_save),
+    )
     return response
 
 

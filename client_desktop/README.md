@@ -10,7 +10,7 @@ The desktop client now tracks the browser client feature set closely:
 - Scan accumulation and map canvas rendering
 - 2D / 3D scan mode selection
 - Local `.slam` map save and load
-- Map exports for `PGM`, `YAML`, `JSON`, and `PCD`
+- Map exports for `ZIP`, `PGM`, `YAML`, `JSON`, and `PCD`
 - Second-stage map editing
 - Noise erase and obstacle-line drawing
 - POI add, batch POI add, delete, geo apply, and clipboard copy
@@ -67,9 +67,24 @@ The desktop client now writes the new `.slam` archive layout:
 
 - `manifest.json`
 - `map_points.bin`
-- `map.pcd` when the session includes 3D point cloud output
+- `map.pcd` only when the user explicitly saves a 3D project with `2D + PCD`
 
-2D sessions save only `manifest.json` and `map_points.bin`. 3D sessions save the same 2D occupancy/map content plus `map.pcd`, and that `pcd` can later be exported directly from the desktop client.
+2D sessions save only `manifest.json` and `map_points.bin`.
+
+3D sessions now have two save payload choices:
+
+- `2D only` (default): writes only `manifest.json` and `map_points.bin`
+- `2D + PCD`: writes `manifest.json`, `map_points.bin`, and `map.pcd`
+
+This keeps `.slam` as the editable project format while making `pcd` inclusion explicit instead of automatic.
+
+## Export Formats
+
+- `Export ZIP` writes a deployment-oriented archive containing:
+  - `map.pgm`
+  - `map.yaml`
+  - `map.json`
+- `Export PCD` keeps the current behavior and only works when the current session or loaded `.slam` has `pcd` content available.
 
 ## Run
 

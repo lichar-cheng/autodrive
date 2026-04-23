@@ -1,6 +1,8 @@
 from pathlib import Path
 
+import json
 import types
+import zipfile
 
 from client_desktop.app import (
     AuthFlowError,
@@ -97,6 +99,7 @@ def build_minimal_client() -> DesktopClient:
     client.map_edit_status_var = DummyVar("")
     client.scan_mode_var = DummyVar("2d")
     client.tr = lambda key, **kwargs: f"{key}:{kwargs}" if kwargs else key
+    client.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None, warning=lambda *args, **kwargs: None, exception=lambda *args, **kwargs: None)
     client.active_occupancy_cells = lambda: []
     client.active_free_cells = lambda: []
     client.mark_canvas_dirty = lambda: None
@@ -582,7 +585,7 @@ def test_ensure_scan_pcd_downloads_and_stores_bytes() -> None:
     assert client.scan["pcd_bytes"] == b"pcd-bytes"
 
 
-def test_save_stcm_downloads_pcd_before_writing_archive(tmp_path: Path, monkeypatch) -> None:
+def test_save_stcm_uses_selected_scan_mode_but_defaults_3d_save_to_2d_only(tmp_path: Path, monkeypatch) -> None:
     target = tmp_path / "demo.slam"
     writes = []
     infos = []
@@ -608,6 +611,47 @@ def test_save_stcm_downloads_pcd_before_writing_archive(tmp_path: Path, monkeypa
     client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
     client.scan["mode"] = "2d"
     client.scan_mode_var = DummyVar("3d")
+    client.choose_3d_save_payload = lambda: "2d_only"
+    pcd_modes = []
+    client.ensure_scan_pcd = lambda mode=None: pcd_modes.append(mode) or {"name": "map.pcd", "content": b"pcd-bytes"}
+
+    DesktopClient.save_stcm(client)
+
+    assert writes
+    assert writes[0][3] is None
+    assert writes[0][1]["scan_mode"] == "3d"
+    assert writes[0][1]["save_payload"] == "2d_only"
+    assert writes[0][1]["pcd"] == {"included": False, "file": ""}
+    assert pcd_modes == []
+    assert infos
+
+
+def test_save_stcm_downloads_pcd_when_actual_scan_mode_is_3d(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "demo-3d.slam"
+    writes = []
+    monkeypatch.setattr("client_desktop.app.filedialog.asksaveasfilename", lambda **_kwargs: str(target))
+    monkeypatch.setattr("client_desktop.app.write_slam_archive", lambda path, manifest, points, pcd_file: writes.append((path, manifest, points, pcd_file)))
+    monkeypatch.setattr("client_desktop.app.messagebox.showinfo", lambda *_args, **_kwargs: None)
+
+    client = build_minimal_client()
+    client.map_name_var = DummyVar("demo")
+    client.map_notes_var = DummyVar("")
+    client.camera_refresh_var = DummyVar("")
+    client.pose = {}
+    client.gps = {}
+    client.chassis = {}
+    client.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+    client.inspector = {"file": "", "manifest": None, "points": [], "pgm": "", "yaml": "", "json": "", "meta": {}, "pcd_file": None}
+    client.rebuild_path_nodes = lambda: None
+    client.apply_scan_fusion_config_from_ui = lambda: {"voxel_size": 0.1, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
+    client.active_voxel_size = lambda: 0.1
+    client.should_use_server_grid = lambda: False
+    client.browser_occupancy = lambda: {"occupied_cells": [], "free_cells": [], "map_fence_xy": [], "voxel_size": 0.1, "scan_fusion": {}}
+    client.occupied_points = lambda: [[1.0, 2.0, 1.0]]
+    client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
+    client.scan["mode"] = "3d"
+    client.scan_mode_var = DummyVar("2d")
+    client.choose_3d_save_payload = lambda: "2d_pcd"
     pcd_modes = []
     client.ensure_scan_pcd = lambda mode=None: pcd_modes.append(mode) or {"name": "map.pcd", "content": b"pcd-bytes"}
 
@@ -616,8 +660,189 @@ def test_save_stcm_downloads_pcd_before_writing_archive(tmp_path: Path, monkeypa
     assert writes
     assert writes[0][3] == {"name": "map.pcd", "content": b"pcd-bytes"}
     assert writes[0][1]["scan_mode"] == "3d"
+    assert writes[0][1]["save_payload"] == "2d_pcd"
     assert pcd_modes == ["3d"]
-    assert infos
+
+
+def test_save_stcm_logs_mode_snapshot_before_writing_archive(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "demo-log.slam"
+    logs = []
+    monkeypatch.setattr("client_desktop.app.filedialog.asksaveasfilename", lambda **_kwargs: str(target))
+    monkeypatch.setattr("client_desktop.app.write_slam_archive", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("client_desktop.app.messagebox.showinfo", lambda *_args, **_kwargs: None)
+
+    client = build_minimal_client()
+    client.map_name_var = DummyVar("demo")
+    client.map_notes_var = DummyVar("")
+    client.camera_refresh_var = DummyVar("")
+    client.pose = {}
+    client.gps = {}
+    client.chassis = {}
+    client.logger = types.SimpleNamespace(
+        info=lambda msg, *args: logs.append(("info", msg, args)),
+        warning=lambda msg, *args: logs.append(("warning", msg, args)),
+    )
+    client.inspector = {"file": "", "manifest": None, "points": [], "pgm": "", "yaml": "", "json": "", "meta": {}, "pcd_file": None}
+    client.rebuild_path_nodes = lambda: None
+    client.apply_scan_fusion_config_from_ui = lambda: {"voxel_size": 0.1, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
+    client.active_voxel_size = lambda: 0.1
+    client.should_use_server_grid = lambda: False
+    client.browser_occupancy = lambda: {"occupied_cells": [], "free_cells": [], "map_fence_xy": [], "voxel_size": 0.1, "scan_fusion": {}}
+    client.occupied_points = lambda: [[1.0, 2.0, 1.0]]
+    client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
+    client.scan["mode"] = "2d"
+    client.scan_mode_var = DummyVar("3d")
+
+    DesktopClient.save_stcm(client)
+
+    matching = [entry for entry in logs if entry[1].startswith("save_stcm requested")]
+    assert matching
+    assert matching[0][2] == ("2d", "3d", "2d_only", False, 0, 1)
+
+
+def test_choose_3d_save_payload_defaults_to_2d_only(monkeypatch) -> None:
+    del monkeypatch
+    client = build_minimal_client()
+    client.root = None
+
+    payload = DesktopClient.choose_3d_save_payload(client)
+
+    assert payload == "2d_only"
+
+
+def test_save_stcm_3d_default_uses_2d_only_without_requesting_pcd(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "demo-3d-default.slam"
+    writes = []
+    monkeypatch.setattr("client_desktop.app.filedialog.asksaveasfilename", lambda **_kwargs: str(target))
+    monkeypatch.setattr("client_desktop.app.write_slam_archive", lambda path, manifest, points, pcd_file: writes.append((path, manifest, points, pcd_file)))
+    monkeypatch.setattr("client_desktop.app.messagebox.showinfo", lambda *_args, **_kwargs: None)
+
+    client = build_minimal_client()
+    client.map_name_var = DummyVar("demo")
+    client.map_notes_var = DummyVar("")
+    client.camera_refresh_var = DummyVar("")
+    client.pose = {}
+    client.gps = {}
+    client.chassis = {}
+    client.inspector = {"file": "", "manifest": None, "points": [], "pgm": "", "yaml": "", "json": "", "meta": {}, "pcd_file": None}
+    client.rebuild_path_nodes = lambda: None
+    client.apply_scan_fusion_config_from_ui = lambda: {"voxel_size": 0.1, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
+    client.active_voxel_size = lambda: 0.1
+    client.should_use_server_grid = lambda: False
+    client.browser_occupancy = lambda: {"occupied_cells": [], "free_cells": [], "map_fence_xy": [], "voxel_size": 0.1, "scan_fusion": {}}
+    client.occupied_points = lambda: [[1.0, 2.0, 1.0]]
+    client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
+    client.scan["mode"] = "2d"
+    client.scan_mode_var = DummyVar("3d")
+    client.choose_3d_save_payload = lambda: "2d_only"
+    client.ensure_scan_pcd = lambda mode=None: (_ for _ in ()).throw(AssertionError("pcd should not be requested"))
+
+    DesktopClient.save_stcm(client)
+
+    assert writes
+    assert writes[0][3] is None
+    assert writes[0][1]["scan_mode"] == "3d"
+    assert writes[0][1]["save_payload"] == "2d_only"
+    assert writes[0][1]["pcd"] == {"included": False, "file": ""}
+
+
+def test_save_stcm_3d_with_pcd_requests_and_writes_pcd(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "demo-3d-with-pcd.slam"
+    writes = []
+    monkeypatch.setattr("client_desktop.app.filedialog.asksaveasfilename", lambda **_kwargs: str(target))
+    monkeypatch.setattr("client_desktop.app.write_slam_archive", lambda path, manifest, points, pcd_file: writes.append((path, manifest, points, pcd_file)))
+    monkeypatch.setattr("client_desktop.app.messagebox.showinfo", lambda *_args, **_kwargs: None)
+
+    client = build_minimal_client()
+    client.map_name_var = DummyVar("demo")
+    client.map_notes_var = DummyVar("")
+    client.camera_refresh_var = DummyVar("")
+    client.pose = {}
+    client.gps = {}
+    client.chassis = {}
+    client.inspector = {"file": "", "manifest": None, "points": [], "pgm": "", "yaml": "", "json": "", "meta": {}, "pcd_file": None}
+    client.rebuild_path_nodes = lambda: None
+    client.apply_scan_fusion_config_from_ui = lambda: {"voxel_size": 0.1, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
+    client.active_voxel_size = lambda: 0.1
+    client.should_use_server_grid = lambda: False
+    client.browser_occupancy = lambda: {"occupied_cells": [], "free_cells": [], "map_fence_xy": [], "voxel_size": 0.1, "scan_fusion": {}}
+    client.occupied_points = lambda: [[1.0, 2.0, 1.0]]
+    client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
+    client.scan["mode"] = "2d"
+    client.scan_mode_var = DummyVar("3d")
+    client.choose_3d_save_payload = lambda: "2d_pcd"
+    client.ensure_scan_pcd = lambda mode=None: {"name": "map.pcd", "content": b"pcd-bytes"}
+
+    DesktopClient.save_stcm(client)
+
+    assert writes
+    assert writes[0][3]["name"] == "map.pcd"
+    assert writes[0][1]["scan_mode"] == "3d"
+    assert writes[0][1]["save_payload"] == "2d_pcd"
+    assert writes[0][1]["pcd"] == {"included": True, "file": "map.pcd"}
+
+
+def test_save_stcm_3d_with_pcd_aborts_when_pcd_missing(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "demo-3d-missing-pcd.slam"
+    writes = []
+    monkeypatch.setattr("client_desktop.app.filedialog.asksaveasfilename", lambda **_kwargs: str(target))
+    monkeypatch.setattr("client_desktop.app.write_slam_archive", lambda path, manifest, points, pcd_file: writes.append((path, manifest, points, pcd_file)))
+    monkeypatch.setattr("client_desktop.app.messagebox.showinfo", lambda *_args, **_kwargs: None)
+
+    client = build_minimal_client()
+    client.map_name_var = DummyVar("demo")
+    client.map_notes_var = DummyVar("")
+    client.camera_refresh_var = DummyVar("")
+    client.pose = {}
+    client.gps = {}
+    client.chassis = {}
+    client.inspector = {"file": "", "manifest": None, "points": [], "pgm": "", "yaml": "", "json": "", "meta": {}, "pcd_file": None}
+    client.rebuild_path_nodes = lambda: None
+    client.apply_scan_fusion_config_from_ui = lambda: {"voxel_size": 0.1, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
+    client.active_voxel_size = lambda: 0.1
+    client.should_use_server_grid = lambda: False
+    client.browser_occupancy = lambda: {"occupied_cells": [], "free_cells": [], "map_fence_xy": [], "voxel_size": 0.1, "scan_fusion": {}}
+    client.occupied_points = lambda: [[1.0, 2.0, 1.0]]
+    client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
+    client.scan["mode"] = "2d"
+    client.scan_mode_var = DummyVar("3d")
+    client.choose_3d_save_payload = lambda: "2d_pcd"
+    client.ensure_scan_pcd = lambda mode=None: None
+
+    DesktopClient.save_stcm(client)
+
+    assert not writes
+
+
+def test_save_stcm_3d_cancelled_payload_choice_aborts(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "demo-3d-cancelled.slam"
+    writes = []
+    monkeypatch.setattr("client_desktop.app.filedialog.asksaveasfilename", lambda **_kwargs: str(target))
+    monkeypatch.setattr("client_desktop.app.write_slam_archive", lambda path, manifest, points, pcd_file: writes.append((path, manifest, points, pcd_file)))
+    monkeypatch.setattr("client_desktop.app.messagebox.showinfo", lambda *_args, **_kwargs: None)
+
+    client = build_minimal_client()
+    client.map_name_var = DummyVar("demo")
+    client.map_notes_var = DummyVar("")
+    client.camera_refresh_var = DummyVar("")
+    client.pose = {}
+    client.gps = {}
+    client.chassis = {}
+    client.inspector = {"file": "", "manifest": None, "points": [], "pgm": "", "yaml": "", "json": "", "meta": {}, "pcd_file": None}
+    client.rebuild_path_nodes = lambda: None
+    client.apply_scan_fusion_config_from_ui = lambda: {"voxel_size": 0.1, "occupied_min_hits": 2, "occupied_over_free_ratio": 0.75, "turn_skip_wz": 0.45, "skip_turn_frames": True}
+    client.active_voxel_size = lambda: 0.1
+    client.should_use_server_grid = lambda: False
+    client.browser_occupancy = lambda: {"occupied_cells": [], "free_cells": [], "map_fence_xy": [], "voxel_size": 0.1, "scan_fusion": {}}
+    client.occupied_points = lambda: [[1.0, 2.0, 1.0]]
+    client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
+    client.scan["mode"] = "2d"
+    client.scan_mode_var = DummyVar("3d")
+    client.choose_3d_save_payload = lambda: None
+
+    DesktopClient.save_stcm(client)
+
+    assert not writes
 
 
 def test_export_pcd_warns_when_no_pcd_exists(monkeypatch) -> None:
@@ -632,6 +857,119 @@ def test_export_pcd_warns_when_no_pcd_exists(monkeypatch) -> None:
 
     assert warnings
     assert warnings[0][1] == "pcd_export_unavailable"
+
+
+def test_export_zip_writes_pgm_yaml_json_only(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "demo.zip"
+    infos = []
+    monkeypatch.setattr("client_desktop.app.filedialog.asksaveasfilename", lambda **_kwargs: str(target))
+    monkeypatch.setattr("client_desktop.app.messagebox.showinfo", lambda *args, **_kwargs: infos.append(args))
+    client = build_minimal_client()
+    client.inspector = {
+        "file": "demo.slam",
+        "manifest": {},
+        "points": [],
+        "pgm": "P2\n1 1\n255\n0\n",
+        "yaml": "image: demo.pgm\n",
+        "json": '{"demo": true}',
+        "meta": {},
+        "pcd_file": None,
+    }
+    client.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+
+    DesktopClient.export_inspector_file(client, "zip")
+
+    assert target.exists()
+    with zipfile.ZipFile(target, "r") as zf:
+        assert set(zf.namelist()) == {"demo.pgm", "demo.yaml", "demo.json"}
+        assert zf.read("demo.pgm").decode("utf-8") == "P2\n1 1\n255\n0\n"
+        assert zf.read("demo.yaml").decode("utf-8") == "image: demo.pgm\n"
+        assert zf.read("demo.json").decode("utf-8") == '{"demo": true}'
+    assert infos
+
+
+def test_export_zip_writes_pgm_name_referenced_by_yaml(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "desktop_map.zip"
+    monkeypatch.setattr("client_desktop.app.filedialog.asksaveasfilename", lambda **_kwargs: str(target))
+    monkeypatch.setattr("client_desktop.app.messagebox.showinfo", lambda *_args, **_kwargs: None)
+    client = build_minimal_client()
+    client.inspector = {
+        "file": "desktop_map.slam",
+        "manifest": {},
+        "points": [],
+        "pgm": "P2\n1 1\n255\n0\n",
+        "yaml": "image: desktop_map.pgm\nresolution: 0.1\norigin: [0.0, 0.0, 0]\n",
+        "json": '{"demo": true}',
+        "meta": {},
+        "pcd_file": None,
+    }
+    client.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+
+    DesktopClient.export_inspector_file(client, "zip")
+
+    with zipfile.ZipFile(target, "r") as zf:
+        assert set(zf.namelist()) == {"desktop_map.pgm", "desktop_map.yaml", "desktop_map.json"}
+        assert zf.read("desktop_map.pgm").decode("utf-8") == "P2\n1 1\n255\n0\n"
+        assert zf.read("desktop_map.yaml").decode("utf-8") == "image: desktop_map.pgm\nresolution: 0.1\norigin: [0.0, 0.0, 0]\n"
+        assert zf.read("desktop_map.json").decode("utf-8") == '{"demo": true}'
+
+    loaded = []
+    monkeypatch.setattr("client_desktop.app.filedialog.askopenfilename", lambda **_kwargs: str(target))
+    client.apply_stcm = lambda file_name, manifest, points, pcd_file=None: loaded.append((file_name, manifest, points, pcd_file))
+    client.set_inspector_bundle_state = lambda file_name, manifest, points: None
+
+    DesktopClient.load_stcm(client)
+
+    assert loaded
+    assert loaded[0][0] == "desktop_map.yaml"
+    assert loaded[0][1]["map_source"] == "native_pgm_yaml"
+
+
+def test_set_inspector_bundle_state_strips_engineering_occupancy_from_export_json() -> None:
+    client = build_minimal_client()
+    client.build_pgm_export = lambda manifest, points, resolution: {"pgm": "P2\n1 1\n255\n0\n", "origin": [0.0, 0.0, 0.0]}
+    client.build_yaml_export = lambda file_name, resolution, origin: "image: map.pgm\n"
+    manifest = {
+        "scan_mode": "2d",
+        "occupancy": {"occupied_cells": [{"ix": 1, "iy": 2}], "free_cells": [{"ix": 3, "iy": 4}]},
+        "browser_occupancy": {"occupied_cells": [{"ix": 5, "iy": 6}], "free_cells": [{"ix": 7, "iy": 8}]},
+        "poi": [],
+        "path": [],
+    }
+
+    DesktopClient.set_inspector_bundle_state(client, "demo.slam", manifest, [])
+
+    export_json = json.loads(client.inspector["json"])
+    assert "browser_occupancy" not in export_json
+    assert "occupancy" not in export_json
+
+
+def test_load_stcm_imports_export_zip_via_native_map_import(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "map_export.zip"
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("map.pgm", "P2\n1 1\n255\n0\n")
+        zf.writestr("map.yaml", "image: map.pgm\nresolution: 0.1\norigin: [0.0, 0.0, 0]\nnegate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.196\n")
+        zf.writestr("map.json", '{"source_file": "demo.slam"}')
+
+    monkeypatch.setattr("client_desktop.app.filedialog.askopenfilename", lambda **_kwargs: str(target))
+    monkeypatch.setattr("client_desktop.app.messagebox.showinfo", lambda *_args, **_kwargs: None)
+
+    imported = []
+    monkeypatch.setattr(
+        "client_desktop.app.NativeMapImportTool.import_map",
+        lambda path: imported.append(Path(path)) or types.SimpleNamespace(file_name="map.yaml", manifest={"scan_mode": "2d", "poi": [], "path": [], "browser_occupancy": {"occupied_cells": [], "free_cells": [], "voxel_size": 0.1}}, radar_points=[]),
+    )
+
+    client = build_minimal_client()
+    client.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+    client.apply_stcm = lambda file_name, manifest, points, pcd_file=None: None
+    client.set_inspector_bundle_state = lambda file_name, manifest, points: None
+
+    DesktopClient.load_stcm(client)
+
+    assert imported
+    assert imported[0].suffix == ".yaml"
+    assert imported[0].name == "map.yaml"
 
 
 def test_export_pcd_writes_current_pcd_bytes(tmp_path: Path, monkeypatch) -> None:
