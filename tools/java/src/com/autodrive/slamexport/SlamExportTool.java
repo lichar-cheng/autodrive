@@ -9,7 +9,6 @@ import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -25,13 +24,16 @@ public final class SlamExportTool {
     public static LoadedSlam load(Path path) throws IOException {
         byte[] manifestBytes = null;
         byte[] gridBytes = null;
+        LinkedHashMap<String, byte[]> archiveEntries = new LinkedHashMap<String, byte[]>();
         try (ZipInputStream zis = new ZipInputStream(Files.newInputStream(path))) {
             ZipEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
+                byte[] entryBytes = readAllBytes(zis);
+                archiveEntries.put(entry.getName(), entryBytes);
                 if ("manifest.json".equals(entry.getName())) {
-                    manifestBytes = readAllBytes(zis);
+                    manifestBytes = entryBytes;
                 } else if ("grid.bin".equals(entry.getName())) {
-                    gridBytes = readAllBytes(zis);
+                    gridBytes = entryBytes;
                 }
             }
         }
@@ -39,8 +41,9 @@ public final class SlamExportTool {
             throw new IOException(".slam archive must contain manifest.json and grid.bin");
         }
         Map<String, Object> manifest = parseManifest(new String(manifestBytes, StandardCharsets.UTF_8));
+        byte[] pcdBytes = attachPcdPayload(manifest, archiveEntries);
         Map<String, Object> occupancyGrid = buildOccupancyGrid(manifest, gridBytes);
-        return new LoadedSlam(manifest, occupancyGrid);
+        return new LoadedSlam(manifest, occupancyGrid, pcdBytes);
     }
 
     @SuppressWarnings("unchecked")
@@ -57,9 +60,35 @@ public final class SlamExportTool {
     }
 
     public static ExportArtifacts buildExports(String sourceFile, Map<String, Object> manifest, Map<String, Object> occupancyGrid, double resolution, int paddingCells) {
+        return buildExports(sourceFile, manifest, occupancyGrid, null, resolution, paddingCells);
+    }
+
+    @SuppressWarnings("unchecked")
+    public static ExportArtifacts buildExports(
+        String sourceFile,
+        Map<String, Object> manifest,
+        Map<String, Object> occupancyGrid,
+        byte[] pcdBytes,
+        double resolution,
+        int paddingCells
+    ) {
         PgmMetadata pgm = buildPgm(occupancyGrid, resolution, paddingCells);
         String yaml = buildYamlText(sourceFile, getDouble(occupancyGrid, "resolution", resolution), pgm.getOrigin());
         Map<String, Object> exportManifest = deepCopyMap(manifest);
+        byte[] exportPcdBytes = pcdBytes;
+        Object rawPcdMeta = exportManifest.get("pcd_file");
+        if (rawPcdMeta instanceof Map) {
+            Map<String, Object> pcdMeta = (Map<String, Object>) rawPcdMeta;
+            if (Boolean.TRUE.equals(pcdMeta.get("included"))) {
+                if (exportPcdBytes == null && pcdMeta.get("content") instanceof byte[]) {
+                    exportPcdBytes = ((byte[]) pcdMeta.get("content")).clone();
+                }
+                Map<String, Object> sanitizedPcdMeta = new LinkedHashMap<String, Object>();
+                sanitizedPcdMeta.put("name", replaceExtension(sourceFile, ".pcd"));
+                sanitizedPcdMeta.put("included", Boolean.TRUE);
+                exportManifest.put("pcd_file", sanitizedPcdMeta);
+            }
+        }
 
         Map<String, Object> mapYaml = new LinkedHashMap<String, Object>();
         mapYaml.put("image", replaceExtension(sourceFile, ".pgm"));
@@ -82,17 +111,27 @@ public final class SlamExportTool {
         exportJson.put("pgm_meta", pgmMeta);
         exportJson.put("manifest", exportManifest);
 
-        return new ExportArtifacts(pgm, yaml, toJson(exportJson, 0));
+        return new ExportArtifacts(pgm, yaml, toJson(exportJson, 0), exportPcdBytes);
     }
 
     public static ExportArtifacts export(Path slamPath, Path outputDir, double resolution, int paddingCells) throws IOException {
         LoadedSlam loaded = load(slamPath);
-        ExportArtifacts artifacts = buildExports(slamPath.getFileName().toString(), loaded.getManifest(), loaded.getOccupancyGrid(), resolution, paddingCells);
+        ExportArtifacts artifacts = buildExports(
+            slamPath.getFileName().toString(),
+            loaded.getManifest(),
+            loaded.getOccupancyGrid(),
+            loaded.getPcdContent(),
+            resolution,
+            paddingCells
+        );
         Files.createDirectories(outputDir);
         String stem = baseName(slamPath.getFileName().toString());
-        Files.writeString(outputDir.resolve(stem + ".pgm"), artifacts.getPgmText(), StandardCharsets.UTF_8);
-        Files.writeString(outputDir.resolve(stem + ".yaml"), artifacts.getYamlText(), StandardCharsets.UTF_8);
-        Files.writeString(outputDir.resolve(stem + ".json"), artifacts.getJsonText(), StandardCharsets.UTF_8);
+        writeUtf8(outputDir.resolve(stem + ".pgm"), artifacts.getPgmText());
+        writeUtf8(outputDir.resolve(stem + ".yaml"), artifacts.getYamlText());
+        writeUtf8(outputDir.resolve(stem + ".json"), artifacts.getJsonText());
+        if (artifacts.getPcdBytes() != null) {
+            Files.write(outputDir.resolve(stem + ".pcd"), artifacts.getPcdBytes());
+        }
         return artifacts;
     }
 
@@ -102,7 +141,9 @@ public final class SlamExportTool {
         int width = (int) Math.round(getDouble(occupancyGrid, "width", 0.0));
         int height = (int) Math.round(getDouble(occupancyGrid, "height", 0.0));
         double gridResolution = Math.max(0.02, getDouble(occupancyGrid, "resolution", resolution));
-        List<Object> data = occupancyGrid.get("data") instanceof List ? (List<Object>) occupancyGrid.get("data") : List.of();
+        List<Object> data = occupancyGrid.get("data") instanceof List
+            ? (List<Object>) occupancyGrid.get("data")
+            : new ArrayList<Object>();
         if (width <= 0 || height <= 0 || data.size() != width * height) {
             throw new IllegalArgumentException("No occupancy grid in SLAM");
         }
@@ -125,7 +166,9 @@ public final class SlamExportTool {
         }
         rows.append("\n");
 
-        Map<String, Object> originMeta = occupancyGrid.get("origin") instanceof Map ? (Map<String, Object>) occupancyGrid.get("origin") : Map.of();
+        Map<String, Object> originMeta = occupancyGrid.get("origin") instanceof Map
+            ? (Map<String, Object>) occupancyGrid.get("origin")
+            : new LinkedHashMap<String, Object>();
         double originX = getDouble(originMeta, "x", 0.0);
         double originY = getDouble(originMeta, "y", 0.0);
         int occupiedCount = 0;
@@ -134,7 +177,10 @@ public final class SlamExportTool {
                 occupiedCount += 1;
             }
         }
-        List<Double> origin = List.of(round3(originX), round3(originY), 0.0);
+        List<Double> origin = new ArrayList<Double>();
+        origin.add(round3(originX));
+        origin.add(round3(originY));
+        origin.add(0.0);
         Map<String, Double> bounds = new LinkedHashMap<String, Double>();
         bounds.put("minX", round3(originX));
         bounds.put("maxX", round3(originX + width * gridResolution));
@@ -176,6 +222,42 @@ public final class SlamExportTool {
         return out.toByteArray();
     }
 
+    @SuppressWarnings("unchecked")
+    private static byte[] attachPcdPayload(Map<String, Object> manifest, Map<String, byte[]> archiveEntries) {
+        Map<String, Object> pcdMeta = readPcdMeta(manifest.get("pcd_file"), "name");
+        if (pcdMeta == null) {
+            pcdMeta = readPcdMeta(manifest.get("pcd"), "file");
+        }
+        if (pcdMeta == null) {
+            return null;
+        }
+        String pcdName = String.valueOf(pcdMeta.get("resolved_name"));
+        byte[] pcdBytes = archiveEntries.get(pcdName);
+        if (pcdBytes == null) {
+            throw new IllegalArgumentException("PCD entry missing from SLAM archive: " + pcdName);
+        }
+        Map<String, Object> manifestPcdMeta = new LinkedHashMap<String, Object>();
+        manifestPcdMeta.put("name", pcdName);
+        manifestPcdMeta.put("included", Boolean.TRUE);
+        manifestPcdMeta.put("content", pcdBytes.clone());
+        manifest.put("pcd_file", manifestPcdMeta);
+        return pcdBytes.clone();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> readPcdMeta(Object rawPcdMeta, String nameKey) {
+        if (!(rawPcdMeta instanceof Map)) {
+            return null;
+        }
+        Map<String, Object> pcdMeta = (Map<String, Object>) rawPcdMeta;
+        if (!Boolean.TRUE.equals(pcdMeta.get("included"))) {
+            return null;
+        }
+        Map<String, Object> normalized = new LinkedHashMap<String, Object>(pcdMeta);
+        normalized.put("resolved_name", String.valueOf(pcdMeta.get(nameKey) == null ? "map.pcd" : pcdMeta.get(nameKey)));
+        return normalized;
+    }
+
     private static String replaceExtension(String fileName, String extension) {
         return baseName(fileName) + extension;
     }
@@ -183,6 +265,10 @@ public final class SlamExportTool {
     private static String baseName(String fileName) {
         int index = fileName.lastIndexOf('.');
         return index >= 0 ? fileName.substring(0, index) : fileName;
+    }
+
+    private static void writeUtf8(Path path, String text) throws IOException {
+        Files.write(path, text.getBytes(StandardCharsets.UTF_8));
     }
 
     private static double getDouble(Map<String, Object> map, String key, double defaultValue) {
@@ -288,7 +374,11 @@ public final class SlamExportTool {
     }
 
     private static String spaces(int count) {
-        return " ".repeat(Math.max(0, count));
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < Math.max(0, count); i++) {
+            builder.append(' ');
+        }
+        return builder.toString();
     }
 
     private static String escapeJson(String text) {

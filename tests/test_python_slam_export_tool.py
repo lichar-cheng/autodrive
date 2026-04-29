@@ -1,14 +1,28 @@
 import json
+import importlib.util
+import sys
 import zipfile
 from pathlib import Path
 
 from tools.slam_export_tool import SlamExportTool
 
 
-def write_slam(path: Path, manifest: dict, grid: dict) -> None:
+def write_slam(path: Path, manifest: dict, grid: dict, pcd_name: str | None = None, pcd_content: bytes | None = None) -> None:
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         zf.writestr("grid.bin", bytes((int(value) & 0xFF) for value in grid["data"]))
+        if pcd_name is not None:
+            zf.writestr(pcd_name, pcd_content or b"")
+
+
+def load_standalone_python_module():
+    module_path = Path(__file__).resolve().parents[1] / "tools" / "python" / "slam_export_tool.py"
+    spec = importlib.util.spec_from_file_location("standalone_slam_export_tool", module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_load_reads_manifest_and_occupancy_grid(tmp_path: Path) -> None:
@@ -86,6 +100,148 @@ def test_export_writes_pgm_yaml_and_json(tmp_path: Path) -> None:
     assert (output_dir / "demo.yaml").exists()
     assert (output_dir / "demo.json").exists()
     assert artifacts.pgm_meta["width"] >= 1
+
+
+def test_load_reads_optional_pcd_payload(tmp_path: Path) -> None:
+    slam_path = tmp_path / "demo.slam"
+    write_slam(
+        slam_path,
+        {
+            "name": "demo",
+            "version": "slam.v4",
+            "map_storage": "occupancy_grid",
+            "pcd_file": {"name": "map.pcd", "included": True},
+            "occupancy_grid": {
+                "width": 1,
+                "height": 1,
+                "resolution": 0.1,
+                "origin": {"x": 0.0, "y": 0.0},
+                "encoding": "int8",
+                "values": {"unknown": -1, "free": 0, "occupied": 100},
+            },
+        },
+        {"width": 1, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}, "data": [100]},
+        pcd_name="map.pcd",
+        pcd_content=b"pcd-bytes",
+    )
+
+    loaded = SlamExportTool.load(slam_path)
+
+    assert loaded.manifest["pcd_file"]["name"] == "map.pcd"
+    assert loaded.manifest["pcd_file"]["content"] == b"pcd-bytes"
+
+
+def test_export_writes_same_stem_pcd_when_present(tmp_path: Path) -> None:
+    slam_path = tmp_path / "demo.slam"
+    output_dir = tmp_path / "out"
+    write_slam(
+        slam_path,
+        {
+            "name": "demo",
+            "version": "slam.v4",
+            "map_storage": "occupancy_grid",
+            "pcd_file": {"name": "map.pcd", "included": True},
+            "occupancy_grid": {
+                "width": 1,
+                "height": 1,
+                "resolution": 0.1,
+                "origin": {"x": 0.0, "y": 0.0},
+                "encoding": "int8",
+                "values": {"unknown": -1, "free": 0, "occupied": 100},
+            },
+        },
+        {"width": 1, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}, "data": [100]},
+        pcd_name="map.pcd",
+        pcd_content=b"pcd-bytes",
+    )
+
+    SlamExportTool.export(slam_path, output_dir, resolution=0.1, padding_cells=2)
+
+    assert (output_dir / "demo.pcd").read_bytes() == b"pcd-bytes"
+
+
+def test_export_writes_same_stem_pcd_for_desktop_archive_format(tmp_path: Path) -> None:
+    slam_path = tmp_path / "desktop_map_pcd.slam"
+    output_dir = tmp_path / "out"
+    write_slam(
+        slam_path,
+        {
+            "name": "demo",
+            "version": "slam.v4",
+            "map_storage": "occupancy_grid",
+            "pcd": {"included": True, "file": "scans.pcd"},
+            "occupancy_grid": {
+                "width": 1,
+                "height": 1,
+                "resolution": 0.1,
+                "origin": {"x": 0.0, "y": 0.0},
+                "encoding": "int8",
+                "values": {"unknown": -1, "free": 0, "occupied": 100},
+            },
+        },
+        {"width": 1, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}, "data": [100]},
+        pcd_name="scans.pcd",
+        pcd_content=b"pcd-bytes",
+    )
+
+    SlamExportTool.export(slam_path, output_dir, resolution=0.1, padding_cells=2)
+
+    assert (output_dir / "desktop_map_pcd.pcd").read_bytes() == b"pcd-bytes"
+
+
+def test_python_standalone_module_is_self_contained() -> None:
+    module_path = Path(__file__).resolve().parents[1] / "tools" / "python" / "slam_export_tool.py"
+    module_source = module_path.read_text(encoding="utf-8")
+
+    assert "from tools.slam_export_tool import" not in module_source
+
+    module = load_standalone_python_module()
+
+    assert hasattr(module, "SlamExportTool")
+
+
+def test_python_standalone_module_keeps_only_slam_export_surface() -> None:
+    module = load_standalone_python_module()
+
+    assert hasattr(module.SlamExportTool, "load")
+    assert hasattr(module.SlamExportTool, "build_exports")
+    assert hasattr(module.SlamExportTool, "export")
+    assert not hasattr(module.SlamExportTool, "import_native_map")
+    assert not hasattr(module.SlamExportTool, "resolve_native_map_yaml_path")
+
+
+def test_python_standalone_module_exports_slam_bundle(tmp_path: Path) -> None:
+    module = load_standalone_python_module()
+    slam_path = tmp_path / "demo.slam"
+    output_dir = tmp_path / "out"
+    write_slam(
+        slam_path,
+        {
+            "name": "demo",
+            "version": "slam.v4",
+            "map_storage": "occupancy_grid",
+            "pcd_file": {"name": "map.pcd", "included": True},
+            "occupancy_grid": {
+                "width": 1,
+                "height": 1,
+                "resolution": 0.1,
+                "origin": {"x": 0.0, "y": 0.0},
+                "encoding": "int8",
+                "values": {"unknown": -1, "free": 0, "occupied": 100},
+            },
+        },
+        {"width": 1, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}, "data": [100]},
+        pcd_name="map.pcd",
+        pcd_content=b"pcd-bytes",
+    )
+
+    artifacts = module.SlamExportTool.export(slam_path, output_dir, resolution=0.1, padding_cells=0)
+
+    assert artifacts.pgm_meta["occupied_cells"] == 1
+    assert (output_dir / "demo.pgm").exists()
+    assert (output_dir / "demo.yaml").exists()
+    assert (output_dir / "demo.json").exists()
+    assert (output_dir / "demo.pcd").read_bytes() == b"pcd-bytes"
 
 
 def test_import_native_map_reads_yaml_and_pgm_into_occupancy_grid(tmp_path: Path) -> None:

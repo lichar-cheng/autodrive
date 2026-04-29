@@ -1,6 +1,7 @@
 package com.autodrive.slamexport;
 
 import java.util.Collections;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -17,7 +18,7 @@ public final class PgmMetadata {
         this.pgmText = pgmText;
         this.width = width;
         this.height = height;
-        this.origin = List.copyOf(origin);
+        this.origin = Collections.unmodifiableList(new ArrayList<Double>(origin));
         this.occupiedCells = occupiedCells;
         this.bounds = Collections.unmodifiableMap(new LinkedHashMap<String, Double>(bounds));
     }

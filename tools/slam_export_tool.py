@@ -20,6 +20,7 @@ class ExportArtifacts:
     yaml_text: str
     json_text: str
     pgm_meta: dict[str, Any]
+    pcd_bytes: bytes | None = None
 
 
 class SlamExportTool:
@@ -112,6 +113,9 @@ class SlamExportTool:
         with zipfile.ZipFile(slam_path, "r") as zf:
             manifest = json.loads(zf.read("manifest.json"))
             blob = zf.read("grid.bin")
+            pcd_payload = SlamExportTool._load_embedded_pcd(manifest, zf)
+            if pcd_payload is not None:
+                manifest["pcd_file"] = pcd_payload
         occupancy_grid = dict(manifest.get("occupancy_grid") or {})
         occupancy_grid["data"] = [value - 256 if value >= 128 else value for value in blob]
         return LoadedSlam(manifest=manifest, occupancy_grid=occupancy_grid)
@@ -127,6 +131,14 @@ class SlamExportTool:
         pgm = SlamExportTool._build_pgm(occupancy_grid, resolution, padding_cells)
         yaml_text = SlamExportTool._build_yaml(source_file, resolution, pgm["origin"])
         export_manifest = dict(manifest)
+        pcd_bytes = None
+        pcd_meta = export_manifest.get("pcd_file")
+        if isinstance(pcd_meta, dict) and pcd_meta.get("included"):
+            pcd_bytes = pcd_meta.get("content")
+            export_manifest["pcd_file"] = {
+                "name": f"{Path(source_file).stem}.pcd",
+                "included": True,
+            }
         json_text = json.dumps(
             {
                 "source_file": source_file,
@@ -150,7 +162,13 @@ class SlamExportTool:
             ensure_ascii=False,
             indent=2,
         )
-        return ExportArtifacts(pgm_text=pgm["pgm"], yaml_text=yaml_text, json_text=json_text, pgm_meta=pgm)
+        return ExportArtifacts(
+            pgm_text=pgm["pgm"],
+            yaml_text=yaml_text,
+            json_text=json_text,
+            pgm_meta=pgm,
+            pcd_bytes=bytes(pcd_bytes) if pcd_bytes is not None else None,
+        )
 
     @staticmethod
     def export(path: str | Path, output_dir: str | Path, resolution: float, padding_cells: int = 8) -> ExportArtifacts:
@@ -169,6 +187,8 @@ class SlamExportTool:
         (output_path / f"{stem}.pgm").write_text(artifacts.pgm_text, encoding="utf-8")
         (output_path / f"{stem}.yaml").write_text(artifacts.yaml_text, encoding="utf-8")
         (output_path / f"{stem}.json").write_text(artifacts.json_text, encoding="utf-8")
+        if artifacts.pcd_bytes is not None:
+            (output_path / f"{stem}.pcd").write_bytes(artifacts.pcd_bytes)
         return artifacts
 
     @staticmethod
@@ -222,6 +242,18 @@ class SlamExportTool:
                 "free_thresh: 0.196",
             ]
         )
+
+    @staticmethod
+    def _load_embedded_pcd(manifest: dict[str, Any], archive: zipfile.ZipFile) -> dict[str, Any] | None:
+        pcd_meta = manifest.get("pcd_file")
+        if isinstance(pcd_meta, dict) and pcd_meta.get("included"):
+            pcd_name = str(pcd_meta.get("name", "map.pcd"))
+            return {"name": pcd_name, "included": True, "content": archive.read(pcd_name)}
+        legacy_meta = manifest.get("pcd")
+        if isinstance(legacy_meta, dict) and legacy_meta.get("included"):
+            pcd_name = str(legacy_meta.get("file", "map.pcd"))
+            return {"name": pcd_name, "included": True, "content": archive.read(pcd_name)}
+        return None
 
     @staticmethod
     def _parse_native_map_yaml(path: Path) -> dict[str, Any]:
