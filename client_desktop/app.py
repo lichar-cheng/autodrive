@@ -3899,6 +3899,10 @@ class DesktopClient:
             bundle["pcd"] = {"included": False, "file": ""}
         manifest = dict(bundle)
         write_slam_archive(target, manifest, grid, pcd_file)
+        if isinstance(pcd_file, dict):
+            self.scan["pcd_name"] = ""
+            self.scan["pcd_bytes"] = b""
+            self.scan["pcd_received_at"] = 0
         self.scan["last_saved_file"] = target
         self.scan["saved_point_count"] = grid_counts["obstacle"]
         self.sync_scan_badges()

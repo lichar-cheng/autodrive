@@ -33,6 +33,7 @@ from .ros_bridge import RosRuntime, detect_ros
 from .simulator import Simulator
 from .stcm_codec import load_stcm, save_stcm
 from .topic_bus import TopicBus
+from .ultrasonic_safety import UltrasonicSafetyRuntime
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -86,7 +87,9 @@ CONTROL_RUNTIME = {
     "last_logged_velocity": None,
     "last_logged_yaw_rate": None,
 }
+CONTROL_OUTPUT_STATE = {"velocity": 0.0, "yaw_rate": 0.0, "updated_at": 0.0}
 control_task: asyncio.Task | None = None
+ULTRASONIC_RUNTIME = UltrasonicSafetyRuntime(CONFIG.ultrasonic_safety)
 
 
 STREAM_TOPICS = [
@@ -187,6 +190,10 @@ def _thin_points(points: list[list[float]] | list[tuple[float, float, float]], l
     step = max(1, len(points) // limit)
     sampled = points[::step][:limit]
     return [list(p) for p in sampled]
+
+
+def _is_websocket_send_after_close_error(exc: RuntimeError) -> bool:
+    return 'Cannot call "send" once a close message has been sent.' in str(exc)
 
 
 def _reset_scan_session(voxel_size: float | None = None, keep_points: bool = False) -> None:
@@ -884,7 +891,38 @@ def _control_target_health(now: float | None = None) -> dict[str, Any]:
         "last_publish_source": str(CONTROL_RUNTIME["last_publish_source"]),
         "last_zero_source": str(CONTROL_RUNTIME["last_zero_source"]),
         "last_zero_at": float(CONTROL_RUNTIME["last_zero_at"]),
+        "ultrasonic_safety": ULTRASONIC_RUNTIME.snapshot().as_dict(),
     }
+
+
+def _apply_ultrasonic_control_gate(velocity: float, yaw_rate: float, now: float | None = None) -> tuple[float, float, str]:
+    return ULTRASONIC_RUNTIME.gate_command(velocity, yaw_rate, now=now)
+
+
+def _step_towards(current: float, target: float, max_accel: float, max_decel: float, dt: float) -> float:
+    current = float(current)
+    target = float(target)
+    if target > current:
+        delta = min(target - current, max_accel * dt)
+        return current + delta
+    delta = min(current - target, max_decel * dt)
+    return current - delta
+
+
+def _smooth_control_command(target_velocity: float, target_yaw_rate: float, now: float | None = None, forced_stop: bool = False) -> tuple[float, float]:
+    current_time = time.time() if now is None else float(now)
+    updated_at = float(CONTROL_OUTPUT_STATE.get("updated_at", 0.0) or 0.0)
+    dt = CONTROL_PUBLISH_INTERVAL_SEC if updated_at <= 0.0 else max(0.001, min(1.0, current_time - updated_at))
+    linear_accel = max(0.01, float(CONFIG.ultrasonic_safety.linear_accel_mps2))
+    linear_decel = max(0.01, float(CONFIG.ultrasonic_safety.linear_emergency_decel_mps2 if forced_stop else CONFIG.ultrasonic_safety.linear_decel_mps2))
+    angular_accel = max(0.01, float(CONFIG.ultrasonic_safety.angular_accel_rps2))
+    angular_decel = max(0.01, float(CONFIG.ultrasonic_safety.angular_emergency_decel_rps2 if forced_stop else CONFIG.ultrasonic_safety.angular_decel_rps2))
+    next_velocity = _step_towards(float(CONTROL_OUTPUT_STATE.get("velocity", 0.0) or 0.0), float(target_velocity), linear_accel, linear_decel, dt)
+    next_yaw_rate = _step_towards(float(CONTROL_OUTPUT_STATE.get("yaw_rate", 0.0) or 0.0), float(target_yaw_rate), angular_accel, angular_decel, dt)
+    CONTROL_OUTPUT_STATE["velocity"] = float(next_velocity)
+    CONTROL_OUTPUT_STATE["yaw_rate"] = float(next_yaw_rate)
+    CONTROL_OUTPUT_STATE["updated_at"] = current_time
+    return float(next_velocity), float(next_yaw_rate)
 
 
 def _record_control_publish_source(source: str, velocity: float, yaw_rate: float) -> None:
@@ -921,12 +959,16 @@ def _record_control_publish_source(source: str, velocity: float, yaw_rate: float
         CONTROL_RUNTIME["last_zero_at"] = time.time()
 
 
-def _publish_control_command(velocity: float, yaw_rate: float, source: str) -> None:
-    _record_control_publish_source(source, velocity, yaw_rate)
+def _publish_control_command(velocity: float, yaw_rate: float, source: str, now: float | None = None) -> None:
+    gated_velocity, gated_yaw_rate, gate_reason = _apply_ultrasonic_control_gate(velocity, yaw_rate, now=now)
+    forced_stop = gate_reason != "clear" and (abs(float(velocity)) > 1e-9 or abs(float(yaw_rate)) > 1e-9)
+    publish_source = source if gate_reason == "clear" else f"{source}_ultrasonic_{gate_reason}"
+    smoothed_velocity, smoothed_yaw_rate = _smooth_control_command(gated_velocity, gated_yaw_rate, now=now, forced_stop=forced_stop)
+    _record_control_publish_source(publish_source, smoothed_velocity, smoothed_yaw_rate)
     if ros.enabled and ros.bridge is not None:
-        ros.bridge.publish_cmd_vel(velocity, yaw_rate)
+        ros.bridge.publish_cmd_vel(smoothed_velocity, smoothed_yaw_rate)
     else:
-        sim.set_motion(velocity, yaw_rate)
+        sim.set_motion(smoothed_velocity, smoothed_yaw_rate)
 
 
 async def _control_publisher_loop() -> None:
@@ -975,6 +1017,7 @@ async def startup() -> None:
         if CONFIG.ros.fallback_to_simulator_on_failure:
             await sim.start()
             logger.info("Simulator fallback started")
+    ULTRASONIC_RUNTIME.start()
     control_task = asyncio.create_task(_control_publisher_loop())
 
 
@@ -988,6 +1031,7 @@ async def shutdown() -> None:
         except asyncio.CancelledError:
             pass
         control_task = None
+    ULTRASONIC_RUNTIME.stop()
     if ros.enabled and ros.bridge is not None:
         ros.bridge.stop()
     if sim._running:
@@ -1264,10 +1308,16 @@ async def move(cmd: MoveCommand) -> dict:
         global motion_command_seq
         motion_command_seq += 1
         command_seq = motion_command_seq
-        ros.bridge.publish_cmd_vel(cmd.velocity, cmd.yaw_rate)
+        CONTROL_TARGET["velocity"] = float(cmd.velocity)
+        CONTROL_TARGET["yaw_rate"] = float(cmd.yaw_rate)
+        CONTROL_TARGET["updated_at"] = time.time()
+        _publish_control_command(float(cmd.velocity), float(cmd.yaw_rate), "api_move")
         await asyncio.sleep(cmd.duration)
         if command_seq == motion_command_seq:
-            ros.bridge.stop_motion()
+            CONTROL_TARGET["velocity"] = 0.0
+            CONTROL_TARGET["yaw_rate"] = 0.0
+            CONTROL_TARGET["updated_at"] = time.time()
+            _publish_control_command(0.0, 0.0, "api_move_stop")
         state = {
             "pose": ros.bridge.latest_pose(),
             "gps": ros.bridge.latest_gps(),
@@ -1287,16 +1337,14 @@ async def set_control_target(cmd: ControlTargetRequest) -> dict:
     CONTROL_TARGET["yaw_rate"] = float(cmd.yaw_rate)
     CONTROL_TARGET["updated_at"] = time.time()
     if ros.enabled and ros.bridge is not None:
-        _record_control_publish_source("api_target", float(cmd.velocity), float(cmd.yaw_rate))
-        ros.bridge.publish_cmd_vel(float(cmd.velocity), float(cmd.yaw_rate))
+        _publish_control_command(float(cmd.velocity), float(cmd.yaw_rate), "api_target")
         state = {
             "pose": ros.bridge.latest_pose(),
             "gps": ros.bridge.latest_gps(),
             "chassis": ros.bridge.latest_chassis(),
         }
         return {"ok": True, "msg": "control target applied", "state": state}
-    _record_control_publish_source("api_target", float(cmd.velocity), float(cmd.yaw_rate))
-    sim.set_motion(float(cmd.velocity), float(cmd.yaw_rate))
+    _publish_control_command(float(cmd.velocity), float(cmd.yaw_rate), "api_target")
     return {"ok": True, "msg": "control target applied", "state": sim.state.__dict__}
 
 
@@ -1307,11 +1355,7 @@ async def stop() -> dict:
     CONTROL_TARGET["velocity"] = 0.0
     CONTROL_TARGET["yaw_rate"] = 0.0
     CONTROL_TARGET["updated_at"] = time.time()
-    _record_control_publish_source("api_stop", 0.0, 0.0)
-    if ros.enabled and ros.bridge is not None:
-        ros.bridge.stop_motion()
-    else:
-        sim.stop_motion()
+    _publish_control_command(0.0, 0.0, "api_stop")
     return {"ok": True}
 
 
@@ -1506,6 +1550,8 @@ async def ws_stream(websocket: WebSocket) -> None:
     ws_last_warn_local = 0.0
     last_client_activity = time.time()
     closed_by_server_timeout = False
+    disconnect_reason = "client_disconnect"
+    disconnect_detail = ""
 
     def maybe_warn_capacity(fill_ratio: float, reason: str) -> None:
         nonlocal ws_last_warn_local
@@ -1588,32 +1634,55 @@ async def ws_stream(websocket: WebSocket) -> None:
             enqueue_nonblocking(("json", packed), reason=topic)
 
     async def monitor_client_idle() -> None:
-        nonlocal closed_by_server_timeout
+        nonlocal closed_by_server_timeout, disconnect_reason, disconnect_detail
         while True:
             await asyncio.sleep(2.0)
             idle_sec = time.time() - last_client_activity
             if idle_sec > CLIENT_IDLE_TIMEOUT_SEC:
                 SERVER_RUNTIME["forced_disconnect_total"] += 1
                 closed_by_server_timeout = True
+                disconnect_reason = "idle_timeout"
+                disconnect_detail = f"idle_sec={idle_sec:.1f}"
                 logger.warning("ws idle timeout id=%s idle_sec=%.1f, force disconnect", ws_id, idle_sec)
-                await websocket.close(code=4001, reason="idle_timeout")
+                try:
+                    await websocket.close(code=4001, reason="idle_timeout")
+                except Exception as exc:  # noqa: BLE001
+                    logger.info("ws close ignored id=%s reason=idle_timeout detail=%s", ws_id, exc)
                 return
 
     async def send_outbound() -> None:
-        nonlocal last_client_activity
+        nonlocal last_client_activity, disconnect_reason, disconnect_detail
         while True:
             message_type, payload = await outbound_queue.get()
-            if message_type == "json":
-                await websocket.send_json(payload)
-                last_client_activity = time.time()
-            elif message_type == "text":
-                await websocket.send_text(payload)
-                last_client_activity = time.time()
+            try:
+                if message_type == "json":
+                    await websocket.send_json(payload)
+                    last_client_activity = time.time()
+                elif message_type == "text":
+                    await websocket.send_text(payload)
+                    last_client_activity = time.time()
+            except WebSocketDisconnect:
+                disconnect_reason = "client_disconnect"
+                disconnect_detail = f"send_{message_type}"
+                logger.info("ws send interrupted id=%s reason=%s detail=%s", ws_id, disconnect_reason, disconnect_detail)
+                raise
+            except RuntimeError as exc:
+                if _is_websocket_send_after_close_error(exc):
+                    disconnect_reason = "send_after_close"
+                    disconnect_detail = f"send_{message_type}"
+                    logger.info("ws send skipped after close id=%s reason=%s detail=%s", ws_id, disconnect_reason, disconnect_detail)
+                    raise WebSocketDisconnect() from exc
+                raise
 
     async def receive_keepalive() -> None:
-        nonlocal last_client_activity
+        nonlocal last_client_activity, disconnect_reason, disconnect_detail
         while True:
-            client_msg = await websocket.receive_text()
+            try:
+                client_msg = await websocket.receive_text()
+            except WebSocketDisconnect:
+                disconnect_reason = "client_disconnect"
+                disconnect_detail = "receive_text"
+                raise
             last_client_activity = time.time()
             if client_msg == "ping":
                 enqueue_nonblocking(("text", "pong"), reason="keepalive")
@@ -1631,9 +1700,9 @@ async def ws_stream(websocket: WebSocket) -> None:
                 raise exc
     except WebSocketDisconnect:
         if closed_by_server_timeout:
-            logger.warning("ws disconnected by server timeout id=%s", ws_id)
+            logger.warning("ws disconnected id=%s reason=%s detail=%s", ws_id, disconnect_reason, disconnect_detail or "server_close")
         else:
-            logger.warning("ws disconnected id=%s", ws_id)
+            logger.warning("ws disconnected id=%s reason=%s detail=%s", ws_id, disconnect_reason, disconnect_detail or "client_close")
     except asyncio.CancelledError:
         logger.info("ws task cancelled id=%s", ws_id)
         raise

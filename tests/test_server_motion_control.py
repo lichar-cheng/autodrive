@@ -10,6 +10,7 @@ import pytest
 from server.app import main
 from server.app.config import ScanLaunchCommandConfig, ScanModesConfig
 from server.app.models import ControlTargetRequest, MoveCommand, SaveMapRequest, StartScanRequest, StopScanRequest
+from server.app.ultrasonic_safety import UltrasonicSafetyRuntime
 
 
 class FakeBridge:
@@ -51,9 +52,188 @@ class FakeBridge:
         return True
 
 
+class FakeWebSocket:
+    def __init__(self) -> None:
+        self.accepted = False
+        self.closed = False
+        self.close_calls: list[tuple[int | None, str | None]] = []
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def close(self, code: int | None = None, reason: str | None = None) -> None:
+        self.closed = True
+        self.close_calls.append((code, reason))
+
+
+def test_ws_stream_handles_send_after_close_without_raising(monkeypatch, caplog) -> None:
+    class ClosingWebSocket(FakeWebSocket):
+        async def send_json(self, _payload) -> None:
+            raise RuntimeError('Cannot call "send" once a close message has been sent.')
+
+        async def send_text(self, _payload) -> None:
+            raise AssertionError("send_text should not be used")
+
+        async def receive_text(self) -> str:
+            raise main.WebSocketDisconnect()
+
+    async def fake_subscribe(_topic):
+        yield {"topic": "/robot/pose", "stamp": 1.0, "payload": {"x": 1.0}}
+        await asyncio.Future()
+
+    monkeypatch.setattr(main, "STREAM_TOPICS", ["/robot/pose"])
+    monkeypatch.setattr(main, "bus", SimpleNamespace(subscribe=fake_subscribe))
+
+    websocket = ClosingWebSocket()
+    caplog.set_level(logging.INFO)
+
+    asyncio.run(main.ws_stream(websocket))
+
+    assert websocket.accepted is True
+    assert any("ws send skipped after close" in message for message in caplog.messages)
+
+
+def test_ws_stream_logs_disconnect_reason_after_send_close_race(monkeypatch, caplog) -> None:
+    class ClosingWebSocket(FakeWebSocket):
+        async def send_json(self, _payload) -> None:
+            raise RuntimeError('Cannot call "send" once a close message has been sent.')
+
+        async def send_text(self, _payload) -> None:
+            raise AssertionError("send_text should not be used")
+
+        async def receive_text(self) -> str:
+            await asyncio.Future()
+
+    async def fake_subscribe(_topic):
+        yield {"topic": "/robot/pose", "stamp": 1.0, "payload": {"x": 1.0}}
+        await asyncio.Future()
+
+    monkeypatch.setattr(main, "STREAM_TOPICS", ["/robot/pose"])
+    monkeypatch.setattr(main, "bus", SimpleNamespace(subscribe=fake_subscribe))
+
+    websocket = ClosingWebSocket()
+    caplog.set_level(logging.INFO)
+
+    asyncio.run(main.ws_stream(websocket))
+
+    assert any("reason=send_after_close" in message for message in caplog.messages)
+
+
+def test_ultrasonic_runtime_blocks_after_consecutive_faults() -> None:
+    runtime = UltrasonicSafetyRuntime(
+        SimpleNamespace(
+            enabled=True,
+            mode="single",
+            danger_distance_m=0.35,
+            resume_distance_m=0.45,
+            fault_trip_count=3,
+            recover_count=2,
+            max_valid_distance_m=4.0,
+            sudden_jump_m=0.45,
+        ),
+        serial_factory=None,
+        time_fn=lambda: 10.0,
+    )
+
+    runtime.update_from_measurement(None, error="short_frame", now=10.0)
+    runtime.update_from_measurement(None, error="short_frame", now=10.1)
+    snapshot = runtime.update_from_measurement(None, error="short_frame", now=10.2)
+
+    assert snapshot.blocked is True
+    assert snapshot.reason == "sensor_fault"
+    assert snapshot.consecutive_faults == 3
+
+
+def test_ultrasonic_runtime_recovers_only_after_resume_distance_repeats() -> None:
+    runtime = UltrasonicSafetyRuntime(
+        SimpleNamespace(
+            enabled=True,
+            mode="single",
+            danger_distance_m=0.35,
+            resume_distance_m=0.45,
+            fault_trip_count=3,
+            recover_count=2,
+            max_valid_distance_m=4.0,
+            sudden_jump_m=0.45,
+        ),
+        serial_factory=None,
+        time_fn=lambda: 20.0,
+    )
+
+    runtime.update_from_measurement([0.3], now=20.0)
+    first_recover = runtime.update_from_measurement([0.5], now=20.1)
+    second_recover = runtime.update_from_measurement([0.55], now=20.2)
+
+    assert first_recover.blocked is True
+    assert second_recover.blocked is False
+    assert second_recover.reason == ""
+
+
+def test_ultrasonic_runtime_parses_a22_single_frames_and_rejects_fffd_sentinel() -> None:
+    runtime = UltrasonicSafetyRuntime(
+        SimpleNamespace(
+            enabled=True,
+            mode="single",
+            frame_length=4,
+            sensor_count=1,
+            max_valid_distance_m=4.0,
+            danger_distance_m=0.35,
+            resume_distance_m=0.45,
+            fault_trip_count=3,
+            recover_count=2,
+            sudden_jump_m=0.45,
+        ),
+        serial_factory=None,
+        time_fn=lambda: 40.0,
+    )
+
+    distances, error = runtime._parse_payload(bytes.fromhex("ff005d5c"))
+    assert distances == [0.093]
+    assert error is None
+
+    distances, error = runtime._parse_payload(bytes.fromhex("ff017f7f"))
+    assert distances == [0.383]
+    assert error is None
+
+    distances, error = runtime._parse_payload(bytes.fromhex("ff00a6a5"))
+    assert distances == [0.166]
+    assert error is None
+
+    distances, error = runtime._parse_payload(bytes.fromhex("fffffdfb"))
+    assert distances is None
+    assert error == "sensor_no_echo"
+
+
+def test_ultrasonic_gate_blocks_nonzero_command_when_sensor_blocked(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main,
+        "ULTRASONIC_RUNTIME",
+        SimpleNamespace(gate_command=lambda velocity, yaw_rate, now=None: (0.0, 0.0, "distance")),
+    )
+
+    velocity, yaw_rate, reason = main._apply_ultrasonic_control_gate(0.4, 0.2, now=30.0)
+
+    assert (velocity, yaw_rate, reason) == (0.0, 0.0, "distance")
+
+
+def test_smooth_control_command_uses_emergency_decel_for_forced_stop(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main,
+        "CONTROL_OUTPUT_STATE",
+        {"velocity": 0.35, "yaw_rate": 0.2, "updated_at": 10.0},
+        raising=False,
+    )
+
+    velocity, yaw_rate = main._smooth_control_command(0.0, 0.0, now=10.1, forced_stop=True)
+
+    assert round(velocity, 3) == 0.25
+    assert round(yaw_rate, 3) < 0.2
+
+
 def test_older_move_request_does_not_stop_newer_ros_command(monkeypatch) -> None:
     bridge = FakeBridge()
     monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge))
+    monkeypatch.setattr(main, "CONTROL_OUTPUT_STATE", {"velocity": 0.0, "yaw_rate": 0.0, "updated_at": 0.0}, raising=False)
 
     async def scenario() -> None:
         first = asyncio.create_task(main.move(MoveCommand(velocity=0.6, yaw_rate=0.0, duration=0.15)))
@@ -61,14 +241,14 @@ def test_older_move_request_does_not_stop_newer_ros_command(monkeypatch) -> None
         second = asyncio.create_task(main.move(MoveCommand(velocity=0.8, yaw_rate=0.0, duration=0.15)))
         await asyncio.sleep(0.11)
 
-        assert bridge.commands == [
-            ("move", 0.6, 0.0),
-            ("move", 0.8, 0.0),
-        ]
+        assert len(bridge.commands) == 2
+        assert 0.0 < bridge.commands[0][1] < 0.6
+        assert bridge.commands[1][1] > bridge.commands[0][1]
 
         await asyncio.gather(first, second)
-        assert bridge.commands[-1] == ("stop", 0.0, 0.0)
-        assert bridge.commands.count(("stop", 0.0, 0.0)) == 1
+        assert bridge.commands[-1][0] == "move"
+        assert bridge.commands[-1][1] <= bridge.commands[1][1]
+        assert bridge.commands[-1][1] >= 0.0
 
     asyncio.run(scenario())
 
@@ -1110,11 +1290,14 @@ def test_set_control_target_updates_server_target_without_sleeping(monkeypatch) 
     bridge = FakeBridge()
     monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge))
     monkeypatch.setattr(main, "CONTROL_TARGET", {"velocity": 0.0, "yaw_rate": 0.0, "updated_at": 0.0})
+    monkeypatch.setattr(main, "CONTROL_OUTPUT_STATE", {"velocity": 0.0, "yaw_rate": 0.0, "updated_at": 0.0}, raising=False)
 
     result = asyncio.run(main.set_control_target(ControlTargetRequest(velocity=0.6, yaw_rate=0.2)))
 
     assert result["ok"] is True
-    assert bridge.commands == [("move", 0.6, 0.2)]
+    assert len(bridge.commands) == 1
+    assert 0.0 < bridge.commands[0][1] < 0.6
+    assert 0.0 < bridge.commands[0][2] <= 0.2
     assert main.CONTROL_TARGET["velocity"] == 0.6
     assert main.CONTROL_TARGET["yaw_rate"] == 0.2
 
@@ -1177,6 +1360,7 @@ def test_control_publisher_loop_sends_finite_stop_after_stale_target(monkeypatch
     monkeypatch.setattr(main, "CONTROL_TARGET", {"velocity": 0.5, "yaw_rate": 0.1, "updated_at": 10.0})
     monkeypatch.setattr(main, "CONTROL_STOP_BURST_REMAINING", 0, raising=False)
     monkeypatch.setattr(main.time, "time", lambda: 11.5)
+    monkeypatch.setattr(main, "CONTROL_OUTPUT_STATE", {"velocity": 0.3, "yaw_rate": 0.15, "updated_at": 11.4}, raising=False)
 
     sleep_calls = 0
 
@@ -1191,11 +1375,11 @@ def test_control_publisher_loop_sends_finite_stop_after_stale_target(monkeypatch
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(main._control_publisher_loop())
 
-    assert bridge.commands == [
-        ("move", 0.0, 0.0),
-        ("move", 0.0, 0.0),
-        ("move", 0.0, 0.0),
-    ]
+    assert len(bridge.commands) == 3
+    assert bridge.commands[0][1] < 0.3
+    assert bridge.commands[1][1] <= bridge.commands[0][1]
+    assert bridge.commands[2][1] <= bridge.commands[1][1]
+    assert bridge.commands[-1][1] >= 0.0
 
 
 def test_control_zero_publish_records_source(monkeypatch) -> None:

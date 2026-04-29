@@ -643,6 +643,9 @@ def test_save_stcm_downloads_pcd_when_actual_scan_mode_is_3d(tmp_path: Path, mon
     client.should_use_server_grid = lambda: False
     client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
     client.scan["mode"] = "3d"
+    client.scan["pcd_name"] = "cached.pcd"
+    client.scan["pcd_bytes"] = b"stale"
+    client.scan["pcd_received_at"] = 123
     client.scan_mode_var = DummyVar("2d")
     client.choose_3d_save_payload = lambda: "2d_pcd"
     pcd_modes = []
@@ -655,6 +658,9 @@ def test_save_stcm_downloads_pcd_when_actual_scan_mode_is_3d(tmp_path: Path, mon
     assert writes[0][1]["scan_mode"] == "3d"
     assert writes[0][1]["save_payload"] == "2d_pcd"
     assert pcd_modes == ["3d"]
+    assert client.scan["pcd_name"] == ""
+    assert client.scan["pcd_bytes"] == b""
+    assert client.scan["pcd_received_at"] == 0
 
 
 def test_save_stcm_logs_mode_snapshot_before_writing_archive(tmp_path: Path, monkeypatch) -> None:
@@ -756,6 +762,9 @@ def test_save_stcm_3d_with_pcd_requests_and_writes_pcd(tmp_path: Path, monkeypat
     client.should_use_server_grid = lambda: False
     client.set_inspector_bundle_state = lambda *_args, **_kwargs: None
     client.scan["mode"] = "2d"
+    client.scan["pcd_name"] = "cached.pcd"
+    client.scan["pcd_bytes"] = b"stale"
+    client.scan["pcd_received_at"] = 123
     client.scan_mode_var = DummyVar("3d")
     client.choose_3d_save_payload = lambda: "2d_pcd"
     client.ensure_scan_pcd = lambda mode=None: {"name": "map.pcd", "content": b"pcd-bytes"}
@@ -767,6 +776,9 @@ def test_save_stcm_3d_with_pcd_requests_and_writes_pcd(tmp_path: Path, monkeypat
     assert writes[0][1]["scan_mode"] == "3d"
     assert writes[0][1]["save_payload"] == "2d_pcd"
     assert writes[0][1]["pcd"] == {"included": True, "file": "map.pcd"}
+    assert client.scan["pcd_name"] == ""
+    assert client.scan["pcd_bytes"] == b""
+    assert client.scan["pcd_received_at"] == 0
 
 
 def test_save_stcm_3d_with_pcd_aborts_when_pcd_missing(tmp_path: Path, monkeypatch) -> None:

@@ -95,6 +95,43 @@ class RosBridgeConfig(BaseModel):
     topics: RosTopicConfig = Field(default_factory=RosTopicConfig)
 
 
+class UltrasonicSafetyConfig(BaseModel):
+    enabled: bool = False
+    mode: str = "disabled"
+    port: str = "/dev/ttyUSB0"
+    baud_rate: int = 115200
+    warmup_sec: float = 2.0
+    poll_interval_sec: float = 0.08
+    response_timeout_sec: float = 0.05
+    trigger_byte: int = Field(default=0xFF, ge=0, le=255)
+    frame_length: int = Field(default=4, ge=4, le=64)
+    sensor_count: int = Field(default=1, ge=1, le=8)
+    danger_distance_m: float = Field(default=0.35, ge=0.05, le=5.0)
+    resume_distance_m: float = Field(default=0.45, ge=0.05, le=5.0)
+    max_valid_distance_m: float = Field(default=4.0, ge=0.1, le=20.0)
+    sudden_jump_m: float = Field(default=0.45, ge=0.0, le=10.0)
+    fault_trip_count: int = Field(default=3, ge=1, le=20)
+    recover_count: int = Field(default=2, ge=1, le=20)
+    stale_data_timeout_sec: float = Field(default=0.4, ge=0.05, le=10.0)
+    linear_accel_mps2: float = Field(default=0.25, ge=0.01, le=10.0)
+    linear_decel_mps2: float = Field(default=0.6, ge=0.01, le=10.0)
+    linear_emergency_decel_mps2: float = Field(default=1.0, ge=0.01, le=20.0)
+    angular_accel_rps2: float = Field(default=0.6, ge=0.01, le=20.0)
+    angular_decel_rps2: float = Field(default=1.2, ge=0.01, le=20.0)
+    angular_emergency_decel_rps2: float = Field(default=2.0, ge=0.01, le=20.0)
+
+    @model_validator(mode="after")
+    def _normalize_mode_and_thresholds(self) -> "UltrasonicSafetyConfig":
+        mode = str(self.mode or "disabled").strip().lower()
+        if mode not in {"disabled", "single", "multi8"}:
+            mode = "disabled"
+        self.mode = mode
+        if mode == "multi8":
+            self.sensor_count = 8
+        self.resume_distance_m = max(self.resume_distance_m, self.danger_distance_m)
+        return self
+
+
 class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8180
@@ -106,6 +143,7 @@ class ServerConfig(BaseModel):
     allowed_clock_drift_sec: float = 5.0
     ros: RosBridgeConfig = Field(default_factory=RosBridgeConfig)
     scan_modes: ScanModesConfig = Field(default_factory=ScanModesConfig)
+    ultrasonic_safety: UltrasonicSafetyConfig = Field(default_factory=UltrasonicSafetyConfig)
 
 
 CONFIG = ServerConfig()
