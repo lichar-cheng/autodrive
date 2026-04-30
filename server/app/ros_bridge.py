@@ -691,6 +691,15 @@ class RosBridge:
         resolution = float(info.resolution)
         origin_x = float(info.origin.position.x)
         origin_y = float(info.origin.position.y)
+        orientation = getattr(info.origin, "orientation", None)
+        origin_yaw = 0.0
+        if orientation is not None:
+            origin_yaw = _yaw_from_quaternion(
+                float(getattr(orientation, "x", 0.0)),
+                float(getattr(orientation, "y", 0.0)),
+                float(getattr(orientation, "z", 0.0)),
+                float(getattr(orientation, "w", 1.0)),
+            )
         frame_id = _normalize_frame(getattr(getattr(msg, "header", None), "frame_id", ""))
         data = [int(value) for value in msg.data]
 
@@ -707,7 +716,7 @@ class RosBridge:
         payload = {
             "data": data,
             "resolution": resolution,
-            "origin": {"x": origin_x, "y": origin_y},
+            "origin": {"x": origin_x, "y": origin_y, "yaw": round(origin_yaw, 6)},
             "width": width,
             "height": height,
             "frame_id": frame_id,

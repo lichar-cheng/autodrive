@@ -227,7 +227,10 @@ def test_on_occupancy_grid_publishes_full_grid_payload() -> None:
                 width=3,
                 height=2,
                 resolution=0.5,
-                origin=SimpleNamespace(position=SimpleNamespace(x=1.0, y=2.0)),
+                origin=SimpleNamespace(
+                    position=SimpleNamespace(x=1.0, y=2.0),
+                    orientation=SimpleNamespace(x=0.0, y=0.0, z=0.1494381325, w=0.9887710779),
+                ),
             ),
             data=[-1, 0, 100, 51, -1, 1],
         )
@@ -240,7 +243,7 @@ def test_on_occupancy_grid_publishes_full_grid_payload() -> None:
         assert payload["data"] == [-1, 0, 100, 51, -1, 1]
         assert payload["width"] == 3
         assert payload["height"] == 2
-        assert payload["origin"] == {"x": 1.0, "y": 2.0}
+        assert payload["origin"] == {"x": 1.0, "y": 2.0, "yaw": 0.3}
         assert bridge.latest_map_points() == [(2.25, 2.25, 1.0), (1.25, 2.75, 1.0)]
     finally:
         loop.close()

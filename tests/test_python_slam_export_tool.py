@@ -37,19 +37,21 @@ def test_load_reads_manifest_and_occupancy_grid(tmp_path: Path) -> None:
                 "width": 2,
                 "height": 2,
                 "resolution": 0.2,
-                "origin": {"x": 1.0, "y": 2.0},
+                "origin": {"x": 1.0, "y": 2.0, "yaw": 0.5},
                 "encoding": "int8",
                 "values": {"unknown": -1, "free": 0, "occupied": 100},
             },
+            "poi": [{"name": "demo-poi", "x": 1.0, "y": 2.0, "yaw": 1.1}],
         },
-        {"width": 2, "height": 2, "resolution": 0.2, "origin": {"x": 1.0, "y": 2.0}, "data": [-1, 0, 100, 0]},
+        {"width": 2, "height": 2, "resolution": 0.2, "origin": {"x": 1.0, "y": 2.0, "yaw": 0.5}, "data": [-1, 0, 100, 0]},
     )
 
     loaded = SlamExportTool.load(slam_path)
 
     assert loaded.manifest["name"] == "demo"
     assert loaded.occupancy_grid["data"] == [-1, 0, 100, 0]
-    assert loaded.occupancy_grid["origin"] == {"x": 1.0, "y": 2.0}
+    assert loaded.occupancy_grid["origin"] == {"x": 1.0, "y": 2.0, "yaw": 0.5}
+    assert loaded.manifest["poi"] == [{"name": "demo-poi", "x": 1.0, "y": 2.0, "yaw": 1.1}]
 
 
 def test_build_exports_uses_occupancy_grid_data(tmp_path: Path) -> None:
@@ -61,16 +63,22 @@ def test_build_exports_uses_occupancy_grid_data(tmp_path: Path) -> None:
             "width": 2,
             "height": 2,
             "resolution": 0.2,
-            "origin": {"x": 0.0, "y": 0.0},
+            "origin": {"x": 0.0, "y": 0.0, "yaw": 0.25},
         },
+        "poi": [{"name": "goal", "x": 1.0, "y": 1.0, "yaw": -0.6}],
     }
-    grid = {"width": 2, "height": 2, "resolution": 0.2, "origin": {"x": 0.0, "y": 0.0}, "data": [100, 100, 0, -1]}
+    grid = {"width": 2, "height": 2, "resolution": 0.2, "origin": {"x": 0.0, "y": 0.0, "yaw": 0.25}, "data": [100, 100, 0, -1]}
 
     artifacts = SlamExportTool.build_exports("demo.slam", manifest, grid, resolution=0.2, padding_cells=1)
+    exported = json.loads(artifacts.json_text)
 
     assert "demo.pgm" in artifacts.yaml_text
     assert artifacts.pgm_meta["occupied_cells"] == 2
     assert "0 0" in artifacts.pgm_text
+    assert "origin: [0.000, 0.000, 0.250]" in artifacts.yaml_text
+    assert exported["map_yaml"]["origin"] == [0.0, 0.0, 0.25]
+    assert exported["manifest"]["poi"] == [{"name": "goal", "x": 1.0, "y": 1.0, "yaw": -0.6}]
+    assert exported["manifest"]["occupancy_grid"]["origin"] == {"x": 0.0, "y": 0.0, "yaw": 0.25}
 
 
 def test_export_writes_pgm_yaml_and_json(tmp_path: Path) -> None:
@@ -100,6 +108,39 @@ def test_export_writes_pgm_yaml_and_json(tmp_path: Path) -> None:
     assert (output_dir / "demo.yaml").exists()
     assert (output_dir / "demo.json").exists()
     assert artifacts.pgm_meta["width"] >= 1
+
+
+def test_export_uses_custom_output_name_for_written_files(tmp_path: Path) -> None:
+    module = load_standalone_python_module()
+    slam_path = tmp_path / "demo.slam"
+    output_dir = tmp_path / "out"
+    write_slam(
+        slam_path,
+        {
+            "name": "demo",
+            "version": "slam.v4",
+            "map_storage": "occupancy_grid",
+            "occupancy_grid": {
+                "width": 1,
+                "height": 1,
+                "resolution": 0.1,
+                "origin": {"x": 0.1, "y": 0.1},
+                "encoding": "int8",
+                "values": {"unknown": -1, "free": 0, "occupied": 100},
+            },
+        },
+        {"width": 1, "height": 1, "resolution": 0.1, "origin": {"x": 0.1, "y": 0.1}, "data": [100]},
+    )
+
+    artifacts = module.SlamExportTool.export(slam_path, output_dir, resolution=0.1, padding_cells=2, output_name="renamed_map")
+
+    assert (output_dir / "renamed_map.pgm").exists()
+    assert (output_dir / "renamed_map.yaml").exists()
+    assert (output_dir / "renamed_map.json").exists()
+    assert not (output_dir / "demo.pgm").exists()
+    assert "image: renamed_map.pgm" in artifacts.yaml_text
+    exported = json.loads((output_dir / "renamed_map.json").read_text(encoding="utf-8"))
+    assert exported["map_yaml"]["image"] == "renamed_map.pgm"
 
 
 def test_load_reads_optional_pcd_payload(tmp_path: Path) -> None:
@@ -158,6 +199,38 @@ def test_export_writes_same_stem_pcd_when_present(tmp_path: Path) -> None:
     SlamExportTool.export(slam_path, output_dir, resolution=0.1, padding_cells=2)
 
     assert (output_dir / "demo.pcd").read_bytes() == b"pcd-bytes"
+
+
+def test_export_uses_custom_output_name_for_pcd_when_present(tmp_path: Path) -> None:
+    module = load_standalone_python_module()
+    slam_path = tmp_path / "demo.slam"
+    output_dir = tmp_path / "out"
+    write_slam(
+        slam_path,
+        {
+            "name": "demo",
+            "version": "slam.v4",
+            "map_storage": "occupancy_grid",
+            "pcd_file": {"name": "map.pcd", "included": True},
+            "occupancy_grid": {
+                "width": 1,
+                "height": 1,
+                "resolution": 0.1,
+                "origin": {"x": 0.0, "y": 0.0},
+                "encoding": "int8",
+                "values": {"unknown": -1, "free": 0, "occupied": 100},
+            },
+        },
+        {"width": 1, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}, "data": [100]},
+        pcd_name="map.pcd",
+        pcd_content=b"pcd-bytes",
+    )
+
+    module.SlamExportTool.export(slam_path, output_dir, resolution=0.1, padding_cells=2, output_name="renamed_map")
+
+    assert (output_dir / "renamed_map.pcd").read_bytes() == b"pcd-bytes"
+    exported = json.loads((output_dir / "renamed_map.json").read_text(encoding="utf-8"))
+    assert exported["manifest"]["pcd_file"]["name"] == "renamed_map.pcd"
 
 
 def test_export_writes_same_stem_pcd_for_desktop_archive_format(tmp_path: Path) -> None:

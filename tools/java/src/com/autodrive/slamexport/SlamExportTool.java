@@ -171,6 +171,7 @@ public final class SlamExportTool {
             : new LinkedHashMap<String, Object>();
         double originX = getDouble(originMeta, "x", 0.0);
         double originY = getDouble(originMeta, "y", 0.0);
+        double originYaw = getDouble(originMeta, "yaw", 0.0);
         int occupiedCount = 0;
         for (Object value : data) {
             if (getInt(value, -1) >= 50) {
@@ -180,7 +181,7 @@ public final class SlamExportTool {
         List<Double> origin = new ArrayList<Double>();
         origin.add(round3(originX));
         origin.add(round3(originY));
-        origin.add(0.0);
+        origin.add(round3(originYaw));
         Map<String, Double> bounds = new LinkedHashMap<String, Double>();
         bounds.put("minX", round3(originX));
         bounds.put("maxX", round3(originX + width * gridResolution));
@@ -206,7 +207,7 @@ public final class SlamExportTool {
         return "image: " + replaceExtension(fileName, ".pgm") + "\n"
             + "mode: trinary\n"
             + "resolution: " + THREE_DECIMAL.format(resolution) + "\n"
-            + "origin: [" + THREE_DECIMAL.format(origin.get(0)) + ", " + THREE_DECIMAL.format(origin.get(1)) + ", " + Math.round(origin.get(2)) + "]\n"
+            + "origin: [" + THREE_DECIMAL.format(origin.get(0)) + ", " + THREE_DECIMAL.format(origin.get(1)) + ", " + THREE_DECIMAL.format(origin.get(2)) + "]\n"
             + "negate: 0\n"
             + "occupied_thresh: 0.65\n"
             + "free_thresh: 0.196";

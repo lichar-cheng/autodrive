@@ -833,7 +833,11 @@ def _occupancy_payload_to_grid(payload: dict[str, Any]) -> dict[str, Any] | None
             "width": width,
             "height": height,
             "resolution": max(0.02, float(payload.get("resolution", 0.05) or 0.05)),
-            "origin": {"x": float(origin.get("x", 0.0)), "y": float(origin.get("y", 0.0))},
+            "origin": {
+                "x": float(origin.get("x", 0.0)),
+                "y": float(origin.get("y", 0.0)),
+                "yaw": float(origin.get("yaw", 0.0) or 0.0),
+            },
             "data": [100 if value >= 50 else 0 if value >= 0 else -1 for value in data],
         }
     points = _occupancy_payload_to_points(payload)
@@ -855,7 +859,7 @@ def _occupancy_payload_to_grid(payload: dict[str, Any]) -> dict[str, Any] | None
         "width": width,
         "height": height,
         "resolution": resolution,
-        "origin": {"x": round(min_ix * resolution, 6), "y": round(min_iy * resolution, 6)},
+        "origin": {"x": round(min_ix * resolution, 6), "y": round(min_iy * resolution, 6), "yaw": 0.0},
         "data": grid_data,
     }
 

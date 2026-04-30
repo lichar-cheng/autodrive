@@ -25,8 +25,8 @@ public final class SlamExportToolSelfTest {
         String manifest = "{"
             + "\"version\":\"slam.v4\","
             + "\"map_storage\":\"occupancy_grid\","
-            + "\"occupancy_grid\":{\"width\":2,\"height\":2,\"resolution\":0.2,\"origin\":{\"x\":0.0,\"y\":0.0},\"encoding\":\"int8\",\"values\":{\"unknown\":-1,\"free\":0,\"occupied\":100}},"
-            + "\"poi\":[{\"name\":\"A\",\"x\":1.0,\"y\":2.0}]"
+            + "\"occupancy_grid\":{\"width\":2,\"height\":2,\"resolution\":0.2,\"origin\":{\"x\":0.0,\"y\":0.0,\"yaw\":0.25},\"encoding\":\"int8\",\"values\":{\"unknown\":-1,\"free\":0,\"occupied\":100}},"
+            + "\"poi\":[{\"name\":\"A\",\"x\":1.0,\"y\":2.0,\"yaw\":1.1}]"
             + "}";
         createSlam(slamPath, manifest, new byte[] {(byte) 100, (byte) 100, 0, (byte) 255});
 
@@ -36,9 +36,10 @@ public final class SlamExportToolSelfTest {
         assertTrue(loaded.getOccupancyGrid().get("data") instanceof List);
         assertTrue(artifacts.getPgmText().startsWith("P2\n# Generated from SLAM occupancy\n2 2\n255\n"));
         assertTrue(artifacts.getYamlText().contains("image: demo.pgm"));
-        assertTrue(artifacts.getYamlText().contains("origin: [0.000, 0.000, 0]"));
+        assertTrue(artifacts.getYamlText().contains("origin: [0.000, 0.000, 0.250]"));
         assertTrue(artifacts.getJsonText().contains("\"source_file\": \"demo.slam\""));
         assertTrue(artifacts.getJsonText().contains("\"occupied_cells\": 2"));
+        assertTrue(artifacts.getJsonText().contains("\"yaw\": 1.1"));
     }
 
     private static void testExportWritesFilesFromOccupancyGrid() throws Exception {

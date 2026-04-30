@@ -50,6 +50,7 @@ class PoiPoint(BaseModel):
     name: str
     x: float
     y: float
+    yaw: float = 0.0
     lat: Optional[float] = None
     lon: Optional[float] = None
 

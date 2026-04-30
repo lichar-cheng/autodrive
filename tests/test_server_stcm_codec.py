@@ -17,9 +17,10 @@ def test_save_stcm_writes_manifest_and_grid_bin(tmp_path: Path) -> None:
                 "width": 3,
                 "height": 2,
                 "resolution": 0.1,
-                "origin": {"x": -0.1, "y": -0.2},
+                "origin": {"x": -0.1, "y": -0.2, "yaw": 0.75},
                 "data": [-1, 0, 100, 0, 100, -1],
             },
+            "poi": [{"name": "dock", "x": 1.0, "y": 2.0, "yaw": 1.2}],
         },
     )
 
@@ -34,10 +35,11 @@ def test_save_stcm_writes_manifest_and_grid_bin(tmp_path: Path) -> None:
         "width": 3,
         "height": 2,
         "resolution": 0.1,
-        "origin": {"x": -0.1, "y": -0.2},
+        "origin": {"x": -0.1, "y": -0.2, "yaw": 0.75},
         "encoding": "int8",
         "values": {"unknown": -1, "free": 0, "occupied": 100},
     }
+    assert manifest["poi"] == [{"name": "dock", "x": 1.0, "y": 2.0, "yaw": 1.2}]
     assert list(grid_bytes) == [255, 0, 100, 0, 100, 255]
 
 
@@ -66,13 +68,16 @@ def test_load_stcm_restores_optional_pcd_payload(tmp_path: Path) -> None:
         {
             "version": "slam.v3",
             "scan_mode": "3d",
-            "occupancy_grid": {"width": 2, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}, "data": [0, 100]},
+            "occupancy_grid": {"width": 2, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0, "yaw": -0.4}, "data": [0, 100]},
             "pcd_file": {"name": "map.pcd", "content": b"pcd-bytes"},
+            "poi": [{"name": "goal", "x": 3.0, "y": 4.0, "yaw": -1.5}],
         },
     )
 
     bundle = load_stcm(target)
 
     assert bundle["occupancy_grid"]["data"] == [0, 100]
+    assert bundle["occupancy_grid"]["origin"] == {"x": 0.0, "y": 0.0, "yaw": -0.4}
+    assert bundle["poi"] == [{"name": "goal", "x": 3.0, "y": 4.0, "yaw": -1.5}]
     assert bundle["pcd_file"]["name"] == "map.pcd"
     assert bundle["pcd_file"]["content"] == b"pcd-bytes"

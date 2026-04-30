@@ -512,9 +512,9 @@ def test_health_ready_retries_mapping_prereq_pending_scan() -> None:
 
 def test_write_slam_archive_writes_grid_bin_for_2d(tmp_path: Path) -> None:
     target = tmp_path / "demo.slam"
-    grid = {"width": 2, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}, "data": [0, 100]}
+    grid = {"width": 2, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0, "yaw": 0.2}, "data": [0, 100]}
 
-    write_slam_archive(target, {"version": "slam.v4", "scan_mode": "2d"}, grid, None)
+    write_slam_archive(target, {"version": "slam.v4", "scan_mode": "2d", "poi": [{"name": "A", "x": 1.0, "y": 2.0, "yaw": 0.9}]}, grid, None)
 
     manifest, loaded_grid, pcd_file = read_slam_archive(target)
 
@@ -522,6 +522,8 @@ def test_write_slam_archive_writes_grid_bin_for_2d(tmp_path: Path) -> None:
         assert set(zf.namelist()) == {"manifest.json", "grid.bin"}
     assert manifest["scan_mode"] == "2d"
     assert manifest["map_storage"] == "occupancy_grid"
+    assert manifest["poi"] == [{"name": "A", "x": 1.0, "y": 2.0, "yaw": 0.9}]
+    assert loaded_grid["origin"] == {"x": 0.0, "y": 0.0, "yaw": 0.2}
     assert loaded_grid["data"] == [0, 100]
     assert pcd_file is None
 

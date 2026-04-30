@@ -87,19 +87,26 @@ class SlamExportTool:
         )
 
     @staticmethod
-    def export(path: str | Path, output_dir: str | Path, resolution: float, padding_cells: int = 8) -> ExportArtifacts:
+    def export(
+        path: str | Path,
+        output_dir: str | Path,
+        resolution: float,
+        padding_cells: int = 8,
+        output_name: str | None = None,
+    ) -> ExportArtifacts:
         slam_path = Path(path)
         output_path = Path(output_dir)
         loaded = SlamExportTool.load(slam_path)
+        export_name = SlamExportTool._resolve_output_file_name(slam_path, output_name)
         artifacts = SlamExportTool.build_exports(
-            slam_path.name,
+            export_name,
             loaded.manifest,
             loaded.occupancy_grid,
             resolution=resolution,
             padding_cells=padding_cells,
         )
         output_path.mkdir(parents=True, exist_ok=True)
-        stem = slam_path.stem
+        stem = Path(export_name).stem
         (output_path / f"{stem}.pgm").write_text(artifacts.pgm_text, encoding="utf-8")
         (output_path / f"{stem}.yaml").write_text(artifacts.yaml_text, encoding="utf-8")
         (output_path / f"{stem}.json").write_text(artifacts.json_text, encoding="utf-8")
@@ -130,10 +137,11 @@ class SlamExportTool:
                 values.append("0" if value >= 50 else "254" if value == 0 else "205")
             rows.append(" ".join(values))
         origin_meta = occupancy_grid.get("origin") if isinstance(occupancy_grid.get("origin"), dict) else {}
+        origin_yaw = round(float(origin_meta.get("yaw", 0.0) or 0.0), 3)
         occupied_cells = sum(1 for value in data if int(value) >= 50)
         return {
             "pgm": f"P2\n# Generated from SLAM occupancy\n{width} {height}\n255\n" + "\n".join(rows) + "\n",
-            "origin": [round(float(origin_meta.get("x", 0.0)), 3), round(float(origin_meta.get("y", 0.0)), 3), 0],
+            "origin": [round(float(origin_meta.get("x", 0.0)), 3), round(float(origin_meta.get("y", 0.0)), 3), origin_yaw],
             "width": width,
             "height": height,
             "occupied_cells": occupied_cells,
@@ -152,7 +160,7 @@ class SlamExportTool:
                 f"image: {Path(source_file).stem}.pgm",
                 "mode: trinary",
                 f"resolution: {float(resolution):.3f}",
-                f"origin: [{float(origin[0]):.3f}, {float(origin[1]):.3f}, {int(origin[2])}]",
+                f"origin: [{float(origin[0]):.3f}, {float(origin[1]):.3f}, {float(origin[2]):.3f}]",
                 "negate: 0",
                 "occupied_thresh: 0.65",
                 "free_thresh: 0.196",
@@ -170,6 +178,13 @@ class SlamExportTool:
             pcd_name = str(legacy_meta.get("file", "map.pcd"))
             return {"name": pcd_name, "included": True, "content": archive.read(pcd_name)}
         return None
+
+    @staticmethod
+    def _resolve_output_file_name(slam_path: Path, output_name: str | None) -> str:
+        normalized = str(output_name or "").strip()
+        if not normalized:
+            return slam_path.name
+        return normalized if Path(normalized).suffix else f"{normalized}.slam"
 
 
 __all__ = ["ExportArtifacts", "LoadedSlam", "SlamExportTool"]
