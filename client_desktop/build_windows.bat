@@ -1,6 +1,8 @@
 @echo off
 REM Windows 打包为独立 EXE
-if "%APP_NAME%"=="" set APP_NAME=maptool_001_20260408
+if "%APP_NAME%"=="" (
+	  for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd"') do set "APP_NAME=maptool_001_%%i"
+  )
 python -m pip install -r requirements.txt
 python -m pip install pyinstaller
 python -c "import tkinter"

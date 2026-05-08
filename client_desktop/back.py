@@ -318,16 +318,8 @@ def zoom_scale_factor(event: object) -> float:
     return 1.0
 
 
-def strip_legacy_trajectory(manifest: dict) -> dict:
-    cleaned = dict(manifest)
-    cleaned.pop("trajectory", None)
-    return cleaned
-
-
 def build_export_json_manifest(manifest: dict) -> dict:
-    export_manifest = strip_legacy_trajectory(manifest)
-    export_manifest.pop("browser_occupancy", None)
-    export_manifest.pop("occupancy", None)
+    export_manifest = dict(manifest)
     export_manifest.pop("pcd_file", None)
     return export_manifest
 
@@ -541,47 +533,6 @@ def mapping_prereq_message(summary: dict) -> str:
     return "mapping prerequisites not satisfied"
 
 
-def _normalize_angle_delta(value: float) -> float:
-    return math.atan2(math.sin(value), math.cos(value))
-
-
-def pose_progress_exceeds_threshold(
-    previous_pose: dict[str, float] | None,
-    current_pose: dict[str, float] | None,
-    min_translation_m: float = MIN_SCAN_TRANSLATION_DELTA_M,
-    min_rotation_rad: float = MIN_SCAN_ROTATION_DELTA_RAD,
-) -> bool:
-    if previous_pose is None or current_pose is None:
-        return True
-    dx = float(current_pose.get("x", 0.0)) - float(previous_pose.get("x", 0.0))
-    dy = float(current_pose.get("y", 0.0)) - float(previous_pose.get("y", 0.0))
-    if math.hypot(dx, dy) >= float(min_translation_m):
-        return True
-    yaw_delta = _normalize_angle_delta(float(current_pose.get("yaw", 0.0)) - float(previous_pose.get("yaw", 0.0)))
-    return abs(yaw_delta) >= float(min_rotation_rad)
-
-
-def prune_scan_cache(scan: dict[str, Any], config: dict[str, Any]) -> None:
-    occupied = scan.get("occupied")
-    free = scan.get("free")
-    if not isinstance(occupied, dict) or not isinstance(free, dict):
-        return
-    retained_occupied: dict[str, dict[str, Any]] = {}
-    for key, cell in occupied.items():
-        free_cell = free.get(key)
-        if not is_occupied_scan_cell(cell, free_cell, config):
-            continue
-        retained_occupied[key] = cell
-    retained_free_items = sorted(
-        (dict(item) for item in free.values()),
-        key=lambda item: (int(item.get("hits", 0)), -abs(int(item.get("ix", 0))) - abs(int(item.get("iy", 0)))),
-        reverse=True,
-    )[:MAX_FREE_DISPLAY_CELLS]
-    retained_free = {_cell_key(int(item["ix"]), int(item["iy"])): item for item in retained_free_items}
-    scan["occupied"] = retained_occupied
-    scan["free"] = retained_free
-
-
 def coalesce_stream_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     latest_by_topic: dict[str, dict[str, Any]] = {}
     passthrough: list[dict[str, Any]] = []
@@ -608,35 +559,12 @@ def _cell_key(ix: int, iy: int) -> str:
     return f"{ix}:{iy}"
 
 
-def _mark_free(scan: dict[str, Any], ix: int, iy: int) -> None:
-    key = _cell_key(ix, iy)
-    slot = scan["free"].get(key, {"ix": ix, "iy": iy, "hits": 0})
-    slot["hits"] += 1
-    scan["free"][key] = slot
-
-
 def _mark_occupied(scan: dict[str, Any], ix: int, iy: int, intensity: float, hits: int = 1) -> None:
     key = _cell_key(ix, iy)
     slot = scan["occupied"].get(key, {"ix": ix, "iy": iy, "hits": 0, "intensity": 0.0})
     slot["hits"] = max(int(slot["hits"]) + hits, hits)
     slot["intensity"] = max(float(slot["intensity"]), float(intensity))
     scan["occupied"][key] = slot
-
-
-def _world_to_cell(scan: dict[str, Any], x: float, y: float) -> tuple[int, int]:
-    voxel = float(scan["voxel"])
-    return round(x / voxel), round(y / voxel)
-
-
-def _raytrace(scan: dict[str, Any], start_x: int, start_y: int, end_x: int, end_y: int) -> None:
-    dx = end_x - start_x
-    dy = end_y - start_y
-    steps = max(abs(dx), abs(dy))
-    if steps <= 1:
-        return
-    for step in range(steps):
-        t = step / steps
-        _mark_free(scan, round(start_x + dx * t), round(start_y + dy * t))
 
 
 def runtime_base_dir() -> Path:
@@ -1525,7 +1453,7 @@ class DesktopClient:
             (self.tr("path"), self.show_path_card_var),
             (self.tr("map"), self.show_map_card_var),
         ]):
-            ttk.Checkbutton(card, text=text, variable=var, command=self.sync_visibility_cards).grid(row=index // 2, column=index % 2, sticky="w", padx=6, pady=2)
+            ttk.Checkbutton(card, text=text, variable=var, command=self.sync_visibility_cards).grid(row=index, column=0, sticky="w", padx=6, pady=2)
 
     def _scan_controls(self, parent: ttk.Frame) -> ttk.LabelFrame:
         card = ttk.LabelFrame(parent, text=self.tr("scan"), padding=8)
@@ -2549,24 +2477,6 @@ class DesktopClient:
                 return {"active": True, **server_grid}
         return {"active": False}
 
-    def grid_value_at_cell(self, ix: int, iy: int, grid: dict | None = None) -> int | None:
-        grid = self.active_grid() if grid is None else grid
-        if not grid.get("active"):
-            return None
-        width = int(grid.get("width", 0) or 0)
-        height = int(grid.get("height", 0) or 0)
-        resolution = max(0.02, float(grid.get("resolution", self.scan.get("voxel", 0.08))))
-        origin = grid.get("origin") if isinstance(grid.get("origin"), dict) else {"x": 0.0, "y": 0.0}
-        origin_ix = round(float(origin.get("x", 0.0)) / resolution)
-        origin_iy = round(float(origin.get("y", 0.0)) / resolution)
-        x = int(ix) - origin_ix
-        y = int(iy) - origin_iy
-        if x < 0 or y < 0 or x >= width or y >= height:
-            return None
-        data = grid.get("data", [])
-        index = y * width + x
-        return int(data[index]) if index < len(data) else None
-
     def world_to_active_grid_cell(self, x: float, y: float, grid: dict | None = None) -> tuple[int, int]:
         grid = self.active_grid() if grid is None else grid
         resolution = max(0.02, float(grid.get("resolution", self.scan.get("voxel", 0.08))))
@@ -2755,9 +2665,6 @@ class DesktopClient:
     def apply_scan_fusion_config_from_ui(self) -> dict:
         return self.apply_scan_fusion_config(self.effective_scan_fusion_config(), update_vars=True)
 
-    def on_scan_fusion_preset_selected(self) -> dict:
-        return self.apply_scan_fusion_config({"preset": self.scan_fusion_preset_var.get()}, update_vars=True)
-
     def occupied_lookup(self) -> dict[tuple[int, int], dict]:
         grid = self.active_grid()
         if grid.get("active"):
@@ -2775,14 +2682,8 @@ class DesktopClient:
             return lookup
         return {(int(cell["ix"]), int(cell["iy"])): cell for cell in self.scan["occupied"].values()}
 
-    def mark_free(self, ix: int, iy: int) -> None:
-        _mark_free(self.scan, ix, iy)
-
     def mark_occupied(self, ix: int, iy: int, intensity: float, hits: int = 1) -> None:
         _mark_occupied(self.scan, ix, iy, intensity, hits)
-
-    def raytrace(self, start_x: int, start_y: int, end_x: int, end_y: int) -> None:
-        _raytrace(self.scan, start_x, start_y, end_x, end_y)
 
     def filtered_occupancy_cells(self) -> list[dict]:
         config = self.effective_scan_fusion_config()
@@ -2804,23 +2705,6 @@ class DesktopClient:
                 continue
             cells.append({"ix": int(cell["ix"]), "iy": int(cell["iy"]), "hits": int(cell["hits"])})
         return cells
-
-    def occupied_points(self) -> list[list[float]]:
-        points = []
-        voxel = self.active_voxel_size()
-        for cell in self.active_occupancy_cells():
-            points.append([float(cell["ix"]) * voxel, float(cell["iy"]) * voxel, float(cell.get("intensity", 1.0))])
-        return points or [[0.0, 0.0, 1.0]]
-
-    def browser_occupancy(self) -> dict:
-        config = self.effective_scan_fusion_config()
-        return {
-            "voxel_size": self.active_voxel_size(),
-            "scan_fusion": build_scan_fusion_metadata(config),
-            "occupied_cells": self.active_occupancy_cells(),
-            "free_cells": self.active_free_cells(),
-            "map_fence_xy": self.active_map_fence_xy(),
-        }
 
     def current_occupancy_grid(self) -> dict:
         grid = self.active_grid()
@@ -2871,19 +2755,22 @@ class DesktopClient:
     def apply_geo_rules_to_pois(self, points: list[Poi]) -> list[Poi]:
         copies = [Poi(**poi.__dict__) for poi in points]
         geo_count = sum(1 for poi in copies if poi.lat is not None and poi.lon is not None)
-        if geo_count in (1, 2):
-            raise ValueError(self.tr("poi_geo_min3"))
-        if geo_count >= 3:
-            inferred = [self.point_from_poi(poi) for poi in copies]
-            infer_missing_geo_points(inferred)
-            for poi, point in zip(copies, inferred):
-                poi.lat = point.lat
-                poi.lon = point.lon
+            # 0、1、2 个经纬度点：只保存已有经纬度，不做推算，不报错
+        if geo_count < 3:
+            return copies
+    
+        # 3 个及以上：才做缺失经纬度推算
+        inferred = [self.point_from_poi(poi) for poi in copies]
+        infer_missing_geo_points(inferred)
+        for poi, point in zip(copies, inferred):
+            poi.lat = point.lat
+            poi.lon = point.lon
+    
         return copies
 
     def build_segment(self, start: Point, end: Point, source: str) -> dict:
         clearance = max(0.0, self.number(self.path_clearance_var, 0.3))
-        points = plan_path_points(start, end, float(self.scan["voxel"]), self.occupied_lookup(), clearance)
+        points = plan_path_points(start, end, self.active_voxel_size(), self.occupied_lookup(), clearance)
         seg = {
             "id": f"seg-{self.segment_seed}",
             "start": self.point_to_payload(start),
@@ -3073,20 +2960,6 @@ class DesktopClient:
         self.sync_poi_box()
         self.sync_path_panel()
 
-    def apply_selected_geo(self) -> None:
-        if not self.selected_poi_ids:
-            messagebox.showwarning(self.tr("poi"), self.tr("poi_select_first"))
-            return
-        lat, lon = self.parse_geo(self.poi_geo_var.get().strip())
-        if self.poi_geo_var.get().strip() and lat is None:
-            messagebox.showwarning("POI", "Geo format must be lon,lat.")
-            return
-        for poi in self.poi_nodes:
-            if poi.client_id in self.selected_poi_ids:
-                poi.lat = lat
-                poi.lon = lon
-        self.sync_poi_box()
-
     def copy_poi_text(self) -> None:
         if not self.poi_nodes:
             messagebox.showwarning(self.tr("poi"), self.tr("poi_no_copy"))
@@ -3182,7 +3055,7 @@ class DesktopClient:
 
     def validate_path(self, show_alert: bool) -> bool:
         segments = [{"id": seg["id"], "start": self.point_from_dict(seg["start"]), "end": self.point_from_dict(seg["end"])} for seg in self.path_segments]
-        self.path_validation = compute_path_closed_loop_validation(segments, float(self.scan["voxel"]))
+        self.path_validation = compute_path_closed_loop_validation(segments, self.active_voxel_size())
         self.selected_segment_id = None
         self.selected_poi_ids = set()
         self.sync_path_panel()
@@ -3218,11 +3091,6 @@ class DesktopClient:
         else:
             self.connect_named_btn.state(["disabled"])
         self.sync_scan_badges()
-
-    def refresh_camera_snapshot(self) -> None:
-        self.logger.info("camera snapshot refresh")
-        self.camera_display = {idx: dict(payload) for idx, payload in self.camera_inbox.items()}
-        self.camera_refresh_var.set(self.camera_refresh_var.get().replace("Buffered", "Displayed", 1) if "Buffered" in self.camera_refresh_var.get() else self.camera_refresh_var.get())
 
     def move_click(self, name: str) -> None:
         command = self.build_control_command(name)
@@ -3891,15 +3759,37 @@ class DesktopClient:
         manifest = self.inspector.get("manifest") if isinstance(self.inspector.get("manifest"), dict) else {}
         if not isinstance(grid_payload, dict):
             return
+    
         if self.inspector.get("pgm") and self.inspector.get("yaml") and self.inspector.get("json"):
             return
+    
         config = extract_scan_fusion_config(manifest, default_preset="")
         resolution = float(grid_payload.get("resolution", config["voxel_size"]))
         pgm = self.build_pgm_export(manifest, grid_payload, resolution)
+    
         self.inspector["pgm"] = pgm["pgm"]
-        self.inspector["yaml"] = self.build_yaml_export(str(self.inspector.get("file") or "map_export"), resolution, pgm["origin"])
-        self.inspector["json"] = json.dumps(build_export_json_manifest(manifest), ensure_ascii=False, indent=2)
-        self.inspector["meta"] = pgm
+        self.inspector["yaml"] = self.build_yaml_export(
+            str(self.inspector.get("file") or "map_export"),
+            resolution,
+            pgm["origin"],
+        )
+        self.inspector["json"] = json.dumps(
+            build_export_json_manifest(manifest),
+            ensure_ascii=False,
+            indent=2,
+        )
+    
+        pgm_data = pgm.get("pgm", "")
+        pgm_size = len(pgm_data.encode("utf-8")) if isinstance(pgm_data, str) else len(bytes(pgm_data))
+    
+        # 关键：meta 里不要放完整 PGM 内容
+        self.inspector["meta"] = {
+            "width": pgm.get("width", 0),
+            "height": pgm.get("height", 0),
+            "origin": pgm.get("origin", [0, 0, 0]),
+            "occupied_cells": pgm.get("occupied_cells", 0),
+            "pgm_size": pgm_size,
+        }
 
     def choose_3d_save_payload(self) -> str | None:
         if getattr(self, "root", None) is None:
@@ -4032,8 +3922,12 @@ class DesktopClient:
             bundle["pcd"] = {"included": True, "file": str(pcd_file.get("name") or "map.pcd")}
         else:
             bundle["pcd"] = {"included": False, "file": ""}
-        manifest = strip_legacy_trajectory(dict(bundle))
+        manifest = dict(bundle)
         write_slam_archive(target, manifest, grid, pcd_file)
+        if isinstance(pcd_file, dict):
+            self.scan["pcd_name"] = ""
+            self.scan["pcd_bytes"] = b""
+            self.scan["pcd_received_at"] = 0
         self.scan["last_saved_file"] = target
         self.scan["saved_point_count"] = grid_counts["obstacle"]
         self.sync_scan_badges()
@@ -4051,12 +3945,6 @@ class DesktopClient:
             file_name = loaded.file_name
             manifest = loaded.manifest
             grid = ensure_grid_runtime_state(dict(getattr(loaded, "occupancy_grid", None) or {}))
-            if not grid.get("data"):
-                grid = occupancy_grid_from_cells(
-                    list((manifest.get("browser_occupancy") or {}).get("occupied_cells", [])),
-                    list((manifest.get("browser_occupancy") or {}).get("free_cells", [])),
-                    float((manifest.get("browser_occupancy") or {}).get("voxel_size", 0.08)),
-                )
             pcd_file = None
         elif suffix == ".zip":
             with tempfile.TemporaryDirectory(prefix="native_map_zip_") as temp_dir:
@@ -4076,12 +3964,6 @@ class DesktopClient:
             file_name = loaded.file_name
             manifest = loaded.manifest
             grid = ensure_grid_runtime_state(dict(getattr(loaded, "occupancy_grid", None) or {}))
-            if not grid.get("data"):
-                grid = occupancy_grid_from_cells(
-                    list((manifest.get("browser_occupancy") or {}).get("occupied_cells", [])),
-                    list((manifest.get("browser_occupancy") or {}).get("free_cells", [])),
-                    float((manifest.get("browser_occupancy") or {}).get("voxel_size", 0.08)),
-                )
             pcd_file = None
         else:
             manifest, grid, pcd_file = read_slam_archive(target)
@@ -4177,6 +4059,9 @@ class DesktopClient:
             if not path:
                 return
             Path(path).write_bytes(pcd_bytes)
+            self.scan["pcd_name"] = ""
+            self.scan["pcd_bytes"] = b""
+            self.scan["pcd_received_at"] = 0
             self.logger.info("map export kind=%s path=%s", kind, path)
             messagebox.showinfo(self.tr("export_title"), self.tr("export_done", kind=kind.upper(), path=path))
             return
@@ -4239,3 +4124,10 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
