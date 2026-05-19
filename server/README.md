@@ -1,200 +1,164 @@
 # AutoDrive Server
 
-`server` is the FastAPI backend for AutoDrive map capture, live streaming, motion control, and `.slam` map management.
+`server` 是当前桌面地图工具配套的 FastAPI 后端，职责已经收敛到 4 件事：
 
-## Overview
+1. 提供远控接口。
+2. 提供扫描启停和 3D PCD 下载接口。
+3. 把 ROS2 的 `/robot/pose` 和 `/map/grid` 转成统一 WebSocket 流。
+4. 提供 `/health` 和 `/diag/mapping_prereq` 诊断，帮助 client 判断能不能开始扫描。
 
-The server is responsible for:
+## 当前边界
 
-1. Exposing HTTP and WebSocket APIs.
-2. Bridging ROS2 topics when ROS is available, or falling back to the built-in simulator.
-3. Aggregating pose, chassis, lidar, camera, and occupancy-grid data onto a unified internal topic bus.
-4. Saving and loading `.slam` map files for client-side map editing, POI, and path workflows.
+`server` 现在不再负责这些能力：
 
-Default endpoints:
+- 模拟器 fallback
+- camera / imu / gps / chassis 透传
+- lidar front / rear WebSocket 流
+- server 端 `.slam` 保存、加载、上传、下载
+- server 端 POI / 路径管理
+- 超声波安全限速
 
-- `http://0.0.0.0:8080`
-- `ws://0.0.0.0:8080/ws/stream`
+换句话说，当前 server 只保留了“控制 + 扫描 + 位姿 + 栅格 + TF/建图前置检查”这条最小闭环。
 
-Service entry:
-
-- [run_server.py](/home/autodrive2/autodrive/server/run_server.py)
-
-## Directory Layout
+## 目录
 
 ```text
 server/
-├─ run_server.py              # Uvicorn entrypoint
-├─ requirements.txt           # Runtime dependencies
+├─ run_map_server.py         # Uvicorn 入口
+├─ start_map_server.sh       # 启动脚本
+├─ requirements.txt
 └─ app/
-   ├─ main.py                 # FastAPI routes, WS stream, scan session, map management
-   ├─ config.py               # Server and ROS topic configuration
-   ├─ models.py               # Request models
-   ├─ topic_bus.py            # Async topic bus with drop statistics
-   ├─ simulator.py            # Built-in fallback data source
-   ├─ ros_bridge.py           # ROS2 bridge
-   └─ stcm_codec.py           # .slam archive read/write
+   ├─ main.py                # FastAPI 路由、控制平滑、扫描会话、WS 推流
+   ├─ ros_bridge.py          # ROS2 -> pose/grid 桥接与建图前置检查
+   ├─ config.py              # server/ROS/scan 配置
+   ├─ models.py              # 请求模型
+   ├─ topic_bus.py           # 异步 topic 总线
+   └─ sample_pcd_file.py     # 3D PCD 降采样缓存
 ```
 
-## Runtime Model
+## HTTP / WS 接口
 
-### `run_server.py`
+当前保留的接口：
 
-- Reads `CONFIG.host` and `CONFIG.port`
-- Starts Uvicorn with `app.main:app`
+- `GET /health`
+- `GET /diag/mapping_prereq`
+- `GET /diag/stream_stats`
+- `POST /scan/start`
+- `POST /scan/stop`
+- `POST /scan/reset`
+- `GET /scan/pcd`
+- `POST /control/move`
+- `POST /control/target`
+- `POST /control/stop`
+- `WS /ws/stream`
 
-### `app/main.py`
+默认地址由 `CONFIG.host` / `CONFIG.port` 决定。
 
-- Initializes `FastAPI`, `TopicBus`, and `Simulator`
-- Detects ROS2 on startup
-- Starts `RosBridge` when ROS2 is available
-- Starts the simulator when ROS2 is unavailable and fallback is allowed
-- Exposes HTTP APIs
-- Exposes `/health` and `/diag/mapping_prereq`
-- Exposes `/ws/stream`
-- Maintains scan session state, latest occupancy grid, map files, and control target state
+## ROS 数据流
 
-### `app/topic_bus.py`
+`ros_bridge.py` 现在只订阅这些 ROS topic：
 
-Internal async bus used by both ROS and simulator sources.
+- `odom`
+- `tf`
+- `tf_static`
+- `occupancy_grid`
 
-It tracks:
-
-- `published`
-- `dropped`
-- `drop_rate`
-- `near_capacity_events`
-- `peak_fill_ratio`
-- `subscribers`
-
-### `app/ros_bridge.py`
-
-Bridges ROS2 topics into the server topic model.
-
-Main responsibilities:
-
-- Subscribe to `odom`, `imu`, `tf`, `tf_static`
-- Optionally subscribe to `gps`, `occupancy_grid`, lidar, and camera topics
-- Convert `LaserScan` into world-space points
-- Resolve lidar mounting pose from TF
-- Publish `/cmd_vel`
-- Report mapping prerequisite diagnostics
-
-### `app/simulator.py`
-
-Used when ROS2 is unavailable.
-
-It periodically publishes:
+内部输出只保留两个实时 topic：
 
 - `/robot/pose`
-- `/robot/gps`
-- `/chassis/odom`
-- `/chassis/status`
-- `/camera/1..4/compressed`
-- `/lidar/front`
-- `/lidar/rear`
 - `/map/grid`
 
-## `.slam` Format
+其中：
 
-The server reads and writes `slam.v4` archives through [app/stcm_codec.py](/home/autodrive2/autodrive/server/app/stcm_codec.py).
+- `/robot/pose` 来自 `odom`，并在 `prefer_tf_pose=True` 时优先使用 `map->odom` 变换修正显示位姿。
+- `/map/grid` 直接携带完整 occupancy grid：`data / width / height / resolution / origin / frame_id`。
 
-Archive layout:
+`WS /ws/stream` 目前也只订阅这两个 topic。
 
-- `manifest.json`
-- `grid.bin`
-- optional `map.pcd`
+## 控制链路
 
-`grid.bin` stores packed occupancy-grid `int8` values:
+远控走两级保护：
 
-- `-1`: unknown
-- `0`: free
-- `100`: occupied
+1. `client_desktop` 高频重复发送 `POST /control/target`
+2. `server` 后台循环按 `CONTROL_PUBLISH_INTERVAL_SEC` 持续发布，目标超时后自动补 0 速
 
-`manifest.json` stores:
+平滑策略保留在线速度和角速度发布前：
 
-- grid metadata
-- POI
-- path
-- pose
-- GPS
-- chassis
-- notes
-- scan summary
+- 起步加速度被单独压低，避免“起步太猛”
+- 常规减速度和紧急停车减速度分开
+- 目标过期后会发送有限次 stop burst，防止旧命令残留
 
-The server save/load path now treats occupancy grid as the primary persisted map representation. It no longer stores the map as expanded point dictionaries inside the `.slam` archive.
+这部分现在不再依赖超声波配置。
 
-## Data Flow
+## 扫描与 Launch
 
-### End-to-end
+`POST /scan/start` 的流程：
 
-```text
-ROS2 topic / Simulator
-        ↓
-   RosBridge / Simulator
-        ↓
-      TopicBus
-        ↓
-   main.py /ws/stream
-        ↓
-      Client
-```
+1. 校验模式 `2d` / `3d`
+2. 根据 `config.scan_modes` 检查或拉起外部 launch 进程
+3. 轮询 `mapping_prerequisites`
+4. 通过后切换扫描会话为 active
 
-### ROS Mode
+`POST /scan/stop` 的流程：
 
-When ROS2 is available:
+1. 取消正在进行的 start 流程
+2. 停止由 server 拉起或追踪到的进程
+3. 清理扫描状态
 
-- `startup()` detects ROS support
-- `RosBridge` subscribes to configured ROS topics
-- callbacks convert ROS messages into internal payloads
-- payloads are published onto `TopicBus`
-- `/ws/stream` subscribes to those topics and forwards them to clients
+当前 launch 依赖只按进程名模式和配置命令跟踪，不再检查旧的节点级多传感器状态。
 
-Current main mappings:
+## 3D PCD 下载
 
-| ROS source | Internal topic | Notes |
-| --- | --- | --- |
-| `odom` | `/robot/pose`, `/chassis/odom`, `/chassis/status` | pose, velocity, chassis |
-| `gps` | `/robot/gps` | GPS data |
-| `LaserScan` front | `/lidar/front` | world-space point cloud |
-| `LaserScan` rear | `/lidar/rear` | world-space point cloud |
-| `CompressedImage` | `/camera/{id}/compressed` | metadata stream |
-| `OccupancyGrid` | `/map/grid` | occupancy grid |
-| `tf`, `tf_static` | internal only | transforms for mapping |
+`GET /scan/pcd` 只在 `3d` 模式下可用。
 
-Notes:
+行为如下：
 
-- Lidar points are transformed using odom and TF.
-- If an `OccupancyGrid` source is configured, the latest grid is used directly for save/load and stream workflows.
-- Scan accumulation still exists for scan summary and fallback map generation, but `.slam` persistence is now occupancy-grid based.
+- 根据 `config.scan_modes.mode_3d.pcd_output_path` 找到原始 PCD
+- 调用 `sample_pcd_file.py` 做降采样
+- 返回降采样后的文件，而不是原始全量 PCD
 
-### Simulator Mode
+默认降采样参数：
 
-When ROS2 is unavailable and fallback is enabled:
+- `voxel_size=0.05`
 
-- `Simulator.start()` begins the async loop
-- it generates pose, GPS, chassis, camera, lidar, and simplified map data at `sim_rate_hz`
-- all messages flow through the same `TopicBus`
+响应头会带这些信息，供 client 展示：
 
-## WebSocket Stream
+- `X-Scan-PCD-Downsampled`
+- `X-Scan-PCD-Voxel-Size`
+- `X-Scan-PCD-Name`
+- `X-Scan-PCD-Size`
+- `X-Scan-PCD-Source-Name`
+- `X-Scan-PCD-Source-Size`
 
-Clients connect to `WS /ws/stream`.
+## 建图前置检查
 
-The server subscribes to:
+`/health` 返回的是轻量摘要，适合低频轮询。
 
-- `/robot/pose`
-- `/robot/gps`
-- `/chassis/odom`
-- `/chassis/status`
-- `/lidar/front`
-- `/lidar/rear`
-- `/camera/1/compressed`
-- `/camera/2/compressed`
-- `/camera/3/compressed`
-- `/camera/4/compressed`
-- `/map/grid`
+重点字段：
 
-Message shape:
+- `mapping_ready`
+- `mapping_status`
+- `mapping_blockers`
+- `mapping_warnings`
+- `scan_active`
+- `scan_summary`
+- `control_target`
+- `topics`
+- `ros_diag`
+
+`/diag/mapping_prereq` 返回更细的检查结果。
+
+当前检查重点是：
+
+- `odom` 是否新鲜
+- `tf` 是否新鲜
+- `occupancy_grid` 是否新鲜
+- `tf_static` 是否存在
+- WebSocket/TopicBus 是否有明显压力
+
+## WebSocket 行为
+
+消息格式：
 
 ```json
 {
@@ -207,187 +171,25 @@ Message shape:
 }
 ```
 
-Protection and throttling:
+当前保留的稳定性保护：
 
-- each client has its own send queue
-- camera topics are rate-limited
-- lidar is decimated on non-keyframes
-- lidar sends periodic keyframes
-- idle WebSocket clients are disconnected
-- `"ping"` receives `"pong"`
+- 每个 client 独立发送队列
+- 队列满时丢弃最旧消息，不阻塞主发布路径
+- 空闲 client 超时断开
+- `ping` -> `pong`
+- send-after-close 竞态保护
 
-## Mapping Readiness
-
-### `GET /health`
-
-`/health` is a lightweight summary for low-frequency polling.
-
-Key fields:
-
-- `mapping_ready`
-- `mapping_status`
-- `mapping_blockers`
-- `mapping_warnings`
-- `ros_enabled`
-- `scan_active`
-- `ws_clients`
-- `scan_summary`
-- `control_target`
-- `ros_diag`
-
-### `GET /diag/mapping_prereq`
-
-Detailed mapping prerequisite result, including:
-
-- `ready`
-- `severity`
-- `blockers`
-- `warnings`
-- `checks`
-
-Typical blockers and warnings cover:
-
-- stale or missing `odom`
-- stale or missing lidar
-- TF from `robot_base_frame` to lidar frame not resolvable
-- stale dynamic TF
-- visible stream pressure
-
-`POST /scan/start` runs the prerequisite check before starting a scan session.
-
-## Motion Control
-
-The current control path has two APIs:
-
-- `POST /control/target`
-- `POST /control/stop`
-
-`POST /control/move` still exists, but the desktop client no longer uses it for repeated keyboard drive.
-
-Current keepalive behavior in [app/main.py](/home/autodrive2/autodrive/server/app/main.py):
-
-- control publish interval: `0.1s`
-- target hold window: `1.0s`
-- stale target warning: `control target stale; publishing stop for safety`
-- stale stop burst: the server sends several explicit zero commands after hold expiry
-
-Control sequence:
-
-1. client repeatedly sends `/control/target`
-2. server stores the latest target and timestamp
-3. background publisher republishes the effective command every `100ms`
-4. if no new target arrives within `1.0s`, the server marks the target stale and publishes stop for safety
-5. `POST /control/stop` zeros the current target immediately
-
-This means movement will not continue forever after the client disappears. Once the hold window expires, the server-side control loop publishes stop.
-
-## Scan Session
-
-During scanning:
-
-- `/scan/start` marks the scan session active
-- lidar frames are accumulated into the current scan session
-- scan summary tracks frame counts, raw point totals, voxel size, and elapsed time
-- `/scan/stop` stops scan accumulation
-- `/scan/reset` clears the accumulated scan state
-
-## API Summary
-
-### `GET /health`
-
-Returns current service health and runtime summary.
-
-### `GET /diag/mapping_prereq`
-
-Returns detailed mapping readiness checks.
-
-### `POST /scan/start`
-
-Starts scan accumulation after prerequisite checks pass.
-
-### `POST /scan/stop`
-
-Stops scan accumulation.
-
-### `POST /scan/reset`
-
-Clears current scan accumulation and statistics.
-
-### `POST /control/target`
-
-Sets the current target velocity and yaw-rate.
-
-Request body:
-
-```json
-{
-  "velocity": 0.5,
-  "yaw_rate": 0.0
-}
-```
-
-### `POST /control/stop`
-
-Immediately clears the current motion target.
-
-### `POST /control/move`
-
-One-shot duration-based move command retained for compatibility and ad hoc use.
-
-Request body:
-
-```json
-{
-  "velocity": 0.5,
-  "yaw_rate": 0.0,
-  "duration": 1.0
-}
-```
-
-### `POST /path/plan`
-
-Stores manual path nodes. The server does not run obstacle-aware path planning here.
-
-### `POST /map/poi`
-
-Adds a POI.
-
-### `POST /map/save`
-
-Saves the current map as `.slam`.
-
-The saved payload includes:
-
-- occupancy grid
-- POI
-- path
-- pose
-- GPS
-- chassis
-- scan summary
-- notes
-
-### `POST /map/load`
-
-Loads a `.slam` file and restores the latest occupancy grid and related map state.
-
-## Run
-
-Install dependencies:
+## 运行
 
 ```bash
 cd server
 python3 -m pip install -r requirements.txt
+python3 run_map_server.py
 ```
 
-Start the service:
+如果你用脚本启动：
 
 ```bash
 cd server
-python3 run_server.py
+./start_map_server.sh
 ```
-
-Default endpoints after startup:
-
-- HTTP: `http://127.0.0.1:8080`
-- WS: `ws://127.0.0.1:8080/ws/stream`
