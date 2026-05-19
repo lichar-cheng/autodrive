@@ -323,7 +323,52 @@ def build_export_json_manifest(manifest: dict) -> dict:
     export_manifest.pop("pcd_file", None)
     return export_manifest
 
+def parse_export_yaml_text(yaml_text: str) -> dict:
+    parsed: dict[str, Any] = {}
 
+    for raw_line in str(yaml_text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+
+        key, value = line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if key == "origin":
+            try:
+                parsed[key] = json.loads(value)
+            except Exception:
+                parsed[key] = value
+        elif key in {"resolution", "occupied_thresh", "free_thresh"}:
+            try:
+                parsed[key] = float(value)
+            except Exception:
+                parsed[key] = value
+        elif key == "negate":
+            try:
+                parsed[key] = int(value)
+            except Exception:
+                parsed[key] = value
+        else:
+            parsed[key] = value
+
+    return parsed
+def build_export_json_bundle(
+    source_file: str,
+    yaml_text: str,
+    pgm_meta: dict,
+    manifest: dict,
+) -> dict:
+    safe_pgm_meta = dict(pgm_meta or {})
+    safe_pgm_meta.pop("pgm", None)  # 关键：不要把完整 PGM 文本塞进 JSON
+
+    return {
+        "source_file": str(source_file or ""),
+        "map_yaml": parse_export_yaml_text(yaml_text),
+        "pgm_meta": safe_pgm_meta,
+        "manifest": build_export_json_manifest(manifest or {}),
+    }
 def grid_to_bytes(grid: dict) -> bytes:
     data = list(grid.get("data", []))
     width = int(grid.get("width", 0) or 0)
@@ -3733,11 +3778,21 @@ class DesktopClient:
         )
 
     def set_inspector_bundle_state(self, file_name: str, manifest: dict, grid_payload: dict) -> None:
-        config = extract_scan_fusion_config(manifest, default_preset="")
-        resolution = float(grid_payload.get("resolution", config["voxel_size"]))
         grid_payload = ensure_grid_runtime_state(dict(grid_payload))
         counts = occupancy_grid_counts(grid_payload)
-        export_manifest = build_export_json_manifest(manifest)
+        meta = {
+            "width": int(grid_payload.get("width", 0) or 0),
+            "height": int(grid_payload.get("height", 0) or 0),
+            "occupied_cells": counts["obstacle"],
+        }
+        
+        export_json = build_export_json_bundle(
+            source_file=file_name,
+            yaml_text="",
+            pgm_meta=meta,
+            manifest=manifest,
+        )
+        
         self.inspector = {
             "file": file_name,
             "manifest": manifest,
@@ -3745,12 +3800,8 @@ class DesktopClient:
             "points": [],
             "pgm": "",
             "yaml": "",
-            "json": json.dumps(export_manifest, ensure_ascii=False, indent=2),
-            "meta": {
-                "width": int(grid_payload.get("width", 0) or 0),
-                "height": int(grid_payload.get("height", 0) or 0),
-                "occupied_cells": counts["obstacle"],
-            },
+            "json": json.dumps(export_json, ensure_ascii=False, indent=2),
+            "meta": meta,
             "pcd_file": dict(manifest.get("pcd") or {}) if isinstance(manifest.get("pcd"), dict) else None,
         }
 
@@ -3759,37 +3810,43 @@ class DesktopClient:
         manifest = self.inspector.get("manifest") if isinstance(self.inspector.get("manifest"), dict) else {}
         if not isinstance(grid_payload, dict):
             return
-    
+
         if self.inspector.get("pgm") and self.inspector.get("yaml") and self.inspector.get("json"):
             return
-    
+
         config = extract_scan_fusion_config(manifest, default_preset="")
         resolution = float(grid_payload.get("resolution", config["voxel_size"]))
         pgm = self.build_pgm_export(manifest, grid_payload, resolution)
-    
+
         self.inspector["pgm"] = pgm["pgm"]
-        self.inspector["yaml"] = self.build_yaml_export(
+
+        yaml_text = self.build_yaml_export(
             str(self.inspector.get("file") or "map_export"),
             resolution,
             pgm["origin"],
         )
-        self.inspector["json"] = json.dumps(
-            build_export_json_manifest(manifest),
-            ensure_ascii=False,
-            indent=2,
-        )
-    
+        
         pgm_data = pgm.get("pgm", "")
         pgm_size = len(pgm_data.encode("utf-8")) if isinstance(pgm_data, str) else len(bytes(pgm_data))
-    
-        # 关键：meta 里不要放完整 PGM 内容
-        self.inspector["meta"] = {
+        
+        pgm_meta = {
+            "origin": pgm.get("origin", [0, 0, 0]),
             "width": pgm.get("width", 0),
             "height": pgm.get("height", 0),
-            "origin": pgm.get("origin", [0, 0, 0]),
             "occupied_cells": pgm.get("occupied_cells", 0),
             "pgm_size": pgm_size,
         }
+        
+        export_json = build_export_json_bundle(
+            source_file=str(self.inspector.get("file") or ""),
+            yaml_text=yaml_text,
+            pgm_meta=pgm_meta,
+            manifest=manifest,
+        )
+        
+        self.inspector["yaml"] = yaml_text
+        self.inspector["json"] = json.dumps(export_json, ensure_ascii=False, indent=2)
+        self.inspector["meta"] = pgm_meta
 
     def choose_3d_save_payload(self) -> str | None:
         if getattr(self, "root", None) is None:
@@ -4124,10 +4181,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
 

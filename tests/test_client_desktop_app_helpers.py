@@ -9,7 +9,6 @@ from client_desktop.app import (
     DesktopClient,
     MAX_MESSAGES_DRAIN_PER_TICK,
     bootstrap_authenticated_bridge,
-    build_camera_refresh_text,
     build_direct_ws_url,
     can_zoom_from_widget,
     classify_network_quality,
@@ -19,7 +18,6 @@ from client_desktop.app import (
     load_desktop_client_config,
     normalize_http_base_url,
     normalize_server_ws_url,
-    parse_camera_topic_id,
     redact_sensitive_text,
     resolve_log_file_path,
     read_slam_archive,
@@ -228,14 +226,22 @@ def test_bootstrap_authenticated_bridge_surfaces_login_failure() -> None:
         raise AssertionError("expected login failure")
 
 
-def test_build_camera_refresh_text_handles_empty_inbox() -> None:
-    assert build_camera_refresh_text({1: {"objects": [], "meta": {}}, 2: {"objects": [], "meta": {}}}) == "No buffered frame"
+def test_coalesce_stream_messages_only_keeps_latest_pose_and_grid() -> None:
+    messages = [
+        {"topic": "/robot/pose", "payload": {"x": 1}},
+        {"topic": "/robot/pose", "payload": {"x": 2}},
+        {"topic": "/map/grid", "payload": {"width": 1}},
+        {"topic": "/map/grid", "payload": {"width": 2}},
+        {"topic": "/robot/gps", "payload": {"lat": 1}},
+    ]
 
+    result = coalesce_stream_messages(messages)
 
-def test_parse_camera_topic_id_rejects_invalid_topic() -> None:
-    assert parse_camera_topic_id("/camera/1") == 1
-    assert parse_camera_topic_id("/camera/not-a-number") is None
-    assert parse_camera_topic_id("/camera") is None
+    assert result == [
+        {"topic": "/robot/pose", "payload": {"x": 2}},
+        {"topic": "/map/grid", "payload": {"width": 2}},
+        {"topic": "/robot/gps", "payload": {"lat": 1}},
+    ]
 
 
 def test_safe_mode_translation_key_falls_back_to_default() -> None:
@@ -936,7 +942,7 @@ def test_set_inspector_bundle_state_keeps_grid_export_metadata() -> None:
     DesktopClient.set_inspector_bundle_state(client, "demo.slam", manifest, {"width": 1, "height": 1, "resolution": 0.1, "origin": {"x": 0.0, "y": 0.0}, "data": [100]})
 
     export_json = json.loads(client.inspector["json"])
-    assert export_json["occupancy_grid"]["width"] == 1
+    assert export_json["manifest"]["occupancy_grid"]["width"] == 1
 
 
 def test_set_inspector_bundle_state_defers_large_pgm_generation() -> None:
@@ -1575,54 +1581,6 @@ def test_consume_messages_stores_server_grid_payload() -> None:
     assert client.server_grid["free_cells"] == []
 
 
-def test_consume_messages_does_not_queue_lidar_for_map_accumulation() -> None:
-    import queue
-
-    class Bridge:
-        def __init__(self) -> None:
-            self.queue = queue.Queue()
-
-    class Var:
-        def __init__(self) -> None:
-            self.value = ""
-
-        def set(self, value) -> None:
-            self.value = value
-
-    client = DesktopClient.__new__(DesktopClient)
-    client.bridge = Bridge()
-    client.camera_inbox = {}
-    client.server_grid = {"active": False, "resolution": 0.0, "occupied_cells": [], "free_cells": []}
-    client.pose = {}
-    client.gps = {}
-    client.odom = {}
-    client.chassis = {}
-    client.pose_history = []
-    client.scan = {"front_frames": 0, "rear_frames": 0, "active": True}
-    client.last_scan = {"front": {}, "rear": {}}
-    client.last_message_at_ms = 0
-    client.camera_refresh_var = Var()
-    client.mark_canvas_dirty = lambda: None
-    client.validate_message = lambda msg: True
-    client.sync_scan_badges = lambda: None
-
-    client.bridge.queue.put(
-        {
-            "topic": "/lidar/front",
-            "stamp": 1.25,
-            "payload": {
-                "points": [[1.0, 2.0, 1.0]],
-                "raw_points": 1,
-                "keyframe": True,
-            },
-        }
-    )
-
-    DesktopClient.consume_messages(client)
-
-    assert client.scan["front_frames"] == 1
-
-
 def test_apply_scan_fusion_config_updates_runtime_and_vars() -> None:
     class Var:
         def __init__(self, value) -> None:
@@ -1706,21 +1664,6 @@ def test_start_scan_waits_when_server_rejects_prereq(monkeypatch) -> None:
     assert warnings
 
 
-def test_coalesce_stream_messages_prefers_latest_pose_and_lidar() -> None:
-    messages = [
-        {"topic": "/robot/pose", "stamp": 1.0, "payload": {"x": 1}},
-        {"topic": "/lidar/front", "stamp": 1.0, "payload": {"points": [[0, 0, 1]]}},
-        {"topic": "/robot/pose", "stamp": 2.0, "payload": {"x": 2}},
-        {"topic": "/lidar/front", "stamp": 2.0, "payload": {"points": [[1, 0, 1]]}},
-    ]
-
-    merged = coalesce_stream_messages(messages)
-
-    assert [item["topic"] for item in merged] == ["/robot/pose", "/lidar/front"]
-    assert merged[0]["payload"]["x"] == 2
-    assert merged[1]["payload"]["points"] == [[1, 0, 1]]
-
-
 def test_consume_messages_coalesces_and_prioritizes_pose_updates() -> None:
     class Bridge:
         def __init__(self) -> None:
@@ -1738,21 +1681,18 @@ def test_consume_messages_coalesces_and_prioritizes_pose_updates() -> None:
 
     client = DesktopClient.__new__(DesktopClient)
     client.bridge = Bridge()
-    client.camera_inbox = {1: {"objects": [], "meta": {}}}
-    client.camera_refresh_var = Var("")
     client.pose = {}
-    client.gps = {}
     client.odom = {}
-    client.chassis = {}
     client.pose_history = []
-    client.scan = {"front_frames": 0, "rear_frames": 0, "active": True}
-    client.last_scan = {"front": {}, "rear": {}}
+    client.scan = {"active": True}
+    client.server_grid = {"active": False, "resolution": 0.0, "occupied_cells": [], "free_cells": [], "data": [], "width": 0, "height": 0, "origin": {"x": 0.0, "y": 0.0}}
     client.validate_message = lambda msg: True
     dirty = []
     client.mark_canvas_dirty = lambda: dirty.append("dirty")
+    client.update_server_grid = lambda payload, stamp: dirty.append(("grid", payload, stamp))
 
     for index in range(MAX_MESSAGES_DRAIN_PER_TICK):
-        client.bridge.queue.put({"topic": "/lidar/front", "stamp": float(index), "payload": {"points": [[index, 0, 1]], "raw_points": 1, "keyframe": False}})
+        client.bridge.queue.put({"topic": "/map/grid", "stamp": float(index), "payload": {"width": index}})
     client.bridge.queue.put({"topic": "/robot/pose", "stamp": 99.0, "payload": {"x": 9.0}})
 
     DesktopClient.consume_messages(client)

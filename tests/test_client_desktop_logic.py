@@ -24,13 +24,13 @@ def test_parse_batch_poi_text_supports_name_geo_and_yaw() -> None:
     assert rows[3]["lat"] is None
 
 
-def test_parse_batch_poi_text_rejects_one_or_two_geo_points() -> None:
-    try:
-        parse_batch_poi_text("a,120.0,30.0\nb")
-    except ValueError as exc:
-        assert "at least 3 POI" in str(exc)
-    else:
-        raise AssertionError("expected ValueError")
+def test_parse_batch_poi_text_accepts_mixed_geo_and_plain_name_rows() -> None:
+    rows = parse_batch_poi_text("a,120.0,30.0\nb")
+
+    assert rows == [
+        {"name": "a", "lon": 120.0, "lat": 30.0, "yaw": None},
+        {"name": "b", "lon": None, "lat": None, "yaw": None},
+    ]
 
 
 def test_infer_missing_geo_points_fills_points_after_three_anchors() -> None:

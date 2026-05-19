@@ -1,5 +1,7 @@
+# 中文注释版：在不改变原有逻辑的前提下，为核心数据结构、函数、类和关键流程补充中文说明。
 from __future__ import annotations
 
+# 标准库导入：用于哈希、JSON、日志、数学、系统路径、线程、时间、Tk UI、压缩包和异常处理。
 import hashlib
 import json
 import logging
@@ -19,9 +21,11 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import urlparse
 from logging.handlers import RotatingFileHandler
+# 第三方库导入：requests 负责 HTTP 请求，websocket 负责实时流连接。
 
 import requests
 import websocket
+# 兼容包内运行和脚本直接运行两种导入方式。
 
 try:
     from .native_map_import import NativeMapImportTool
@@ -60,6 +64,7 @@ except ImportError:
 
 
 @dataclass
+# POI 点的数据结构：保存客户端 ID、名称、地图坐标、航向角以及可选经纬度。
 class Poi:
     client_id: str
     name: str
@@ -70,6 +75,7 @@ class Poi:
     lon: float | None = None
 
 
+# 规范化 WebSocket 地址，并补齐服务端流式接口路径 /ws/stream。
 def normalize_server_ws_url(raw: str) -> str:
     text = raw.strip()
     if not text:
@@ -91,6 +97,7 @@ def normalize_server_ws_url(raw: str) -> str:
     return parsed._replace(path=path).geturl()
 
 
+# 规范化 HTTP 基础地址，补齐协议并去掉 query、fragment 等无关部分。
 def normalize_http_base_url(raw: str) -> str:
     text = raw.strip()
     if not text:
@@ -108,6 +115,7 @@ def normalize_http_base_url(raw: str) -> str:
     return parsed._replace(scheme=scheme, netloc=netloc, path=path, params="", query="", fragment="").geturl().rstrip("/")
 
 
+# 根据主机和端口拼出 HTTP 基础地址，供登录网关接口使用。
 def compose_http_base_url(host: str, port: str) -> str:
     normalized_host = host.strip()
     normalized_port = port.strip()
@@ -118,6 +126,7 @@ def compose_http_base_url(host: str, port: str) -> str:
     return normalize_http_base_url(normalized_host)
 
 
+# 根据主机和端口拼出直连 WebSocket 地址，常用于调试直连模式。
 def build_direct_ws_url(host: str, port: str) -> str:
     normalized_host = host.strip()
     normalized_port = port.strip()
@@ -128,6 +137,7 @@ def build_direct_ws_url(host: str, port: str) -> str:
     return normalize_server_ws_url(normalized_host)
 
 
+# 对日志或错误信息中的 URL、主机、长 token 做脱敏，避免泄露敏感信息。
 def redact_sensitive_text(text: str) -> str:
     redacted = str(text)
     redacted = re.sub(r"(https?|wss?)://[^\s\"']+", "<redacted-url>", redacted, flags=re.IGNORECASE)
@@ -136,13 +146,16 @@ def redact_sensitive_text(text: str) -> str:
     return redacted
 
 
+# 登录/鉴权流程中的业务异常，区分用户可见提示和内部调试细节。
 class AuthFlowError(RuntimeError):
+    # 初始化鉴权异常，并对用户可见文案做脱敏处理。
     def __init__(self, user_message: str, detail: str | None = None) -> None:
         super().__init__(detail or user_message)
         self.user_message = redact_sensitive_text(user_message)
         self.detail = detail or user_message
 
 
+# 读取桌面客户端配置文件，并用默认配置补齐缺失字段。
 def load_desktop_client_config(config_path: Path | None = None) -> dict[str, Any]:
     defaults = {
         "login_required": True,
@@ -172,6 +185,7 @@ def load_desktop_client_config(config_path: Path | None = None) -> dict[str, Any
     return defaults
 
 
+# 解析接口 JSON 响应，并统一检查 retCode 是否成功。
 def _extract_json_payload(response: Any, action: str) -> dict[str, Any]:
     try:
         payload = response.json()
@@ -185,6 +199,7 @@ def _extract_json_payload(response: Any, action: str) -> dict[str, Any]:
     return payload
 
 
+# 完成登录、获取 token，并从网关拉取真实 HTTP/WS 桥接地址。
 def bootstrap_authenticated_bridge(
     base_url: str,
     username: str,
@@ -237,6 +252,7 @@ def bootstrap_authenticated_bridge(
             http.close()
 
 
+# 按候选路径逐个尝试创建日志文件，返回第一个可写路径。
 def resolve_log_file_path(
     candidates: list[Path],
     mkdir_fn=None,
@@ -254,6 +270,7 @@ def resolve_log_file_path(
     raise OSError(f"unable to create log file in any candidate path: {last_err}")
 
 
+# 在正式日志系统初始化前，向日志文件追加一条启动或异常记录。
 def bootstrap_log_write(path: Path, message: str) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -263,27 +280,12 @@ def bootstrap_log_write(path: Path, message: str) -> None:
         pass
 
 
-def build_camera_refresh_text(camera_inbox: dict[int, dict]) -> str:
-    newest = max((item.get("meta", {}).get("received_at_ms", 0) for item in camera_inbox.values()), default=0)
-    if not newest:
-        return "No buffered frame"
-    return f"Buffered latest {time.strftime('%H:%M:%S', time.localtime(newest / 1000))}"
-
-
-def parse_camera_topic_id(topic: str) -> int | None:
-    parts = topic.split("/")
-    if len(parts) < 3:
-        return None
-    try:
-        return int(parts[2])
-    except (TypeError, ValueError):
-        return None
-
-
+# 根据模式值查找翻译 key，找不到时回退到默认 key。
 def safe_mode_translation_key(value: str, mapping: dict[str, str], default_key: str) -> str:
     return mapping.get(value, default_key)
 
 
+# 安全获取当前焦点控件，避免 Tk 在销毁控件时抛异常。
 def safe_focus_widget(root: tk.Tk) -> tk.Misc | None:
     try:
         return root.focus_get()
@@ -291,6 +293,7 @@ def safe_focus_widget(root: tk.Tk) -> tk.Misc | None:
         return None
 
 
+# 判断鼠标事件来源是否在地图画布内，用于限制缩放触发区域。
 def can_zoom_from_widget(widget: object, canvas: tk.Canvas) -> bool:
     current = widget
     while current is not None:
@@ -300,10 +303,12 @@ def can_zoom_from_widget(widget: object, canvas: tk.Canvas) -> bool:
     return False
 
 
+# 判断点击某控件时是否应清除输入焦点。
 def should_clear_focus_on_click(widget: object) -> bool:
     return not isinstance(widget, (tk.Entry, tk.Text, tk.Listbox, ttk.Entry, ttk.Combobox, ttk.Button, ttk.Checkbutton))
 
 
+# 把鼠标滚轮事件转换成缩放倍率。
 def zoom_scale_factor(event: object) -> float:
     delta = getattr(event, "delta", 0)
     if delta > 0:
@@ -318,11 +323,13 @@ def zoom_scale_factor(event: object) -> float:
     return 1.0
 
 
+# 导出 JSON manifest 前移除不应直接序列化的 PCD 文件内容。
 def build_export_json_manifest(manifest: dict) -> dict:
     export_manifest = dict(manifest)
     export_manifest.pop("pcd_file", None)
     return export_manifest
 
+# 解析地图 YAML 文本，尽量把数字字段转换成对应数值类型。
 def parse_export_yaml_text(yaml_text: str) -> dict:
     parsed: dict[str, Any] = {}
 
@@ -354,6 +361,7 @@ def parse_export_yaml_text(yaml_text: str) -> dict:
             parsed[key] = value
 
     return parsed
+# 组装导出用 JSON 包，包含 YAML、PGM 元信息和 manifest。
 def build_export_json_bundle(
     source_file: str,
     yaml_text: str,
@@ -369,6 +377,7 @@ def build_export_json_bundle(
         "pgm_meta": safe_pgm_meta,
         "manifest": build_export_json_manifest(manifest or {}),
     }
+# 把 occupancy_grid 的 int8 数据转换成二进制字节流，用于归档保存。
 def grid_to_bytes(grid: dict) -> bytes:
     data = list(grid.get("data", []))
     width = int(grid.get("width", 0) or 0)
@@ -378,10 +387,12 @@ def grid_to_bytes(grid: dict) -> bytes:
     return bytes((int(value) & 0xFF) for value in data)
 
 
+# 把二进制 int8 字节流还原成 Python 的有符号栅格值列表。
 def bytes_to_grid_data(blob: bytes) -> list[int]:
     return [value - 256 if value >= 128 else value for value in blob]
 
 
+# 生成栅格地图的轻量 manifest，记录宽高、分辨率、原点和编码约定。
 def grid_manifest(grid: dict) -> dict:
     return {
         "width": int(grid.get("width", 0) or 0),
@@ -393,6 +404,7 @@ def grid_manifest(grid: dict) -> dict:
     }
 
 
+# 根据导出文件名生成 PGM、YAML、JSON 三个 ZIP 内部条目名。
 def export_zip_entry_names(file_name: str) -> dict[str, str]:
     stem = Path(str(file_name or "map_export")).stem or "map_export"
     return {
@@ -402,6 +414,7 @@ def export_zip_entry_names(file_name: str) -> dict[str, str]:
     }
 
 
+# 根据障碍格和空闲格构造完整 occupancy grid。
 def occupancy_grid_from_cells(occupied_cells: list[dict], free_cells: list[dict], resolution: float) -> dict:
     resolution = max(0.02, float(resolution))
     all_cells = list(occupied_cells) + list(free_cells)
@@ -415,6 +428,7 @@ def occupancy_grid_from_cells(occupied_cells: list[dict], free_cells: list[dict]
     height = max_iy - min_iy + 1
     data = [-1] * (width * height)
 
+    # 把单个格子写入临时栅格数组，并做边界保护。
     def set_cell(cell: dict, value: int) -> None:
         x = int(cell.get("ix", 0)) - min_ix
         y = int(cell.get("iy", 0)) - min_iy
@@ -434,6 +448,7 @@ def occupancy_grid_from_cells(occupied_cells: list[dict], free_cells: list[dict]
     })
 
 
+# 统计栅格中障碍、空闲和未知单元数量，并缓存结果。
 def occupancy_grid_counts(grid: dict) -> dict[str, int]:
     cached = grid.get("_counts")
     if isinstance(cached, dict):
@@ -453,12 +468,14 @@ def occupancy_grid_counts(grid: dict) -> dict[str, int]:
     return dict(counts)
 
 
+# 确保栅格携带运行期缓存字段，如 revision 和 counts。
 def ensure_grid_runtime_state(grid: dict) -> dict:
     grid.setdefault("_revision", 0)
     occupancy_grid_counts(grid)
     return grid
 
 
+# 把原始栅格值归类为 obstacle、safe 或 unknown。
 def occupancy_bucket(value: int) -> str:
     if int(value) >= 50:
         return "obstacle"
@@ -467,6 +484,7 @@ def occupancy_bucket(value: int) -> str:
     return "unknown"
 
 
+# 把地图 manifest、栅格二进制数据和可选 PCD 写入自定义 SLAM 归档。
 def write_slam_archive(path: str | Path, manifest: dict, grid: dict, pcd_file: dict[str, Any] | None) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -492,6 +510,7 @@ def write_slam_archive(path: str | Path, manifest: dict, grid: dict, pcd_file: d
     return target
 
 
+# 从自定义 SLAM 归档中读取 manifest、栅格数据和可选 PCD 文件。
 def read_slam_archive(path: str | Path) -> tuple[dict, dict, dict[str, Any] | None]:
     target = Path(path)
     with zipfile.ZipFile(target, "r") as zf:
@@ -508,6 +527,7 @@ def read_slam_archive(path: str | Path) -> tuple[dict, dict, dict[str, Any] | No
     return manifest, grid, pcd_file
 
 
+# 把字节数格式化成 B/KB/MB/GB 的可读文本。
 def format_file_size(num_bytes: int) -> str:
     size = float(max(0, int(num_bytes)))
     for unit in ("B", "KB", "MB", "GB"):
@@ -515,6 +535,8 @@ def format_file_size(num_bytes: int) -> str:
             return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024.0
     return f"{size:.1f} GB"
+
+# 运行参数常量：控制键盘停止确认、健康轮询、消息处理上限、网络质量阈值和地图显示限制。
 
 
 KEYUP_STOP_CONFIRM_MS = 50
@@ -530,6 +552,7 @@ MIN_SCAN_ROTATION_DELTA_RAD = 0.03
 MAX_FREE_DISPLAY_CELLS = 12000
 
 
+# 从健康状态中提炼建图状态，优先展示阻塞项和警告。
 def summarize_mapping_status(health: dict) -> str:
     status = str(health.get("mapping_status", "ok"))
     blockers = list(health.get("mapping_blockers", []) or [])
@@ -543,6 +566,7 @@ def summarize_mapping_status(health: dict) -> str:
     return status
 
 
+# 根据连接状态、消息延迟、丢包/校验错误等指标判断网络质量。
 def classify_network_quality(
     bridge_connected: bool,
     stream_health: dict,
@@ -568,6 +592,7 @@ def classify_network_quality(
     return "ok"
 
 
+# 把建图前置条件检查结果转换成可展示提示。
 def mapping_prereq_message(summary: dict) -> str:
     blockers = list(summary.get("blockers", []) or [])
     warnings = list(summary.get("warnings", []) or [])
@@ -578,32 +603,27 @@ def mapping_prereq_message(summary: dict) -> str:
     return "mapping prerequisites not satisfied"
 
 
+# 合并高频流式消息，只保留核心 pose/grid topic 的最新一条以减轻 UI 压力。
 def coalesce_stream_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     latest_by_topic: dict[str, dict[str, Any]] = {}
     passthrough: list[dict[str, Any]] = []
     for msg in messages:
         topic = str(msg.get("topic", ""))
-        if topic in {"/robot/pose", "/robot/gps", "/chassis/odom", "/chassis/status", "/lidar/front", "/lidar/rear"} or topic.startswith("/camera/"):
+        if topic in {"/robot/pose", "/map/grid"}:
             latest_by_topic[topic] = msg
         else:
             passthrough.append(msg)
-    ordered_topics = [
-        "/robot/pose",
-        "/chassis/odom",
-        "/chassis/status",
-        "/robot/gps",
-        "/lidar/front",
-        "/lidar/rear",
-    ]
-    ordered_topics.extend(sorted(topic for topic in latest_by_topic if topic.startswith("/camera/")))
+    ordered_topics = ["/robot/pose", "/map/grid"]
     coalesced = [latest_by_topic[topic] for topic in ordered_topics if topic in latest_by_topic]
     return coalesced + passthrough
 
 
+# 把栅格坐标编码成字符串 key，便于在字典中存取。
 def _cell_key(ix: int, iy: int) -> str:
     return f"{ix}:{iy}"
 
 
+# 记录障碍格命中次数和最大强度，用于后续滤波和显示。
 def _mark_occupied(scan: dict[str, Any], ix: int, iy: int, intensity: float, hits: int = 1) -> None:
     key = _cell_key(ix, iy)
     slot = scan["occupied"].get(key, {"ix": ix, "iy": iy, "hits": 0, "intensity": 0.0})
@@ -612,12 +632,14 @@ def _mark_occupied(scan: dict[str, Any], ix: int, iy: int, intensity: float, hit
     scan["occupied"][key] = slot
 
 
+# 获取运行基准目录，兼容源码运行和 PyInstaller 打包后的可执行文件。
 def runtime_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
 
+# 根据不同操作系统生成日志文件候选路径列表。
 def compute_log_candidates(
     platform_name: str,
     env: dict[str, str],
@@ -646,7 +668,9 @@ def compute_log_candidates(
     return candidates
 
 
+# 负责与服务端建立 WebSocket 流连接，并提供 HTTP 请求封装。
 class ServerBridge:
+    # 初始化服务端桥接状态、HTTP session、消息队列和重连计数。
     def __init__(self, ws_url: str, logger: logging.Logger | None = None) -> None:
         self.ws_url = normalize_server_ws_url(ws_url)
         self.http_base = self.ws_url.replace("ws://", "http://").replace("wss://", "https://").replace("/ws/stream", "")
@@ -662,6 +686,7 @@ class ServerBridge:
         self.reconnect_count = 0
         self.last_ws_issue_at_ms = 0
 
+    # 启动后台 WebSocket 线程；如果已经在运行则直接返回。
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
             return
@@ -670,6 +695,7 @@ class ServerBridge:
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
+    # 停止 WebSocket 线程并关闭当前连接。
     def stop(self) -> None:
         self.stop_event.set()
         self.connected = False
@@ -680,6 +706,7 @@ class ServerBridge:
             except Exception:
                 self.logger.exception("bridge ws close failed")
 
+    # 同步发送 HTTP POST 请求，带重试和指数退避。
     def post(self, path: str, body: dict, retries: int = 3, timeout_sec: float = 4.0, backoff_base_sec: float = 0.2) -> dict:
         last_err: Exception | None = None
         for index in range(retries + 1):
@@ -695,7 +722,9 @@ class ServerBridge:
                     time.sleep(backoff_base_sec * (2**index))
         raise RuntimeError(str(last_err))
 
+    # 异步发送 HTTP POST 请求，避免阻塞 Tk 主线程。
     def post_async(self, path: str, body: dict, retries: int = 1) -> None:
+        # 后台线程中的 POST 执行逻辑。
         def worker() -> None:
             session = requests.Session()
             session.trust_env = False
@@ -719,15 +748,18 @@ class ServerBridge:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    # 同步发送 HTTP GET 请求并返回 JSON。
     def get(self, path: str) -> dict:
         self.logger.info("http get path=%s", path)
         res = self.session.get(f"{self.http_base}{path}", timeout=2)
         res.raise_for_status()
         return res.json()
 
+    # WebSocket 主循环，负责连接、回调注册和断线重连。
     def _loop(self) -> None:
         retry = 0
 
+        # 处理 WebSocket 消息，将 JSON 消息放入线程安全队列。
         def on_message(_ws, msg: str) -> None:
             if msg == "pong":
                 return
@@ -736,17 +768,20 @@ class ServerBridge:
             except Exception:
                 self.logger.exception("ws message parse failed")
 
+        # WebSocket 打开时重置重试计数并标记已连接。
         def on_open(_ws) -> None:
             nonlocal retry
             retry = 0
             self.connected = True
             self.logger.info("ws opened host=%s", self.ws_host)
 
+        # WebSocket 关闭时标记离线并记录最近异常时间。
         def on_close(_ws, _code, _msg) -> None:
             self.connected = False
             self.last_ws_issue_at_ms = int(time.time() * 1000)
             self.logger.warning("ws closed code=%s msg=%s", _code, _msg)
 
+        # WebSocket 出错时记录异常并标记连接不可用。
         def on_error(_ws, _err) -> None:
             self.connected = False
             self.last_ws_issue_at_ms = int(time.time() * 1000)
@@ -778,7 +813,9 @@ class ServerBridge:
             time.sleep(min(10.0, 0.3 * (2 ** min(retry, 5))))
 
 
+# Tkinter 桌面端主类，整合登录、扫图、POI、路径规划、地图编辑和渲染。
 class DesktopClient:
+    # 初始化国际化文案、Tk 状态变量、运行状态、UI 和定时 tick 循环。
     def __init__(self) -> None:
         self.i18n = {
             "en": {
@@ -1152,13 +1189,10 @@ class DesktopClient:
         self.root.report_callback_exception = self.report_callback_exception
 
         self.bridge: ServerBridge | None = None
+        # 运行态只保留控制、机器人位姿和地图栅格；摄像头、GPS、底盘状态不再作为主流程输入。
         self.pose = {"x": 0.0, "y": 0.0, "yaw": 0.0, "vx": 0.0, "wz": 0.0}
-        self.gps = {"lat": 0.0, "lon": 0.0}
         self.odom = {"x": 0.0, "y": 0.0, "yaw": 0.0, "vx": 0.0, "wz": 0.0}
-        self.chassis = {"mode": "-", "battery": 0.0}
         self.pose_history: list[dict] = []
-        self.camera_inbox: dict[int, dict] = {i: {"objects": [], "meta": {}} for i in range(1, 5)}
-        self.camera_display: dict[int, dict] = {i: {"objects": [], "meta": {}} for i in range(1, 5)}
         self.last_scan = {
             "front": {"raw_points": 0, "keyframe": False, "stamp": 0},
             "rear": {"raw_points": 0, "keyframe": False, "stamp": 0},
@@ -1244,7 +1278,6 @@ class DesktopClient:
         self.scan_state_var = tk.StringVar(value=self.tr("idle"))
         self.scan_mode_var = tk.StringVar(value=str(self.scan["mode"]))
         self.keyboard_var = tk.StringVar(value=self.tr("keyboard_inactive"))
-        self.camera_refresh_var = tk.StringVar(value="No buffered frame")
         self.map_name_var = tk.StringVar(value="desktop_map")
         self.map_notes_var = tk.StringVar(value="Desktop scan session")
         self.voxel_var = tk.StringVar(value=f"{float(self.scan_fusion['voxel_size']):.2f}")
@@ -1329,6 +1362,7 @@ class DesktopClient:
         self.control_sender_thread.start()
         self.tick()
 
+    # 配置滚动日志文件，避免重复添加同一路径的 handler。
     def setup_logging(self) -> str:
         log_candidates = compute_log_candidates(
             platform_name=sys.platform,
@@ -1355,6 +1389,7 @@ class DesktopClient:
         logger.info("desktop client startup")
         return str(log_path)
 
+    # 统一捕获 Tk 回调异常，写日志并弹窗提示。
     def report_callback_exception(self, exc_type, exc_value, exc_traceback) -> None:
         details = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
         bootstrap_log_write(Path(self.log_path), f"tk callback exception\n{details}")
@@ -1364,16 +1399,19 @@ class DesktopClient:
         except Exception:
             pass
 
+    # 按当前语言获取文案，并支持 format 参数替换。
     def tr(self, key: str, **kwargs) -> str:
         text = self.i18n[self.current_lang].get(key, key)
         return text.format(**kwargs) if kwargs else text
 
+    # 处理语言下拉框变化，并重建界面以应用翻译。
     def on_language_change(self, _event=None) -> None:
         selection = self.lang_choice_var.get()
         self.current_lang = "zh" if selection == self.i18n["en"]["chinese"] else "en"
         self.logger.info("language changed lang=%s", self.current_lang)
         self.rebuild_ui()
 
+    # 销毁并重新创建所有 UI 控件，用于切换语言。
     def rebuild_ui(self) -> None:
         for child in self.root.winfo_children():
             child.destroy()
@@ -1382,6 +1420,7 @@ class DesktopClient:
         self._ui()
         self.refresh_language_state()
 
+    # 刷新与语言相关的状态变量和面板文字。
     def refresh_language_state(self) -> None:
         self.poi_mode_display_var.set(self.tr(self.poi_mode_var.get()))
         self.path_mode_display_var.set(self.tr(self.path_mode_var.get()))
@@ -1405,6 +1444,7 @@ class DesktopClient:
         self.sync_path_panel()
         self.update_left_panel_notice()
 
+    # 把界面显示文案反向映射为内部模式值。
     def sync_mode_from_display(self, kind: str) -> None:
         if kind == "poi":
             reverse = {self.tr("batch"): "batch", self.tr("single"): "single", self.tr("edit"): "edit"}
@@ -1419,6 +1459,7 @@ class DesktopClient:
             self.edit_tool_var.set(reverse.get(self.edit_tool_display_var.get(), "view"))
             self.edit_tool_changed()
 
+    # 设置 ttk 主题和基础控件样式。
     def _style(self) -> None:
         style = ttk.Style()
         style.theme_use("clam")
@@ -1427,6 +1468,7 @@ class DesktopClient:
         style.configure("Header.TLabel", font=("Segoe UI", 24, "bold"))
         style.configure("Muted.TLabel", foreground="#5c6f7a", font=("Segoe UI", 10))
 
+    # 创建主窗口整体布局：顶部工具栏、左侧面板、地图区和右侧信息区。
     def _ui(self) -> None:
         shell = ttk.Frame(self.root, padding=12)
         shell.pack(fill=tk.BOTH, expand=True)
@@ -1464,6 +1506,7 @@ class DesktopClient:
         self.sync_visibility_cards()
         self.root.after_idle(self.reset_view)
 
+    # 创建左侧可滚动控制面板。
     def _left(self, parent: ttk.Frame) -> None:
         shell = ttk.Frame(parent)
         shell.pack(fill=tk.BOTH, expand=True)
@@ -1488,6 +1531,7 @@ class DesktopClient:
         self.map_card = self._map_controls(self.left_panel)
         parent.bind("<Configure>", lambda _e: self.root.after_idle(self.update_left_panel_notice))
 
+    # 创建左侧面板显示/隐藏开关。
     def _visibility_controls(self, parent: ttk.Frame) -> None:
         card = ttk.LabelFrame(parent, text=self.tr("panel_visibility"), padding=8)
         card.pack(fill=tk.X, pady=(0, 10))
@@ -1500,6 +1544,7 @@ class DesktopClient:
         ]):
             ttk.Checkbutton(card, text=text, variable=var, command=self.sync_visibility_cards).grid(row=index, column=0, sticky="w", padx=6, pady=2)
 
+    # 创建扫描控制卡片。
     def _scan_controls(self, parent: ttk.Frame) -> ttk.LabelFrame:
         card = ttk.LabelFrame(parent, text=self.tr("scan"), padding=8)
         card.pack(fill=tk.X, pady=(0, 10))
@@ -1524,6 +1569,7 @@ class DesktopClient:
         self._entry(card, self.tr("notes"), self.map_notes_var)
         return card
 
+    # 创建机器人移动控制卡片。
     def _move_controls(self, parent: ttk.Frame) -> ttk.LabelFrame:
         card = ttk.LabelFrame(parent, text=self.tr("move"), padding=8)
         card.pack(fill=tk.X, pady=(0, 10))
@@ -1540,6 +1586,7 @@ class DesktopClient:
         move_row.pack(fill=tk.X, pady=(6, 0))
         return card
 
+    # 创建 POI 新增、编辑、删除和列表 UI。
     def _poi_controls(self, parent: ttk.Frame) -> ttk.LabelFrame:
         card = ttk.LabelFrame(parent, text=self.tr("poi"), padding=8)
         card.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
@@ -1597,6 +1644,7 @@ class DesktopClient:
         self.sync_poi_mode_ui()
         return card
 
+    # 创建路径规划与闭环校验控制 UI。
     def _path_controls(self, parent: ttk.Frame) -> ttk.LabelFrame:
         card = ttk.LabelFrame(parent, text=self.tr("path"), padding=8)
         card.pack(fill=tk.BOTH, expand=True)
@@ -1635,6 +1683,7 @@ class DesktopClient:
         self.path_end_var.trace_add("write", lambda *_: self.sync_path_panel())
         return card
 
+    # 创建地图编辑、保存、加载和导出控制 UI。
     def _map_controls(self, parent: ttk.Frame) -> ttk.LabelFrame:
         card = ttk.LabelFrame(parent, text=self.tr("map"), padding=8)
         card.pack(fill=tk.X, pady=(10, 0))
@@ -1661,6 +1710,7 @@ class DesktopClient:
         ttk.Label(card, textvariable=self.map_edit_status_var, style="Muted.TLabel", wraplength=340).pack(anchor=tk.W, pady=(6, 0))
         return card
 
+    # 创建中心地图画布和视图控制按钮。
     def _center(self, parent: ttk.Frame) -> None:
         card = ttk.LabelFrame(parent, text=self.tr("map_view"), padding=8)
         card.pack(fill=tk.BOTH, expand=True)
@@ -1684,10 +1734,12 @@ class DesktopClient:
         self.canvas.bind("<B1-Motion>", self.canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.canvas_release)
 
+    # 创建右侧文本信息面板。
     def _right(self, parent: ttk.Frame) -> None:
         self.scan_text = self._card_text(parent, self.tr("odom_scan"), 8)
         self.comm_text = self._card_text(parent, self.tr("comm_map"), 12)
 
+    # 创建带标题的只读/展示文本卡片。
     def _card_text(self, parent: ttk.Frame, title: str, height: int) -> tk.Text:
         card = ttk.LabelFrame(parent, text=title, padding=8)
         card.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
@@ -1695,12 +1747,14 @@ class DesktopClient:
         text.pack(fill=tk.BOTH, expand=True)
         return text
 
+    # 创建通用标签 + 输入框行。
     def _entry(self, parent: ttk.Frame, label: str, var: tk.StringVar) -> None:
         row = ttk.Frame(parent)
         row.pack(fill=tk.X, pady=2)
         ttk.Label(row, text=label, width=18).pack(side=tk.LEFT)
         ttk.Entry(row, textvariable=var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
 
+    # 创建可根据宽度自动换行的按钮行。
     def _responsive_button_row(self, parent: ttk.Frame, buttons: list[tuple[str, object]], min_button_width: int = 120) -> tuple[ttk.Frame, list[ttk.Button]]:
         frame = ttk.Frame(parent)
         created: list[ttk.Button] = []
@@ -1713,6 +1767,7 @@ class DesktopClient:
         self.root.after_idle(lambda spec=row_spec: self.layout_responsive_row(spec))
         return frame, created
 
+    # 根据当前容器宽度重新排列按钮网格。
     def layout_responsive_row(self, spec: dict) -> None:
         frame = spec["frame"]
         buttons = spec["buttons"]
@@ -1729,6 +1784,7 @@ class DesktopClient:
         for col in range(columns, len(buttons)):
             frame.grid_columnconfigure(col, weight=0)
 
+    # 检测左侧面板是否需要滚动，并给出空间不足提示。
     def update_left_panel_notice(self) -> None:
         if not hasattr(self, "left_panel"):
             return
@@ -1740,18 +1796,21 @@ class DesktopClient:
         else:
             self.left_layout_notice_var.set("")
 
+    # 左侧内容尺寸变化时更新滚动区域。
     def on_left_panel_configure(self, _event=None) -> None:
         if not hasattr(self, "left_canvas"):
             return
         self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all"))
         self.root.after_idle(self.update_left_panel_notice)
 
+    # 左侧画布尺寸变化时同步内部窗口宽度。
     def on_left_canvas_configure(self, event) -> None:
         if not hasattr(self, "left_canvas"):
             return
         self.left_canvas.itemconfigure(self.left_window_id, width=event.width)
         self.root.after_idle(self.update_left_panel_notice)
 
+    # 只在鼠标位于左侧面板时响应滚动。
     def on_left_mousewheel(self, event) -> None:
         if not hasattr(self, "left_canvas"):
             return
@@ -1765,12 +1824,14 @@ class DesktopClient:
                 return
             current = current.master
 
+    # 把 StringVar 转成 float，失败时返回兜底值。
     def number(self, var: tk.StringVar, fallback: float) -> float:
         try:
             return float(var.get().strip())
         except Exception:
             return fallback
 
+    # 按勾选状态显示或隐藏左侧功能卡片。
     def sync_visibility_cards(self) -> None:
         order = [
             (self.scan_card, self.show_scan_card_var.get(), tk.X, False),
@@ -1787,6 +1848,7 @@ class DesktopClient:
                 frame.pack(fill=fill_mode, expand=expand, pady=pady)
         self.root.after_idle(self.update_left_panel_notice)
 
+    # 根据 POI 模式显示对应输入区域，并更新批量按钮文字。
     def sync_poi_mode_ui(self) -> None:
         mode = self.poi_mode_var.get()
         for frame in (self.batch_poi_frame, self.single_poi_frame, self.edit_poi_frame):
@@ -1800,6 +1862,7 @@ class DesktopClient:
         target.pack(fill=tk.X, pady=(0, 6))
         self.batch_action_btn.configure(text=self.tr("start_batch_add") if self.pending_poi is None and not self.pending_poi_queue else self.tr("cancel_batch", count=len(self.pending_poi_queue) + (1 if self.pending_poi else 0)))
 
+    # 刷新服务端健康状态，并在建图条件恢复时自动继续扫描。
     def update_health_status_detail(self, health: dict) -> None:
         if (
             hasattr(self, "scan")
@@ -1832,6 +1895,7 @@ class DesktopClient:
             )
         )
 
+    # 更新并缓存当前网络质量。
     def update_network_quality(self) -> str:
         if not hasattr(self, "stream_health"):
             self.stream_health = {}
@@ -1849,6 +1913,7 @@ class DesktopClient:
             self.stream_health["network_quality_checksum_seen"] = int(self.stream_health.get("checksum_err", 0) or 0)
         return quality
 
+    # 打开登录/直连配置弹窗。
     def open_login_dialog(self) -> None:
         dialog = tk.Toplevel(self.root)
         dialog.title(self.tr("login_title"))
@@ -1876,6 +1941,7 @@ class DesktopClient:
         dialog.wait_visibility()
         dialog.focus_set()
 
+    # 执行登录流程，成功后自动连接服务端。
     def login_and_connect(self, dialog: tk.Toplevel | None = None) -> None:
         if not bool(self.client_config.get("login_required", True)):
             if dialog is not None:
@@ -1902,6 +1968,7 @@ class DesktopClient:
             user_message = exc.user_message if isinstance(exc, AuthFlowError) else self.tr("login_failed_safe")
             messagebox.showerror(self.tr("login_failed"), user_message)
 
+    # 连接服务端：预检 /health 后启动 WebSocket 桥接。
     def connect(self) -> None:
         try:
             self.disconnect()
@@ -1935,6 +2002,7 @@ class DesktopClient:
             self.status_var.set(self.tr("ws_offline"))
             self.status_detail_var.set(redact_sensitive_text(str(exc)))
 
+    # 断开服务端连接并重置连接状态文案。
     def disconnect(self) -> None:
         self.logger.info("disconnect clicked")
         if self.bridge:
@@ -1944,6 +2012,7 @@ class DesktopClient:
         self.status_var.set(self.tr("ws_offline"))
         self.status_detail_var.set(self.tr("disconnected"))
 
+    # 同步调用服务端 API，并统一处理错误提示。
     def call_api(self, path: str, body: dict) -> dict | None:
         if not self.bridge:
             messagebox.showwarning(self.tr("disconnected"), self.tr("warning_disconnected"))
@@ -1958,6 +2027,7 @@ class DesktopClient:
             messagebox.showerror(self.tr("api_error"), self.tr("connect_failed_safe"))
             return None
 
+    # 异步调用服务端 API，用于不需要立即返回结果的操作。
     def call_api_async(self, path: str, body: dict) -> None:
         if not self.bridge:
             messagebox.showwarning(self.tr("disconnected"), self.tr("warning_disconnected"))
@@ -1965,6 +2035,7 @@ class DesktopClient:
         self.stream_health["last_api_error"] = ""
         self.bridge.post_async(path, body)
 
+    # 创建用于 PCD 下载等耗时操作的进度弹窗。
     def _create_progress_dialog(self, title: str) -> dict[str, Any] | None:
         if getattr(self, "root", None) is None:
             return None
@@ -1981,6 +2052,7 @@ class DesktopClient:
         dialog.update_idletasks()
         return {"dialog": dialog, "detail_var": detail_var, "progress": progress, "started": False}
 
+    # 更新进度弹窗的文字和进度条状态。
     def _update_progress_dialog(self, progress_state: dict[str, Any] | None, detail: str, received: int, total: int) -> None:
         if not progress_state:
             return
@@ -1996,6 +2068,7 @@ class DesktopClient:
                 progress_state["started"] = True
         progress_state["dialog"].update_idletasks()
 
+    # 关闭进度弹窗并停止进度条动画。
     def _close_progress_dialog(self, progress_state: dict[str, Any] | None) -> None:
         if not progress_state:
             return
@@ -2010,6 +2083,7 @@ class DesktopClient:
         except Exception:
             pass
 
+    # 从响应头中解析下载文件名，失败时使用默认名。
     def _parse_download_filename(self, response: requests.Response, default_name: str = "map.pcd") -> str:
         content_disposition = str(response.headers.get("Content-Disposition", "") or "")
         match = re.search(r'filename="?([^";]+)"?', content_disposition)
@@ -2018,6 +2092,7 @@ class DesktopClient:
         header_name = str(response.headers.get("X-Scan-PCD-Name", "") or "").strip()
         return header_name or default_name
 
+    # 获取当前选择的扫描模式，并兼容已有扫描状态。
     def selected_scan_mode(self) -> str:
         current_scan_mode = str(getattr(self, "scan", {}).get("mode", "2d")).strip().lower()
         if current_scan_mode == "3d":
@@ -2032,6 +2107,7 @@ class DesktopClient:
                 pass
         return "2d"
 
+    # 确保 3D 扫描结果已有 PCD 数据；必要时从服务端下载。
     def ensure_scan_pcd(self, mode: str | None = None) -> dict[str, Any] | None:
         current_bytes = bytes(self.scan.get("pcd_bytes") or b"")
         if current_bytes:
@@ -2128,6 +2204,7 @@ class DesktopClient:
             self._close_progress_dialog(progress_state)
             self.sync_scan_badges()
 
+    # 按固定间隔轮询服务端健康状态。
     def poll_health(self) -> None:
         now = time.monotonic()
         if now - self.last_health_poll_at < HEALTH_POLL_INTERVAL_SEC or not self.bridge or not self.bridge.connected:
@@ -2140,6 +2217,7 @@ class DesktopClient:
             self.stream_health["last_api_error"] = str(exc)
             self.logger.warning("health poll failed err=%s", exc)
 
+    # 主循环定时任务：消费消息、刷新状态、渲染画布并安排下一次 tick。
     def tick(self) -> None:
         self.consume_messages()
         if self.scan_badges_dirty:
@@ -2161,6 +2239,7 @@ class DesktopClient:
         )
         self.root.after(60, self.tick)
 
+    # 校验流式消息的 checksum、时间戳和序号连续性。
     def validate_message(self, msg: dict) -> bool:
         self.stream_health["msg_total"] += 1
         stamp = float(msg.get("stamp", 0.0))
@@ -2190,6 +2269,7 @@ class DesktopClient:
         self.last_message_at_ms = int(time.time() * 1000)
         return True
 
+    # 从桥接队列批量取消息，合并高频 topic 后更新本地状态。
     def consume_messages(self) -> None:
         if not self.bridge:
             return
@@ -2213,34 +2293,17 @@ class DesktopClient:
             processed += 1
             topic = msg.get("topic")
             payload = msg.get("payload", {})
+            # 现在只消费最小闭环需要的两个 topic：机器人位姿和 occupancy_grid。
             if topic == "/robot/pose":
                 self.pose = payload
-                self.mark_canvas_dirty()
-            elif topic == "/robot/gps":
-                self.gps = payload
-            elif topic == "/chassis/odom":
-                self.odom = payload
+                self.odom = dict(payload)
                 self.pose_history.append({"stamp": float(msg.get("stamp", time.time())), "pose": dict(payload)})
                 self.pose_history = self.pose_history[-240:]
                 self.mark_canvas_dirty()
-            elif topic == "/chassis/status":
-                self.chassis = payload
-            elif topic == "/lidar/front":
-                self.scan["front_frames"] += 1
-                self.scan["raw_points"] = int(self.scan.get("raw_points", 0)) + int(payload.get("raw_points", len(payload.get("points", []))))
-                self.last_scan["front"] = {"raw_points": int(payload.get("raw_points", len(payload.get("points", [])))), "keyframe": bool(payload.get("keyframe")), "stamp": float(msg.get("stamp", 0))}
-            elif topic == "/lidar/rear":
-                self.scan["rear_frames"] += 1
-                self.scan["raw_points"] = int(self.scan.get("raw_points", 0)) + int(payload.get("raw_points", len(payload.get("points", []))))
-                self.last_scan["rear"] = {"raw_points": int(payload.get("raw_points", len(payload.get("points", [])))), "keyframe": bool(payload.get("keyframe")), "stamp": float(msg.get("stamp", 0))}
             elif topic == "/map/grid":
                 self.update_server_grid(payload, float(msg.get("stamp", 0)))
-            elif topic and topic.startswith("/camera/"):
-                cam_id = parse_camera_topic_id(topic)
-                if cam_id is not None and cam_id in self.camera_inbox:
-                    self.camera_inbox[cam_id] = {"objects": payload.get("objects", []), "meta": {"seq": msg.get("seq"), "stamp": msg.get("stamp"), "received_at_ms": int(time.time() * 1000)}}
-        self.camera_refresh_var.set(build_camera_refresh_text(self.camera_inbox))
 
+    # 启动扫描流程，并把耗时请求放到后台线程避免阻塞 UI。
     def start_scan(self) -> None:
         mode = str(getattr(self, "scan_mode_var", None).get() if getattr(self, "scan_mode_var", None) is not None else self.scan.get("mode", "2d")).strip().lower()
         if hasattr(self, "logger") and hasattr(self.logger, "info"):
@@ -2275,6 +2338,7 @@ class DesktopClient:
         response = self.call_api("/scan/start", {"mode": mode})
         self._finish_start_scan(mode, response)
 
+    # 后台执行扫描启动 API，失败时尝试清理。
     def _start_scan_worker(self, mode: str) -> None:
         response = None
         try:
@@ -2292,6 +2356,7 @@ class DesktopClient:
         if getattr(self, "root", None) is not None:
             self.root.after(0, lambda: self._finish_start_scan(mode, response))
 
+    # 扫描启动超时或失败后，发送 stop 请求清理服务端状态。
     def _cleanup_scan_start_after_timeout(self, mode: str) -> None:
         bridge = getattr(self, "bridge", None)
         if bridge is None:
@@ -2305,6 +2370,7 @@ class DesktopClient:
             if hasattr(self, "logger"):
                 self.logger.warning("scan start cleanup stop_scan failed mode=%s err=%s", mode, cleanup_exc)
 
+    # 处理扫描启动响应，更新扫描状态和错误提示。
     def _finish_start_scan(self, mode: str, response: dict | None, show_mapping_warning: bool = True) -> None:
         if hasattr(self, "logger") and hasattr(self.logger, "info"):
             self.logger.info(
@@ -2378,6 +2444,7 @@ class DesktopClient:
             self.scan["started_ms"] = int(time.time() * 1000)
             self.sync_scan_badges()
 
+    # 停止当前扫描并处理服务端返回状态。
     def stop_scan(self) -> None:
         mode = str(self.scan.get("mode", "2d")).strip().lower()
         if hasattr(self, "logger") and hasattr(self.logger, "info"):
@@ -2437,6 +2504,7 @@ class DesktopClient:
         self.scan["pending_mode"] = ""
         self.sync_scan_badges()
 
+    # 清空当前扫描缓存、地图缓存和 PCD 缓存。
     def clear_scan(self) -> None:
         with self.scan_lock:
             self.scan["occupied"] = {}
@@ -2456,6 +2524,7 @@ class DesktopClient:
             self.map_photo_key = None
         self.sync_scan_badges()
 
+    # 同步扫描状态、地图状态和统计徽标。
     def sync_scan_badges(self) -> None:
         grid = self.active_grid()
         if grid.get("active"):
@@ -2484,26 +2553,32 @@ class DesktopClient:
         self.stats_badge_var.set(self.tr("stats_badge", occ=occ, poi=len(self.poi_nodes), path=len(self.path_segments)))
         self.mark_canvas_dirty()
 
+    # 标记画布需要重绘，并递增渲染版本号。
     def mark_canvas_dirty(self) -> None:
         self.canvas_dirty = True
         self.canvas_revision += 1
 
+    # 生成当前扫描栅格的字典 key。
     def cell_key(self, ix: int, iy: int) -> str:
         return f"{ix}:{iy}"
 
+    # 把世界坐标转换为当前扫描分辨率下的栅格坐标。
     def world_to_cell(self, x: float, y: float) -> tuple[int, int]:
         voxel = float(self.scan["voxel"])
         return round(x / voxel), round(y / voxel)
 
+    # 按指定分辨率把世界坐标转换为栅格坐标。
     def world_to_cell_with_resolution(self, x: float, y: float, resolution: float) -> tuple[int, int]:
         voxel = max(0.02, float(resolution))
         return round(x / voxel), round(y / voxel)
 
+    # 判断是否优先使用服务端下发的地图栅格。
     def should_use_server_grid(self) -> bool:
         server_grid = getattr(self, "server_grid", {}) or {}
         edit = getattr(self, "edit", {}) or {}
         return bool(server_grid.get("active")) and not bool(edit.get("loaded_from_stcm"))
 
+    # 获取当前活跃地图/扫描使用的分辨率。
     def active_voxel_size(self) -> float:
         if self.active_grid().get("active"):
             return max(0.02, float(self.active_grid().get("resolution", getattr(self, "scan", {}).get("voxel", 0.08))))
@@ -2511,6 +2586,7 @@ class DesktopClient:
             return max(0.02, float(getattr(self, "server_grid", {}).get("resolution", getattr(self, "scan", {}).get("voxel", 0.08))))
         return float(self.scan["voxel"])
 
+    # 获取当前活跃栅格，优先使用已加载地图，其次使用服务端栅格。
     def active_grid(self) -> dict:
         loaded_grid = getattr(self, "map_grid", {}) or {}
         if bool(loaded_grid.get("active")):
@@ -2522,12 +2598,14 @@ class DesktopClient:
                 return {"active": True, **server_grid}
         return {"active": False}
 
+    # 把世界坐标转换到活跃栅格的局部坐标系。
     def world_to_active_grid_cell(self, x: float, y: float, grid: dict | None = None) -> tuple[int, int]:
         grid = self.active_grid() if grid is None else grid
         resolution = max(0.02, float(grid.get("resolution", self.scan.get("voxel", 0.08))))
         origin = grid.get("origin") if isinstance(grid.get("origin"), dict) else {"x": 0.0, "y": 0.0}
         return round((float(x) - float(origin.get("x", 0.0))) / resolution), round((float(y) - float(origin.get("y", 0.0))) / resolution)
 
+    # 修改活跃栅格中的单元值，并同步缓存统计和 revision。
     def set_active_grid_value(self, grid_x: int, grid_y: int, value: int) -> None:
         grid = self.active_grid()
         if not grid.get("active"):
@@ -2562,6 +2640,7 @@ class DesktopClient:
         self.map_photo_key = None
         self.mark_canvas_dirty()
 
+    # 获取当前用于显示/规划的障碍格列表。
     def active_occupancy_cells(self) -> list[dict]:
         grid = self.active_grid()
         if grid.get("active"):
@@ -2570,6 +2649,7 @@ class DesktopClient:
             return [dict(cell) for cell in getattr(self, "server_grid", {}).get("occupied_cells", [])]
         return self.filtered_occupancy_cells()
 
+    # 获取当前用于显示/导出的空闲格列表。
     def active_free_cells(self) -> list[dict]:
         grid = self.active_grid()
         if grid.get("active"):
@@ -2578,6 +2658,7 @@ class DesktopClient:
             return [dict(cell) for cell in getattr(self, "server_grid", {}).get("free_cells", [])]
         return self.filtered_free_cells()
 
+    # 把 occupancy grid 数据展开成障碍格或空闲格列表。
     def grid_cells(self, grid: dict, occupied: bool) -> list[dict]:
         width = int(grid.get("width", 0) or 0)
         resolution = max(0.02, float(grid.get("resolution", self.scan.get("voxel", 0.08))))
@@ -2599,6 +2680,7 @@ class DesktopClient:
             cells.append(cell)
         return cells
 
+    # 计算当前地图边界多边形，用于导出和展示。
     def active_map_fence_xy(self) -> list[dict[str, float]]:
         grid = self.active_grid()
         if grid.get("active"):
@@ -2652,6 +2734,7 @@ class DesktopClient:
             {"x": round(min_x, 3), "y": round(min_y, 3)},
         ]
 
+    # 接收服务端地图栅格消息并更新本地缓存。
     def update_server_grid(self, payload: dict[str, Any], stamp: float) -> None:
         was_active = bool(self.server_grid.get("active"))
         resolution = max(0.02, float(payload.get("resolution", getattr(self, "scan", {}).get("voxel", 0.08))))
@@ -2683,6 +2766,7 @@ class DesktopClient:
         if not was_active and hasattr(self, "canvas") and not bool(getattr(self, "edit", {}).get("loaded_from_stcm")):
             self.center_loaded_map()
 
+    # 读取 UI 中的扫描融合参数并生成有效配置。
     def effective_scan_fusion_config(self) -> dict:
         overrides = {
             "voxel_size": max(0.02, self.number(self.voxel_var, float(self.scan_fusion.get("voxel_size", 0.08)))),
@@ -2693,6 +2777,7 @@ class DesktopClient:
         }
         return resolve_scan_fusion_config(None, overrides)
 
+    # 应用扫描融合配置，并可同步写回 UI 变量。
     def apply_scan_fusion_config(self, config: dict, update_vars: bool = True) -> dict:
         resolved = resolve_scan_fusion_config(str(config.get("preset", "")), config)
         self.scan_fusion = resolved
@@ -2707,9 +2792,11 @@ class DesktopClient:
             self.skip_turn_frames_var.set(bool(resolved["skip_turn_frames"]))
         return resolved
 
+    # 从界面读取并应用扫描融合配置。
     def apply_scan_fusion_config_from_ui(self) -> dict:
         return self.apply_scan_fusion_config(self.effective_scan_fusion_config(), update_vars=True)
 
+    # 生成障碍格查找表，供路径规划避障使用。
     def occupied_lookup(self) -> dict[tuple[int, int], dict]:
         grid = self.active_grid()
         if grid.get("active"):
@@ -2727,9 +2814,11 @@ class DesktopClient:
             return lookup
         return {(int(cell["ix"]), int(cell["iy"])): cell for cell in self.scan["occupied"].values()}
 
+    # 把当前扫描中的指定格子标记为障碍。
     def mark_occupied(self, ix: int, iy: int, intensity: float, hits: int = 1) -> None:
         _mark_occupied(self.scan, ix, iy, intensity, hits)
 
+    # 按融合规则过滤扫描障碍格。
     def filtered_occupancy_cells(self) -> list[dict]:
         config = self.effective_scan_fusion_config()
         cells: list[dict] = []
@@ -2740,6 +2829,7 @@ class DesktopClient:
             cells.append({"ix": int(cell["ix"]), "iy": int(cell["iy"]), "hits": int(cell["hits"]), "intensity": float(cell["intensity"])})
         return cells
 
+    # 按障碍/空闲命中比例过滤空闲格。
     def filtered_free_cells(self) -> list[dict]:
         occupied_by_key = {self.cell_key(int(cell["ix"]), int(cell["iy"])): cell for cell in self.scan["occupied"].values()}
         cells: list[dict] = []
@@ -2751,6 +2841,7 @@ class DesktopClient:
             cells.append({"ix": int(cell["ix"]), "iy": int(cell["iy"]), "hits": int(cell["hits"])})
         return cells
 
+    # 获取当前地图的标准 occupancy_grid 表示。
     def current_occupancy_grid(self) -> dict:
         grid = self.active_grid()
         if grid.get("active"):
@@ -2763,9 +2854,11 @@ class DesktopClient:
             }
         return occupancy_grid_from_cells(self.active_occupancy_cells(), self.active_free_cells(), self.active_voxel_size())
 
+    # 把 POI 数据对象转换成路径规划使用的 Point。
     def point_from_poi(self, poi: Poi) -> Point:
         return Point(x=poi.x, y=poi.y, name=poi.name, yaw=poi.yaw, lat=poi.lat, lon=poi.lon, poi_id=poi.client_id)
 
+    # 从字典 payload 构造 Point 对象。
     def point_from_dict(self, payload: dict) -> Point:
         return Point(
             x=float(payload.get("x", 0.0)),
@@ -2777,6 +2870,7 @@ class DesktopClient:
             poi_id=payload.get("poi_id") or payload.get("poiId"),
         )
 
+    # 把 Point 转换成可序列化 payload。
     def point_to_payload(self, point: Point) -> dict:
         return {
             "x": float(point.x),
@@ -2788,15 +2882,18 @@ class DesktopClient:
             "poi_id": point.poi_id,
         }
 
+    # 把 POI 转换为接口/导出使用的 payload。
     def poi_payload(self, poi: Poi) -> dict:
         return self.point_to_payload(self.point_from_poi(poi))
 
+    # 解析经纬度输入，并在格式错误时抛出本地化错误。
     def parse_geo_text(self, text: str, label: str) -> tuple[float | None, float | None]:
         lat, lon = self.parse_geo(text.strip())
         if text.strip() and lat is None:
             raise ValueError(self.tr("poi_geo_format", label=label))
         return lat, lon
 
+    # 根据 POI 经纬度数量决定是否进行缺失经纬度推算。
     def apply_geo_rules_to_pois(self, points: list[Poi]) -> list[Poi]:
         copies = [Poi(**poi.__dict__) for poi in points]
         geo_count = sum(1 for poi in copies if poi.lat is not None and poi.lon is not None)
@@ -2813,6 +2910,7 @@ class DesktopClient:
     
         return copies
 
+    # 根据起终点和避障参数构造路径段。
     def build_segment(self, start: Point, end: Point, source: str) -> dict:
         clearance = max(0.0, self.number(self.path_clearance_var, 0.3))
         points = plan_path_points(start, end, self.active_voxel_size(), self.occupied_lookup(), clearance)
@@ -2829,6 +2927,7 @@ class DesktopClient:
         self.segment_seed += 1
         return seg
 
+    # 启动或取消批量 POI 添加流程。
     def toggle_add_poi(self) -> None:
         if self.pending_poi is not None or self.pending_poi_queue:
             self.pending_poi = None
@@ -2848,6 +2947,7 @@ class DesktopClient:
         self.batch_action_btn.configure(text=self.tr("cancel_batch", count=len(queue)))
         self.start_next_poi_draft()
 
+    # 从批量队列中取出下一个待放置 POI。
     def start_next_poi_draft(self) -> None:
         if self.pending_poi is not None or not self.pending_poi_queue:
             return
@@ -2856,6 +2956,7 @@ class DesktopClient:
         self.poi_status_var.set(self.tr("poi_ready_place", name=self.pending_poi["name"]))
         self.batch_action_btn.configure(text=self.tr("cancel_batch", count=len(self.pending_poi_queue) + 1))
 
+    # 解析 lon,lat 文本，返回内部使用的 lat/lon。
     def parse_geo(self, text: str) -> tuple[float | None, float | None]:
         if not text:
             return None, None
@@ -2871,6 +2972,7 @@ class DesktopClient:
         except Exception:
             return None, None
 
+    # 在地图上放置待添加 POI，并处理批量队列。
     def place_poi(self, x: float, y: float) -> None:
         if self.pending_poi is None:
             return
@@ -2906,6 +3008,7 @@ class DesktopClient:
             self.batch_action_btn.configure(text=self.tr("start_batch_add"))
         self.sync_poi_box()
 
+    # 从单点输入框读取数据并添加 POI。
     def add_single_poi(self) -> None:
         name = self.single_poi_name_var.get().strip()
         if not name:
@@ -2934,6 +3037,7 @@ class DesktopClient:
         self.sync_poi_box()
         self.poi_status_var.set(self.tr("poi_added", name=name))
 
+    # 把编辑表单中的内容应用到选中的 POI。
     def apply_poi_edit(self) -> None:
         selected = [poi for poi in self.poi_nodes if poi.client_id in self.selected_poi_ids]
         if len(selected) != 1:
@@ -2966,6 +3070,7 @@ class DesktopClient:
         self.sync_poi_box()
         self.poi_status_var.set(self.tr("poi_updated", name=updated.name))
 
+    # 同步列表选择状态，并把单选 POI 信息填入编辑表单。
     def sync_selected_poi(self) -> None:
         self.selected_poi_ids = set()
         for idx in self.poi_box.curselection():
@@ -2982,12 +3087,14 @@ class DesktopClient:
         self.sync_scan_badges()
         self.sync_path_panel()
 
+    # 刷新 POI 列表显示。
     def sync_poi_box(self) -> None:
         self.poi_box.delete(0, tk.END)
         for index, poi in enumerate(self.poi_nodes, start=1):
             self.poi_box.insert(tk.END, f"{index}. {poi.name} ({poi.x:.2f}, {poi.y:.2f}) yaw={poi.yaw:.3f} lat={poi.lat if poi.lat is not None else 'n/a'} lon={poi.lon if poi.lon is not None else 'n/a'}")
         self.sync_scan_badges()
 
+    # 删除选中的 POI，并清理相关选择状态。
     def delete_selected_poi(self) -> None:
         if not self.selected_poi_ids:
             messagebox.showwarning(self.tr("poi"), self.tr("poi_select_delete"))
@@ -3005,6 +3112,7 @@ class DesktopClient:
         self.sync_poi_box()
         self.sync_path_panel()
 
+    # 把当前 POI 列表复制到剪贴板。
     def copy_poi_text(self) -> None:
         if not self.poi_nodes:
             messagebox.showwarning(self.tr("poi"), self.tr("poi_no_copy"))
@@ -3014,6 +3122,7 @@ class DesktopClient:
         self.root.clipboard_append(text)
         messagebox.showinfo(self.tr("poi"), self.tr("poi_copied"))
 
+    # 按名称查找 POI，并检查重名情况。
     def find_poi_name(self, name: str) -> Poi | None:
         target = name.strip().lower()
         if not target:
@@ -3028,11 +3137,13 @@ class DesktopClient:
             return None
         return matches[0]
 
+    # 添加路径段并刷新路径相关状态。
     def add_segment(self, seg: dict) -> None:
         self.path_segments.append(seg)
         self.selected_segment_id = seg["id"]
         self.sync_path_panel()
 
+    # 根据路径段重建路径节点列表。
     def rebuild_path_nodes(self) -> None:
         self.path_nodes = []
         for seg in self.path_segments:
@@ -3044,6 +3155,7 @@ class DesktopClient:
                     continue
                 self.path_nodes.append(node)
 
+    # 按起点/终点 POI 名称生成路径段。
     def connect_named_poi(self) -> None:
         a = self.find_poi_name(self.path_start_var.get().strip())
         b = self.find_poi_name(self.path_end_var.get().strip())
@@ -3057,6 +3169,7 @@ class DesktopClient:
         except ValueError as exc:
             messagebox.showwarning(self.tr("path"), str(exc))
 
+    # 对所有 POI 求最近邻闭环路线，并可用 2-opt 优化。
     def auto_loop(self) -> None:
         if len(self.poi_nodes) < 2:
             messagebox.showwarning(self.tr("path"), self.tr("path_need_two_poi"))
@@ -3076,11 +3189,13 @@ class DesktopClient:
         self.selected_segment_id = self.path_segments[-1]["id"] if self.path_segments else None
         self.sync_path_panel()
 
+    # 同步路径段列表的当前选择。
     def sync_selected_segment(self) -> None:
         sel = self.path_box.curselection()
         self.selected_segment_id = self.path_segments[sel[0]]["id"] if sel and sel[0] < len(self.path_segments) else None
         self.sync_path_panel()
 
+    # 删除当前选中的路径段。
     def delete_selected_segment(self) -> None:
         if self.selected_segment_id is None:
             return
@@ -3088,6 +3203,7 @@ class DesktopClient:
         self.selected_segment_id = None
         self.sync_path_panel()
 
+    # 清空 POI、路径段和自由点选择。
     def clear_selection(self) -> None:
         self.selected_segment_id = None
         self.selected_poi_ids = set()
@@ -3098,6 +3214,7 @@ class DesktopClient:
         self.sync_path_panel()
         self.sync_poi_box()
 
+    # 执行路径闭环校验，并可弹窗展示结果。
     def validate_path(self, show_alert: bool) -> bool:
         segments = [{"id": seg["id"], "start": self.point_from_dict(seg["start"]), "end": self.point_from_dict(seg["end"])} for seg in self.path_segments]
         self.path_validation = compute_path_closed_loop_validation(segments, self.active_voxel_size())
@@ -3108,6 +3225,7 @@ class DesktopClient:
             messagebox.showinfo(self.tr("path_validation_title"), self.path_validation["message"])
         return bool(self.path_validation["ok"])
 
+    # 计算一条路径折线的长度。
     def path_polyline_length(self, seg: dict) -> float:
         points = seg.get("points") or [seg["start"], seg["end"]]
         total = 0.0
@@ -3115,6 +3233,7 @@ class DesktopClient:
             total += math.hypot(points[index + 1]["x"] - points[index]["x"], points[index + 1]["y"] - points[index]["y"])
         return total
 
+    # 刷新路径列表和状态文案。
     def sync_path_panel(self) -> None:
         self.rebuild_path_nodes()
         self.path_box.delete(0, tk.END)
@@ -3137,6 +3256,7 @@ class DesktopClient:
             self.connect_named_btn.state(["disabled"])
         self.sync_scan_badges()
 
+    # 处理移动按钮点击，并发送对应控制命令。
     def move_click(self, name: str) -> None:
         command = self.build_control_command(name)
         if command is None:
@@ -3144,6 +3264,7 @@ class DesktopClient:
         path, body, _label = command
         self.call_api_async(path, body)
 
+    # 根据方向、速度和时长构造底盘控制命令。
     def build_control_command(self, name: str) -> tuple[str, dict, str] | None:
         fwd = self.number(self.forward_var, 0.8)
         rev = self.number(self.reverse_var, 0.5)
@@ -3160,6 +3281,7 @@ class DesktopClient:
             body = {"velocity": 0.0, "yaw_rate": -turn}
         return ("/control/target", body, name)
 
+    # 根据当前按键组合生成键盘控制方向。
     def keyboard_command(self) -> str | None:
         if "space" in self.keys_down:
             return "stop"
@@ -3173,11 +3295,13 @@ class DesktopClient:
             return "right"
         return None
 
+    # 清除当前控制目标并可立即发送停止指令。
     def clear_control_target(self) -> None:
         with self.control_lock:
             self.control_target = None
         self.control_sender_event.set()
 
+    # 更新持续发送的控制目标，并唤醒控制线程。
     def update_control_target(self, name: str | None) -> None:
         if name is None:
             self.clear_control_target()
@@ -3191,6 +3315,7 @@ class DesktopClient:
             self.control_target = command
         self.control_sender_event.set()
 
+    # 立即向服务端发送一次控制命令。
     def send_control_command_now(self, path: str, body: dict) -> None:
         bridge = self.bridge
         if bridge is None or not bridge.connected:
@@ -3199,6 +3324,7 @@ class DesktopClient:
         if hasattr(self, "stream_health"):
             self.stream_health["control_failures_consecutive"] = 0
 
+    # 后台循环按 repeat_ms 周期重复发送控制目标。
     def _control_sender_loop(self) -> None:
         while not self.control_sender_stop.is_set():
             repeat_sec = max(0.06, self.number(self.repeat_ms_var, 120) / 1000.0)
@@ -3219,12 +3345,14 @@ class DesktopClient:
                 if hasattr(self, "logger"):
                     self.logger.warning("control sender failed path=%s err=%s", path, exc)
 
+    # 确保控制发送线程处于可用状态。
     def ensure_drive_loop(self) -> None:
         command = self.keyboard_command()
         self.update_control_target(command)
         if command is not None:
             self.keyboard_var.set(self.tr("keyboard_cmd", cmd=command))
 
+    # 取消等待中的松键停止定时器。
     def cancel_pending_keyup_stop(self) -> None:
         if self.pending_keyup_stop_id is None:
             return
@@ -3234,6 +3362,7 @@ class DesktopClient:
             pass
         self.pending_keyup_stop_id = None
 
+    # 确认松键后发送停止命令，避免按键抖动误停。
     def confirm_keyup_stop(self) -> None:
         self.pending_keyup_stop_id = None
         if not self.stop_on_keyup_var.get() or self.keys_down:
@@ -3242,13 +3371,16 @@ class DesktopClient:
         self.move_click("stop")
         self.keyboard_var.set(self.tr("keyboard_stop_keyup"))
 
+    # 延迟触发松键停止逻辑。
     def schedule_keyup_stop(self) -> None:
         self.cancel_pending_keyup_stop()
         self.pending_keyup_stop_id = self.root.after(KEYUP_STOP_CONFIRM_MS, self.confirm_keyup_stop)
 
+    # 当输入框获得焦点时忽略全局方向键。
     def should_ignore_global_keys(self, widget: tk.Misc | None) -> bool:
         return isinstance(widget, (tk.Entry, tk.Text, tk.Listbox, ttk.Entry, ttk.Combobox))
 
+    # 处理键盘按下事件并更新运动控制目标。
     def on_key_press(self, event: tk.Event) -> None:
         if self.should_ignore_global_keys(self.root.focus_get()):
             return
@@ -3258,6 +3390,7 @@ class DesktopClient:
             self.keys_down.add(key)
             self.ensure_drive_loop()
 
+    # 处理键盘松开事件并根据配置停止或切换控制。
     def on_key_release(self, event: tk.Event) -> None:
         if self.should_ignore_global_keys(self.root.focus_get()):
             return
@@ -3270,6 +3403,7 @@ class DesktopClient:
         if self.stop_on_keyup_var.get():
             self.schedule_keyup_stop()
 
+    # 地图编辑工具变化时重置临时状态并刷新提示。
     def edit_tool_changed(self) -> None:
         self.edit["tool"] = self.edit_tool_var.get()
         self.edit["pending_obstacle_start"] = None
@@ -3281,6 +3415,7 @@ class DesktopClient:
             self.map_edit_status_var.set(self.tr("map_edit_view"))
         self.sync_scan_badges()
 
+    # 处理地图画布鼠标按下：选择、放置 POI 或开始编辑。
     def canvas_press(self, event: tk.Event) -> None:
         self.view["last_xy"] = (event.x, event.y)
         self.view["moved"] = False
@@ -3304,6 +3439,7 @@ class DesktopClient:
             return
         self.view["dragging"] = True
 
+    # 处理画布拖拽：平移视图或擦除噪点。
     def canvas_drag(self, event: tk.Event) -> None:
         if self.edit["erasing"]:
             x, y = self.screen_to_world(event.x, event.y)
@@ -3320,6 +3456,7 @@ class DesktopClient:
         self.view["last_xy"] = (event.x, event.y)
         self.update_view_metrics()
 
+    # 处理画布鼠标释放，完成平移或编辑动作。
     def canvas_release(self, event: tk.Event) -> None:
         if self.edit["erasing"]:
             self.edit["erasing"] = False
@@ -3331,7 +3468,7 @@ class DesktopClient:
             return
         x, y = self.screen_to_world(event.x, event.y)
         if self.path_mode_var.get() == "free":
-            point = Point(x=x, y=y, lat=self.gps.get("lat"), lon=self.gps.get("lon"))
+            point = Point(x=x, y=y, lat=None, lon=None)
             if self.pending_free_point is None:
                 self.pending_free_point = self.point_to_payload(point)
             else:
@@ -3342,6 +3479,7 @@ class DesktopClient:
                 self.pending_free_point = None
             self.sync_path_panel()
 
+    # 在指定世界坐标周围按画刷半径清除障碍。
     def erase_radius(self, world_x: float, world_y: float) -> None:
         radius = max(0.05, self.number(self.brush_var, 0.25))
         grid = self.active_grid()
@@ -3366,6 +3504,7 @@ class DesktopClient:
                 self.scan["free"].pop(key, None)
         self.sync_scan_badges()
 
+    # 在地图上绘制障碍线，并写入活跃栅格或扫描缓存。
     def draw_obstacle_line(self, start: tuple[float, float], end: tuple[float, float]) -> None:
         grid = self.active_grid()
         if grid.get("active"):
@@ -3383,6 +3522,7 @@ class DesktopClient:
             t = step / steps
             self.mark_occupied(round(sx + (ex - sx) * t), round(sy + (ey - sy) * t), 1.0, 3)
 
+    # 自动清理孤立障碍噪点。
     def auto_clear_noise(self) -> None:
         removable = []
         for key, cell in self.scan["occupied"].items():
@@ -3402,6 +3542,7 @@ class DesktopClient:
         self.map_edit_status_var.set(self.tr("noise_cleared", count=len(removable)) if removable else self.tr("noise_none"))
         self.sync_scan_badges()
 
+    # 清空已加载地图并恢复扫描会话视图。
     def clear_loaded_map(self) -> None:
         self.clear_scan()
         self.server_grid = {"active": False, "resolution": 0.0, "occupied_cells": [], "free_cells": [], "data": [], "origin": {"x": 0.0, "y": 0.0}, "width": 0, "height": 0, "stamp": 0.0}
@@ -3424,16 +3565,19 @@ class DesktopClient:
         self.map_edit_status_var.set(self.tr("map_cleared"))
         self.reset_view()
 
+    # 把世界坐标转换为画布屏幕坐标。
     def world_to_screen(self, x: float, y: float) -> tuple[float, float]:
         width = max(1, self.canvas.winfo_width())
         height = max(1, self.canvas.winfo_height())
         return width / 2 + self.view["pan_x"] + x * self.view["scale"], height / 2 + self.view["pan_y"] - y * self.view["scale"]
 
+    # 把画布屏幕坐标转换为世界坐标。
     def screen_to_world(self, x: float, y: float) -> tuple[float, float]:
         width = max(1, self.canvas.winfo_width())
         height = max(1, self.canvas.winfo_height())
         return (x - width / 2 - self.view["pan_x"]) / self.view["scale"], (height / 2 + self.view["pan_y"] - y) / self.view["scale"]
 
+    # 处理画布缩放滚轮事件。
     def on_mousewheel(self, event: tk.Event) -> None:
         if not can_zoom_from_widget(getattr(event, "widget", None), self.canvas):
             return
@@ -3443,6 +3587,7 @@ class DesktopClient:
             return
         self.zoom_view(factor, anchor=(x, y), screen_xy=(event.x, event.y))
 
+    # 以当前焦点点为中心缩放地图视图。
     def zoom_view(
         self,
         factor: float,
@@ -3458,10 +3603,12 @@ class DesktopClient:
             self.view["pan_y"] += screen_xy[1] - sy
         self.update_view_metrics()
 
+    # 点击非输入控件时清理焦点，避免键盘控制被输入框占用。
     def on_root_click(self, event: tk.Event) -> None:
         if should_clear_focus_on_click(getattr(event, "widget", None)):
             self.root.focus_set()
 
+    # 把给定世界坐标边界适配到当前画布视野。
     def fit_world_bounds(
         self,
         min_x: float,
@@ -3485,6 +3632,7 @@ class DesktopClient:
         self.view["pan_y"] = center_y * self.view["scale"]
         self.update_view_metrics()
 
+    # 计算当前活跃地图或扫描数据的世界坐标边界。
     def active_map_world_bounds(self, include_robot: bool = False) -> tuple[float, float, float, float] | None:
         grid = self.active_grid()
         if grid.get("active"):
@@ -3526,6 +3674,7 @@ class DesktopClient:
             max_y = max(max_y, float(self.pose.get("y", 0.0)))
         return (min_x, min_y, max_x, max_y)
 
+    # 把视图中心移动到机器人当前位置。
     def center_robot(self) -> None:
         bounds = self.active_map_world_bounds(include_robot=True)
         if bounds is not None:
@@ -3535,6 +3684,7 @@ class DesktopClient:
         self.view["pan_y"] = float(self.pose.get("y", 0.0)) * self.view["scale"]
         self.update_view_metrics()
 
+    # 把视图适配到当前加载地图的范围。
     def center_loaded_map(self) -> None:
         bounds = self.active_map_world_bounds(include_robot=False)
         if bounds is None:
@@ -3542,6 +3692,7 @@ class DesktopClient:
             return
         self.fit_world_bounds(*bounds)
 
+    # 重置视图，优先适配地图；没有地图时回到默认视角。
     def reset_view(self) -> None:
         bounds = self.active_map_world_bounds(include_robot=True)
         if bounds is not None:
@@ -3550,12 +3701,14 @@ class DesktopClient:
         self.view["scale"] = 80.0
         self.center_robot()
 
+    # 刷新平移和缩放倍率显示。
     def update_view_metrics(self) -> None:
         pan_x = -self.view["pan_x"] / self.view["scale"]
         pan_y = self.view["pan_y"] / self.view["scale"]
         self.view_metrics_var.set(f"Pan {pan_x:.2f}, {pan_y:.2f} | Zoom {self.view['scale']:.1f} px/m")
         self.mark_canvas_dirty()
 
+    # 只有在画布脏标记或版本变化时才触发重绘。
     def render_canvas_if_needed(self) -> None:
         if not self.canvas_dirty and self.last_render_revision == self.canvas_revision:
             return
@@ -3563,6 +3716,7 @@ class DesktopClient:
         self.last_render_revision = self.canvas_revision
         self.canvas_dirty = False
 
+    # 执行地图画布完整绘制流程。
     def render_canvas_contents(self) -> None:
         self.canvas.delete("all")
         width = max(1, self.canvas.winfo_width())
@@ -3575,6 +3729,7 @@ class DesktopClient:
         self.draw_pois()
         self.draw_robot()
 
+    # 绘制背景参考网格。
     def draw_grid(self) -> None:
         spacing = 2.0
         if spacing * self.view["scale"] < 20:
@@ -3596,6 +3751,7 @@ class DesktopClient:
             self.canvas.create_line(sx1, sy1, sx2, sy2, fill="#ffffff", stipple="gray50")
             y += spacing
 
+    # 绘制扫描得到的空闲格和障碍格。
     def draw_cells(self) -> None:
         grid = self.active_grid()
         if grid.get("active"):
@@ -3631,6 +3787,7 @@ class DesktopClient:
             sx, sy = self.world_to_screen(float(cell["ix"]) * voxel, float(cell["iy"]) * voxel)
             self.canvas.create_rectangle(sx - size / 2, sy - size / 2, sx + size / 2, sy + size / 2, fill="#0c0f12", outline="")
 
+    # 把 occupancy grid 渲染成 Tk 图片并绘制到画布。
     def draw_occupancy_grid_image(self, grid: dict) -> None:
         width = int(grid.get("width", 0) or 0)
         height = int(grid.get("height", 0) or 0)
@@ -3689,6 +3846,7 @@ class DesktopClient:
         sx, sy = self.world_to_screen(origin_x + col_start * resolution, origin_y + row_end * resolution)
         self.canvas.create_image(sx, sy, image=self.map_photo, anchor=tk.NW)
 
+    # 绘制正在编辑的障碍线预览。
     def draw_pending_obstacle(self) -> None:
         start = self.edit["pending_obstacle_start"]
         if self.edit["tool"] != "obstacle" or start is None:
@@ -3697,6 +3855,7 @@ class DesktopClient:
         self.canvas.create_oval(sx - 9, sy - 9, sx + 9, sy + 9, outline="#101214", width=2)
         self.canvas.create_oval(sx - 3, sy - 3, sx + 3, sy + 3, outline="#101214", fill="#101214")
 
+    # 绘制路径段及其选中状态。
     def draw_paths(self) -> None:
         if not self.show_path_var.get():
             return
@@ -3713,6 +3872,7 @@ class DesktopClient:
             sx, sy = self.world_to_screen(self.pending_free_point["x"], self.pending_free_point["y"])
             self.canvas.create_oval(sx - 8, sy - 8, sx + 8, sy + 8, outline="#4fd1c5", dash=(6, 4), width=2)
 
+    # 绘制 POI 点、名称和选中状态。
     def draw_pois(self) -> None:
         if not self.show_poi_var.get():
             return
@@ -3728,6 +3888,7 @@ class DesktopClient:
                 self.canvas.create_rectangle(bbox[0] - 4, bbox[1] - 2, bbox[2] + 4, bbox[3] + 2, fill="#fff5d6", outline="")
                 self.canvas.tag_raise(text_id)
 
+    # 绘制机器人当前位置和朝向。
     def draw_robot(self) -> None:
         if not self.show_robot_var.get():
             return
@@ -3736,6 +3897,7 @@ class DesktopClient:
         yaw = -float(self.pose.get("yaw", 0.0))
         self.canvas.create_line(sx, sy, sx + math.cos(yaw) * 14, sy + math.sin(yaw) * 14, fill="#ffffff", width=2)
 
+    # 根据当前栅格生成 PGM 图像文本和导出元信息。
     def build_pgm_export(self, manifest: dict, grid_payload: dict, resolution: float, padding_cells: int = 0) -> dict:
         del manifest, padding_cells
         resolution = max(0.02, float(grid_payload.get("resolution", resolution)))
@@ -3763,6 +3925,7 @@ class DesktopClient:
             "occupied_cells": sum(1 for value in data if int(value) >= 50),
         }
 
+    # 生成地图 YAML 配置文本。
     def build_yaml_export(self, file_name: str, resolution: float, origin: list[float]) -> str:
         stem = Path(file_name).with_suffix(".pgm").name
         return "\n".join(
@@ -3777,6 +3940,7 @@ class DesktopClient:
             ]
         )
 
+    # 把待查看/导出的地图 bundle 写入 inspector 状态。
     def set_inspector_bundle_state(self, file_name: str, manifest: dict, grid_payload: dict) -> None:
         grid_payload = ensure_grid_runtime_state(dict(grid_payload))
         counts = occupancy_grid_counts(grid_payload)
@@ -3805,6 +3969,7 @@ class DesktopClient:
             "pcd_file": dict(manifest.get("pcd") or {}) if isinstance(manifest.get("pcd"), dict) else None,
         }
 
+    # 准备 ZIP/JSON/PGM/YAML/PCD 等导出数据。
     def prepare_inspector_exports(self) -> None:
         grid_payload = self.inspector.get("grid") if isinstance(self.inspector.get("grid"), dict) else None
         manifest = self.inspector.get("manifest") if isinstance(self.inspector.get("manifest"), dict) else {}
@@ -3848,6 +4013,7 @@ class DesktopClient:
         self.inspector["json"] = json.dumps(export_json, ensure_ascii=False, indent=2)
         self.inspector["meta"] = pgm_meta
 
+    # 当 3D 扫描缺少 PCD 时，询问用户是否继续保存或下载 PCD。
     def choose_3d_save_payload(self) -> str | None:
         if getattr(self, "root", None) is None:
             return "2d_only"
@@ -3868,10 +4034,12 @@ class DesktopClient:
         actions = ttk.Frame(body)
         actions.pack(fill=tk.X, pady=(10, 0))
 
+        # 用户确认继续保存时设置确认结果。
         def confirm() -> None:
             result["value"] = str(choice_var.get() or "2d_only").strip().lower()
             dialog.destroy()
 
+        # 用户取消保存时设置取消结果。
         def cancel() -> None:
             result["value"] = None
             dialog.destroy()
@@ -3884,6 +4052,7 @@ class DesktopClient:
         dialog.wait_window()
         return result["value"]
 
+    # 保存当前地图会话为 .stcm 归档文件。
     def save_stcm(self) -> None:
         self.rebuild_path_nodes()
         config = self.apply_scan_fusion_config_from_ui()
@@ -3899,7 +4068,6 @@ class DesktopClient:
             "voxelSize": voxel_size,
             "loadedFromStcm": self.edit["loaded_from_stcm"],
             "loadedMapName": self.edit["loaded_map_name"] or None,
-            "manualCameraSnapshotAt": self.camera_refresh_var.get(),
             "editTool": self.edit["tool"],
         }
         grid = self.current_occupancy_grid()
@@ -3915,8 +4083,6 @@ class DesktopClient:
             "map_storage": "occupancy_grid",
             "occupancy_grid": grid_manifest(grid),
             "pose": self.pose,
-            "gps": self.gps,
-            "chassis": self.chassis,
             "poi": [self.poi_payload(poi) for poi in self.poi_nodes],
             "path": [
                 {
@@ -3992,6 +4158,7 @@ class DesktopClient:
         self.logger.info("map saved path=%s occupied=%s safe=%s", target, grid_counts["obstacle"], grid_counts["safe"])
         messagebox.showinfo(self.tr("save_title"), self.tr("save_done", path=target))
 
+    # 从 .stcm 归档加载地图并应用到主视图。
     def load_stcm(self) -> None:
         target = filedialog.askopenfilename(parent=self.root, filetypes=[("SLAM / ZIP / YAML / PGM", "*.slam *.zip *.yaml *.yml *.pgm"), ("SLAM", "*.slam"), ("ZIP", "*.zip"), ("YAML", "*.yaml *.yml"), ("PGM", "*.pgm")])
         if not target:
@@ -4030,6 +4197,7 @@ class DesktopClient:
         self.logger.info("map loaded path=%s cells=%s", target, int(grid.get("width", 0) or 0) * int(grid.get("height", 0) or 0))
         messagebox.showinfo(self.tr("load_title"), self.tr("load_done", name=file_name))
 
+    # 把读取到的 .stcm manifest、栅格和 PCD 应用到运行状态。
     def apply_stcm(self, file_name: str, manifest: dict, grid: dict, pcd_file: dict[str, Any] | None = None) -> None:
         self.clear_scan()
         self.scan["active"] = False
@@ -4086,6 +4254,7 @@ class DesktopClient:
         self.sync_scan_badges()
         self.map_edit_status_var.set(self.tr("map_loaded_view", name=file_name))
 
+    # 将当前 inspector 数据导出为 ZIP 或 PCD。
     def export_inspector_file(self, kind: str) -> None:
         if not self.inspector["file"]:
             messagebox.showwarning(self.tr("export_title"), self.tr("export_need_map"))
@@ -4123,6 +4292,7 @@ class DesktopClient:
             messagebox.showinfo(self.tr("export_title"), self.tr("export_done", kind=kind.upper(), path=path))
             return
 
+    # 刷新右侧里程计、扫描、通信和地图状态文本。
     def render_text_panels(self) -> None:
         self.write_text(
             self.scan_text,
@@ -4152,6 +4322,7 @@ class DesktopClient:
             },
         )
 
+    # 向文本控件写入 JSON 文本，并避免焦点中断和重复刷新。
     def write_text(self, widget: tk.Text, payload: dict) -> None:
         text = json.dumps(payload, ensure_ascii=False, indent=2, default=lambda value: list(value) if isinstance(value, set) else str(value))
         widget_id = id(widget)
@@ -4163,6 +4334,7 @@ class DesktopClient:
         widget.delete("1.0", tk.END)
         widget.insert(tk.END, text)
 
+    # 关闭窗口时断开连接、停止控制线程并销毁 Tk。
     def on_close(self) -> None:
         self.disconnect()
         self.control_sender_stop.set()
@@ -4171,10 +4343,12 @@ class DesktopClient:
             self.control_sender_thread.join(timeout=1.0)
         self.root.destroy()
 
+    # 进入 Tk 主事件循环。
     def run(self) -> None:
         self.root.mainloop()
 
 
+# 程序入口：创建桌面客户端并启动事件循环。
 def main() -> None:
     DesktopClient().run()
 

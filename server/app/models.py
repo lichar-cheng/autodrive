@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import List, Optional
-
 from pydantic import BaseModel, Field
 
 
@@ -22,38 +20,3 @@ class StartScanRequest(BaseModel):
 
 class StopScanRequest(BaseModel):
     mode: str = Field(pattern="^(2d|3d)$")
-
-
-class SaveMapRequest(BaseModel):
-    name: str = "session"
-    notes: str = ""
-    voxel_size: Optional[float] = Field(default=None, ge=0.02, le=1.0)
-    reset_after_save: bool = False
-
-
-class LoadMapRequest(BaseModel):
-    filename: str
-
-
-class PathNode(BaseModel):
-    x: float
-    y: float
-    lat: Optional[float] = None
-    lon: Optional[float] = None
-
-
-class PlanPathRequest(BaseModel):
-    nodes: List[PathNode]
-
-
-class PoiPoint(BaseModel):
-    name: str
-    x: float
-    y: float
-    yaw: float = 0.0
-    lat: Optional[float] = None
-    lon: Optional[float] = None
-
-
-class AddPoiRequest(BaseModel):
-    poi: PoiPoint

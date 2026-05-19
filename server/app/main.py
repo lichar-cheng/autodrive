@@ -1,5 +1,16 @@
+# -*- coding: utf-8 -*-
+# AutoDrive Mapping Server 服务端主入口。
+#
+# 这个文件负责：
+# 1. 启动 FastAPI 服务，并提供控制、扫描、诊断、WebSocket 数据流等接口；
+# 2. 在 ROS 可用时桥接 `/robot/pose` 与 `/map/grid` 两类核心数据；
+# 3. 管理 2D/3D 扫描会话、PCD 下载和 WebSocket 流控；
+# 4. 统一维护运行时状态，便于 /health 和 /diag/* 接口诊断。
+
+# 启用延迟类型注解，避免运行时过早解析类型。
 from __future__ import annotations
 
+# 标准库依赖：异步任务、进程管理、哈希、JSON、日志、文件路径等。
 import asyncio
 import copy
 import hashlib
@@ -14,32 +25,30 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+# FastAPI 相关依赖：HTTP 接口、WebSocket 和响应对象。
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
+# 项目内部模块：配置、请求模型、ROS 桥接、主题总线和 PCD 处理。
+from .sample_pcd_file import downsample_pcd_to_cache
 from .config import CONFIG
 from .models import (
-    AddPoiRequest,
     ControlTargetRequest,
-    LoadMapRequest,
     MoveCommand,
-    PlanPathRequest,
-    SaveMapRequest,
     StartScanRequest,
     StopScanRequest,
 )
 from .ros_bridge import RosRuntime, detect_ros
-from .simulator import Simulator
-from .stcm_codec import load_stcm, save_stcm
 from .topic_bus import TopicBus
-from .ultrasonic_safety import UltrasonicSafetyRuntime
 
 
+# 初始化全局日志格式，便于定位服务端运行状态和异常。
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("autodrive.server")
 
 
+# 过滤成功的 POST 访问日志，避免高频控制接口刷屏；失败或非 POST 请求仍然保留。
 class _SuccessPostAccessLogFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args if isinstance(record.args, tuple) else ()
@@ -54,6 +63,7 @@ class _SuccessPostAccessLogFilter(logging.Filter):
         return True
 
 
+# 安装 uvicorn.access 日志过滤器，只安装一次，避免重复添加 filter。
 def _install_access_log_filter() -> None:
     access_logger = logging.getLogger("uvicorn.access")
     if not any(isinstance(existing, _SuccessPostAccessLogFilter) for existing in access_logger.filters):
@@ -62,23 +72,24 @@ def _install_access_log_filter() -> None:
 
 _install_access_log_filter()
 
+# 创建 FastAPI 应用实例，并开放跨域，方便前端或调试工具直接访问。
 app = FastAPI(title="AutoDrive Mapping Server", version="0.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# 核心运行时对象：主题总线、ROS 运行时状态和最近一份地图栅格缓存。
 bus = TopicBus(queue_size=CONFIG.ws_queue_size)
-sim = Simulator(bus, rate_hz=CONFIG.sim_rate_hz, points_per_scan=CONFIG.lidar_points_per_scan)
 ros: RosRuntime = RosRuntime(enabled=False, reason="ROS runtime not initialized")
-map_dir = Path("data/maps")
-latest_points: list[tuple[float, float, float]] = []
 latest_occupancy_grid: dict[str, Any] | None = None
 seq_by_topic: dict[str, int] = defaultdict(int)
 ws_clients: set[int] = set()
 motion_command_seq = 0
+# 运动控制目标。velocity 为线速度，yaw_rate 为角速度，updated_at 用于判断指令是否过期。
 CONTROL_TARGET = {"velocity": 0.0, "yaw_rate": 0.0, "updated_at": 0.0}
 CONTROL_PUBLISH_INTERVAL_SEC = 0.1
 CONTROL_TARGET_HOLD_SEC = 1.0
 CONTROL_STOP_BURST_TICKS = 3
 CONTROL_STOP_BURST_REMAINING = 0
+# 运动控制运行时诊断信息，用于记录最近一次发布、归零和日志输出状态。
 CONTROL_RUNTIME = {
     "last_zero_source": "",
     "last_zero_at": 0.0,
@@ -89,37 +100,33 @@ CONTROL_RUNTIME = {
 }
 CONTROL_OUTPUT_STATE = {"velocity": 0.0, "yaw_rate": 0.0, "updated_at": 0.0}
 control_task: asyncio.Task | None = None
-ULTRASONIC_RUNTIME = UltrasonicSafetyRuntime(CONFIG.ultrasonic_safety)
 
+# 控制平滑参数：只保留起步/转向缓启与停车减速，不再依赖超声波配置。
+CONTROL_LINEAR_ACCEL_MPS2 = 0.16
+CONTROL_LINEAR_DECEL_MPS2 = 0.6
+CONTROL_LINEAR_EMERGENCY_DECEL_MPS2 = 1.0
+CONTROL_ANGULAR_ACCEL_RPS2 = 0.45
+CONTROL_ANGULAR_DECEL_RPS2 = 1.2
+CONTROL_ANGULAR_EMERGENCY_DECEL_RPS2 = 2.0
+# 默认 voxel 边长，单位 m。
+# 数值越大，点云越稀疏，文件越小；数值越小，点云越密。
+PCD_DEFAULT_VOXEL_SIZE = 0.05
 
+# WebSocket 默认订阅的实时数据主题。
 STREAM_TOPICS = [
     "/robot/pose",
-    "/robot/gps",
-    "/chassis/odom",
-    "/chassis/status",
-    "/lidar/front",
-    "/lidar/rear",
-    "/camera/1/compressed",
-    "/camera/2/compressed",
-    "/camera/3/compressed",
-    "/camera/4/compressed",
     "/map/grid",
 ]
 
-# 高频传感器流控策略：保留关键帧 + 稀疏非关键帧。
-TOPIC_MIN_INTERVAL_SEC = {
-    "/camera/1/compressed": 0.2,
-    "/camera/2/compressed": 0.2,
-    "/camera/3/compressed": 0.2,
-    "/camera/4/compressed": 0.2,
-}
-LIDAR_MAX_WS_POINTS = 1200
-LIDAR_KEYFRAME_INTERVAL_SEC = 1.0
+# 仅保留 pose 与 occupancy_grid 两类流，因此这里只需要空的按 topic 限频表。
+TOPIC_MIN_INTERVAL_SEC: dict[str, float] = {}
 
+# WebSocket 队列和客户端保活相关参数。
 QUEUE_NEAR_CAPACITY_RATIO = 0.8
 QUEUE_WARN_INTERVAL_SEC = 5.0
 CLIENT_IDLE_TIMEOUT_SEC = 20.0
 
+# 服务端流控统计，主要用于诊断 WebSocket 队列压力和主动断开次数。
 SERVER_RUNTIME = {
     "ws_overflow_total": 0,
     "ws_near_capacity_total": 0,
@@ -128,6 +135,7 @@ SERVER_RUNTIME = {
     "forced_disconnect_total": 0,
 }
 
+# 当前扫描会话状态：是否正在扫描、模式、帧数、点数、依赖状态和 PCD 传输状态。
 SCAN_SESSION = {
     "active": False,
     "mode": "3d",
@@ -150,6 +158,7 @@ SCAN_SESSION = {
     "pcd_file": None,
 }
 
+# 由服务端拉起的扫描依赖进程，停止扫描时会尝试一起清理。
 LAUNCHED_SCAN_PROCESSES: list[subprocess.Popen[str]] = []
 LAUNCHED_SCAN_COMMANDS: dict[str, list[subprocess.Popen[str]]] = {}
 SCAN_START_LOCK = threading.Lock()
@@ -162,12 +171,14 @@ SCAN_MAPPING_PREREQ_POLL_ATTEMPTS = 10
 SCAN_MAPPING_PREREQ_POLL_INTERVAL_SEC = 0.5
 
 
+# 根据 topic、时间戳、序号和 payload 生成消息校验值，便于前端判断消息是否完整或重复。
 def _checksum(topic: str, stamp: float, seq: int, payload: dict) -> str:
     payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     raw = f"{topic}|{stamp:.6f}|{seq}|{payload_json}".encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
 
+# 统一封装即将通过 WebSocket 发送的消息，补充服务端时间、递增序号和校验和。
 def _pack_message(message: dict) -> dict:
     topic = message["topic"]
     stamp = float(message["stamp"])
@@ -184,18 +195,12 @@ def _pack_message(message: dict) -> dict:
     }
 
 
-def _thin_points(points: list[list[float]] | list[tuple[float, float, float]], limit: int) -> list[list[float]]:
-    if len(points) <= limit:
-        return [list(p) for p in points]
-    step = max(1, len(points) // limit)
-    sampled = points[::step][:limit]
-    return [list(p) for p in sampled]
-
-
+# 判断 WebSocket 是否已经关闭后仍尝试发送，便于优雅处理断开场景。
 def _is_websocket_send_after_close_error(exc: RuntimeError) -> bool:
     return 'Cannot call "send" once a close message has been sent.' in str(exc)
 
 
+# 重置扫描会话状态；可选保留或更新 voxel_size，但不会直接清理真实文件。
 def _reset_scan_session(voxel_size: float | None = None, keep_points: bool = False) -> None:
     SCAN_SESSION["active"] = False
     SCAN_SESSION["mode"] = "3d"
@@ -219,11 +224,13 @@ def _reset_scan_session(voxel_size: float | None = None, keep_points: bool = Fal
         SCAN_SESSION["voxel_size"] = max(0.02, float(voxel_size))
 
 
+# 规范化扫描模式，只允许 2d 或 3d，非法值返回 None。
 def _normalize_scan_mode(mode: str | None) -> str | None:
     normalized = str(mode or "").strip().lower()
     return normalized if normalized in {"2d", "3d"} else None
 
 
+# 获取当前 3D 扫描对应的 PCD 文件路径，并返回结构化错误信息。
 def _scan_pcd_path(mode: str | None = None) -> tuple[Path | None, dict | None]:
     normalized_mode = _normalize_scan_mode(mode or str(SCAN_SESSION.get("mode", "2d")))
     if normalized_mode != "3d":
@@ -236,23 +243,7 @@ def _scan_pcd_path(mode: str | None = None) -> tuple[Path | None, dict | None]:
     return pcd_path, None
 
 
-def _load_scan_pcd_file(mode: str | None = None) -> tuple[dict[str, Any] | None, dict | None]:
-    pcd_path, error = _scan_pcd_path(mode)
-    if error is not None or pcd_path is None:
-        SCAN_SESSION["pcd_transfer_state"] = "error"
-        return None, error
-    try:
-        SCAN_SESSION["pcd_transfer_state"] = "reading"
-        content = pcd_path.read_bytes()
-    except OSError as exc:
-        SCAN_SESSION["pcd_transfer_state"] = "error"
-        return None, {"reason": "pcd_read_failed", "error": str(exc), "status_code": 500}
-    pcd_file = {"name": pcd_path.name, "size": len(content), "content": content}
-    SCAN_SESSION["pcd_file"] = {"name": pcd_path.name, "size": len(content)}
-    SCAN_SESSION["pcd_transfer_state"] = "ready"
-    return pcd_file, None
-
-
+# 根据扫描模式选择对应配置；未知模式直接抛错，防止静默使用错误配置。
 def _scan_mode_config(mode: str) -> Any:
     if mode == "2d":
         return CONFIG.scan_modes.mode_2d
@@ -261,6 +252,7 @@ def _scan_mode_config(mode: str) -> Any:
     raise ValueError(f"unsupported scan mode: {mode}")
 
 
+# 使用 pgrep 查找符合模式的进程，用于判断外部 ROS/扫描依赖是否已启动。
 def _list_process_matches(pattern: str) -> list[str]:
     completed = subprocess.run(
         ["pgrep", "-af", pattern],
@@ -274,6 +266,7 @@ def _list_process_matches(pattern: str) -> list[str]:
     return [line.strip() for line in str(completed.stdout or "").splitlines() if line.strip()]
 
 
+# 检查一组必需进程是否存在，返回缺失项、匹配结果和错误列表。
 def _check_required_processes(processes: list[str]) -> dict[str, Any]:
     if not processes:
         return {"required_processes": [], "missing_processes": [], "matched_processes": {}, "errors": []}
@@ -301,6 +294,7 @@ def _check_required_processes(processes: list[str]) -> dict[str, Any]:
     return {"required_processes": list(processes), "missing_processes": missing, "matched_processes": matched, "errors": errors}
 
 
+# 从 pgrep 输出行中提取 PID。
 def _extract_pid_from_process_line(line: str) -> int | None:
     parts = str(line).strip().split(maxsplit=1)
     if not parts:
@@ -312,6 +306,7 @@ def _extract_pid_from_process_line(line: str) -> int | None:
     return pid if pid > 0 else None
 
 
+# 从匹配到的进程信息中提取去重后的 PID 列表，后续停止扫描时使用。
 def _matched_process_pids(matched_processes: dict[str, list[str]]) -> list[int]:
     pids: list[int] = []
     for lines in matched_processes.values():
@@ -322,10 +317,12 @@ def _matched_process_pids(matched_processes: dict[str, list[str]]) -> list[int]:
     return list(dict.fromkeys(pids))
 
 
+# 把命令参数拼成稳定 key，用来追踪同一条启动命令是否已经运行。
 def _scan_command_key(argv: list[str]) -> str:
     return "\x00".join(str(part) for part in argv)
 
 
+# 判断启动命令对应的依赖是否已经满足，避免重复启动相同依赖。
 def _command_targets_satisfied_dependency(argv: list[str], required_processes: list[str], missing_processes: list[str]) -> bool:
     command_text = " ".join(str(part).lower() for part in argv)
     missing = {str(process).lower() for process in missing_processes}
@@ -333,6 +330,7 @@ def _command_targets_satisfied_dependency(argv: list[str], required_processes: l
     return bool(targeted) and not any(process in missing for process in targeted)
 
 
+# 从配置项中提取真正要执行的命令参数列表。
 def _launch_command_argv(command: Any) -> list[str]:
     if isinstance(command, dict):
         return [str(part) for part in command.get("command", [])]
@@ -340,6 +338,7 @@ def _launch_command_argv(command: Any) -> list[str]:
     return [str(part) for part in raw]
 
 
+# 从配置项中提取该命令负责启动或检查的进程名。
 def _launch_command_processes(command: Any) -> list[str]:
     if isinstance(command, dict):
         raw = command.get("processes", [])
@@ -350,6 +349,7 @@ def _launch_command_processes(command: Any) -> list[str]:
     return [str(process) for process in raw if str(process).strip()]
 
 
+# 检查系统里是否已经存在与某条启动命令匹配的进程。
 def _scan_command_process_matches(argv: list[str]) -> list[str]:
     tokens = [str(part) for part in argv if str(part).strip()]
     if not tokens:
@@ -365,6 +365,7 @@ def _scan_command_process_matches(argv: list[str]) -> list[str]:
     return filtered[:5]
 
 
+# 判断当前依赖状态下是否需要执行某条扫描启动命令。
 def _scan_launch_command_needed(command: Any, status: dict[str, Any]) -> bool:
     processes = _launch_command_processes(command)
     missing_processes = {str(process) for process in status.get("missing_processes", [])}
@@ -373,6 +374,7 @@ def _scan_launch_command_needed(command: Any, status: dict[str, Any]) -> bool:
     return bool(status.get("missing_processes"))
 
 
+# 从扫描模式的启动命令配置中汇总所有必需进程。
 def _scan_required_processes_from_launch_commands(config: Any) -> list[str]:
     processes: list[str] = []
     for command in getattr(config, "launch_commands", []):
@@ -380,6 +382,7 @@ def _scan_required_processes_from_launch_commands(config: Any) -> list[str]:
     return list(dict.fromkeys(processes))
 
 
+# 真正拉起扫描依赖命令，并记录进程对象，方便后续停止和回收。
 def _launch_scan_mode_command(argv: list[str]) -> tuple[bool, str]:
     key = _scan_command_key(argv)
     existing_processes = LAUNCHED_SCAN_COMMANDS.get(key, [])
@@ -409,6 +412,7 @@ def _launch_scan_mode_command(argv: list[str]) -> tuple[bool, str]:
     return True, f"pid={process.pid}"
 
 
+# 等待并回收已启动的扫描依赖进程，同时从跟踪表中移除。
 def _reap_scan_process(process: subprocess.Popen[str]) -> None:
     try:
         process.wait()
@@ -423,10 +427,12 @@ def _reap_scan_process(process: subprocess.Popen[str]) -> None:
         logger.warning("failed to reap scan dependency process pid=%s err=%s", getattr(process, "pid", "?"), exc)
 
 
+# 在后台线程中回收进程，避免阻塞当前请求处理。
 def _reap_scan_process_async(process: subprocess.Popen[str]) -> None:
     threading.Thread(target=_reap_scan_process, args=(process,), daemon=True).start()
 
 
+# 合并节点依赖和进程依赖的检查结果，形成统一依赖状态。
 def _merge_scan_dependency_status(node_status: dict[str, Any], process_status: dict[str, Any]) -> dict[str, Any]:
     return {
         "required_nodes": list(node_status.get("required_nodes", [])),
@@ -441,12 +447,14 @@ def _merge_scan_dependency_status(node_status: dict[str, Any], process_status: d
     }
 
 
+# 获取某个扫描模式当前的依赖状态。
 def _scan_dependency_status(config: Any) -> dict[str, Any]:
     node_status = {"required_nodes": [], "missing_nodes": [], "started_nodes": [], "errors": []}
     process_status = _check_required_processes(_scan_required_processes_from_launch_commands(config))
     return _merge_scan_dependency_status(node_status, process_status)
 
 
+# 确保扫描模式所需依赖已启动；必要时自动执行配置里的启动命令并轮询等待。
 def _ensure_scan_mode_dependencies(mode: str) -> dict[str, Any]:
     config = _scan_mode_config(mode)
     status = _scan_dependency_status(config)
@@ -542,6 +550,7 @@ def _ensure_scan_mode_dependencies(mode: str) -> dict[str, Any]:
     return status
 
 
+# 按 PID 停止已追踪到的扫描依赖进程。
 def _stop_tracked_scan_pids(pids: list[int]) -> dict[str, Any]:
     stopped_pids: list[int] = []
     errors: list[str] = []
@@ -563,6 +572,7 @@ def _stop_tracked_scan_pids(pids: list[int]) -> dict[str, Any]:
     return {"stopped_pids": stopped_pids, "errors": errors}
 
 
+# 等待指定 PID 退出，并尝试回收子进程。
 def _wait_for_pid_exit(pid: int) -> bool:
     proc_path = Path(f"/proc/{pid}")
     for _ in range(SCAN_PROCESS_STOP_POLL_ATTEMPTS):
@@ -576,6 +586,7 @@ def _wait_for_pid_exit(pid: int) -> bool:
     return not proc_path.exists()
 
 
+# 非阻塞回收指定子进程 PID。
 def _reap_child_pid(pid: int) -> bool:
     try:
         reaped_pid, _status = os.waitpid(pid, os.WNOHANG)
@@ -589,6 +600,7 @@ def _reap_child_pid(pid: int) -> bool:
     return False
 
 
+# 停止所有由服务端启动或跟踪的扫描依赖进程。
 def _stop_launched_scan_processes() -> dict[str, Any]:
     stopped_pids: list[int] = []
     errors: list[str] = []
@@ -630,6 +642,7 @@ def _stop_launched_scan_processes() -> dict[str, Any]:
     return {"stopped_pids": stopped_pids, "stopped_patterns": pattern_status["stopped_patterns"], "errors": errors}
 
 
+# 按进程名模式批量发送 SIGINT，用于清理扫描依赖。
 def _terminate_process_patterns(patterns: list[str]) -> dict[str, Any]:
     stopped_patterns: list[str] = []
     errors: list[str] = []
@@ -654,6 +667,7 @@ def _terminate_process_patterns(patterns: list[str]) -> dict[str, Any]:
     return {"stopped_patterns": stopped_patterns, "errors": errors}
 
 
+# 依赖启动后等待建图前置条件就绪，给 ROS 节点一些初始化时间。
 def _wait_for_mapping_prereq_after_dependency_start(dependency_status: dict[str, Any]) -> dict[str, Any]:
     summary = _mapping_prereq_summary()
     if summary["ready"] or not (dependency_status.get("started_nodes") or dependency_status.get("started_processes")):
@@ -666,6 +680,7 @@ def _wait_for_mapping_prereq_after_dependency_start(dependency_status: dict[str,
     return summary
 
 
+# 根据扫描模式配置找到 3D PCD 输出路径。
 def _pcd_output_path_for_mode(mode: str) -> Path | None:
     normalized = _normalize_scan_mode(mode)
     if normalized != "3d":
@@ -674,14 +689,13 @@ def _pcd_output_path_for_mode(mode: str) -> Path | None:
     return Path(raw) if raw else None
 
 
+# 汇总 WebSocket 队列和客户端连接容量相关的配置与运行时指标。
 def _server_capacity_summary() -> dict[str, Any]:
     return {
         "limits": {
             "ws_queue_size": CONFIG.ws_queue_size * 2,
             "queue_near_capacity_ratio": QUEUE_NEAR_CAPACITY_RATIO,
-            "camera_min_interval_sec": TOPIC_MIN_INTERVAL_SEC,
-            "lidar_max_ws_points": LIDAR_MAX_WS_POINTS,
-            "lidar_keyframe_interval_sec": LIDAR_KEYFRAME_INTERVAL_SEC,
+            "topic_min_interval_sec": TOPIC_MIN_INTERVAL_SEC,
             "client_idle_timeout_sec": CLIENT_IDLE_TIMEOUT_SEC,
         },
         "runtime": {
@@ -694,6 +708,7 @@ def _server_capacity_summary() -> dict[str, Any]:
     }
 
 
+# 生成当前扫描会话摘要，包括耗时、帧数、原始点数等。
 def _scan_summary() -> dict[str, Any]:
     started_at = float(SCAN_SESSION["started_at"])
     stopped_at = float(SCAN_SESSION["stopped_at"])
@@ -717,12 +732,14 @@ def _scan_summary() -> dict[str, Any]:
     }
 
 
+# 获取 ROS 桥接层诊断信息；ROS 不可用时返回空字典。
 def _ros_diag() -> dict[str, Any]:
     if ros.enabled and ros.bridge is not None:
         return ros.bridge.diagnostics()
     return {}
 
 
+# 根据 WebSocket 客户端和 TopicBus 压力生成网络诊断摘要。
 def _network_diag_summary() -> dict[str, Any]:
     topic_stats = bus.stats()
     warnings: list[str] = []
@@ -743,6 +760,7 @@ def _network_diag_summary() -> dict[str, Any]:
     return {"ok": not warnings, "warnings": warnings, "checks": checks}
 
 
+# 综合 ROS 与网络状态，判断当前是否满足建图前置条件。
 def _mapping_prereq_summary() -> dict[str, Any]:
     if ros.enabled and ros.bridge is not None and hasattr(ros.bridge, "mapping_prerequisites"):
         summary = dict(ros.bridge.mapping_prerequisites())
@@ -756,11 +774,11 @@ def _mapping_prereq_summary() -> dict[str, Any]:
         }
     else:
         summary = {
-            "ready": bool(sim._running),
-            "severity": "ok" if bool(sim._running) else "warn",
-            "blockers": [] if bool(sim._running) else ["ros disabled and simulator inactive"],
-            "warnings": [] if bool(sim._running) else ["mapping data source unavailable"],
-            "checks": {"data_source": {"ok": bool(sim._running), "source": "simulator" if bool(sim._running) else "none"}},
+            "ready": False,
+            "severity": "error",
+            "blockers": ["ros bridge unavailable"],
+            "warnings": ["mapping data source unavailable"],
+            "checks": {"data_source": {"ok": False, "source": "none"}},
         }
 
     network = _network_diag_summary()
@@ -780,49 +798,14 @@ def _mapping_prereq_summary() -> dict[str, Any]:
     }
 
 
-def _current_map_points() -> list[tuple[float, float, float]]:
-    global latest_points
-
-    if ros.enabled and ros.bridge is not None:
-        ros_points = ros.bridge.latest_map_points()
-        if ros_points:
-            return ros_points
-    return latest_points
-
-
+# 判断当前地图数据来源，便于诊断接口展示。
 def _current_map_source() -> str:
-    if ros.enabled and ros.bridge is not None and getattr(ros.bridge, "latest_map_points", lambda: [])():
+    if latest_occupancy_grid:
         return "occupancy_grid"
-    if latest_points:
-        return "loaded_map"
     return "unavailable"
 
 
-def _occupancy_payload_to_points(payload: dict[str, Any]) -> list[tuple[float, float, float]]:
-    if isinstance(payload.get("data"), list):
-        resolution = max(0.02, float(payload.get("resolution", 0.05) or 0.05))
-        origin = payload.get("origin") if isinstance(payload.get("origin"), dict) else {}
-        origin_x = float(origin.get("x", 0.0))
-        origin_y = float(origin.get("y", 0.0))
-        width = int(payload.get("width", 0) or 0)
-        points: list[tuple[float, float, float]] = []
-        if width <= 0:
-            return points
-        for index, value in enumerate(payload.get("data", [])):
-            if int(value) < 50:
-                continue
-            row = index // width
-            col = index % width
-            x = origin_x + (col + 0.5) * resolution
-            y = origin_y + (row + 0.5) * resolution
-            points.append((round(x, 3), round(y, 3), 1.0))
-        return points
-    return [
-        (float(cell.get("x", 0.0)), float(cell.get("y", 0.0)), 1.0)
-        for cell in payload.get("occupied", [])
-    ]
-
-
+# 把地图 payload 标准化为栅格结构；这里只接受完整 occupancy_grid。
 def _occupancy_payload_to_grid(payload: dict[str, Any]) -> dict[str, Any] | None:
     data = [int(value) for value in payload.get("data", [])] if isinstance(payload.get("data"), list) else []
     width = int(payload.get("width", 0) or 0)
@@ -840,30 +823,10 @@ def _occupancy_payload_to_grid(payload: dict[str, Any]) -> dict[str, Any] | None
             },
             "data": [100 if value >= 50 else 0 if value >= 0 else -1 for value in data],
         }
-    points = _occupancy_payload_to_points(payload)
-    if not points:
-        return None
-    resolution = max(0.02, float(payload.get("resolution", 0.05) or 0.05))
-    min_ix = min(round(point[0] / resolution) for point in points)
-    max_ix = max(round(point[0] / resolution) for point in points)
-    min_iy = min(round(point[1] / resolution) for point in points)
-    max_iy = max(round(point[1] / resolution) for point in points)
-    width = max_ix - min_ix + 1
-    height = max_iy - min_iy + 1
-    grid_data = [-1] * (width * height)
-    for x, y, _intensity in points:
-        ix = round(x / resolution) - min_ix
-        iy = round(y / resolution) - min_iy
-        grid_data[iy * width + ix] = 100
-    return {
-        "width": width,
-        "height": height,
-        "resolution": resolution,
-        "origin": {"x": round(min_ix * resolution, 6), "y": round(min_iy * resolution, 6), "yaw": 0.0},
-        "data": grid_data,
-    }
+    return None
 
 
+# 根据指令更新时间计算当前有效控制目标；超时则触发安全停车。
 def _effective_control_target(now: float | None = None) -> tuple[float, float, bool, bool]:
     now = time.time() if now is None else float(now)
     updated_at = float(CONTROL_TARGET.get("updated_at", 0.0) or 0.0)
@@ -876,6 +839,7 @@ def _effective_control_target(now: float | None = None) -> tuple[float, float, b
     return 0.0, 0.0, bool(velocity or yaw_rate), False
 
 
+# 输出控制目标与平滑控制模块的健康状态。
 def _control_target_health(now: float | None = None) -> dict[str, Any]:
     now = time.time() if now is None else float(now)
     updated_at = float(CONTROL_TARGET.get("updated_at", 0.0) or 0.0)
@@ -894,15 +858,12 @@ def _control_target_health(now: float | None = None) -> dict[str, Any]:
         "hold_sec": CONTROL_TARGET_HOLD_SEC,
         "last_publish_source": str(CONTROL_RUNTIME["last_publish_source"]),
         "last_zero_source": str(CONTROL_RUNTIME["last_zero_source"]),
-        "last_zero_at": float(CONTROL_RUNTIME["last_zero_at"]),
-        "ultrasonic_safety": ULTRASONIC_RUNTIME.snapshot().as_dict(),
+        "last_zero_at": float(CONTROL_RUNTIME["last_zero_at"])
     }
 
 
-def _apply_ultrasonic_control_gate(velocity: float, yaw_rate: float, now: float | None = None) -> tuple[float, float, str]:
-    return ULTRASONIC_RUNTIME.gate_command(velocity, yaw_rate, now=now)
 
-
+# 按照最大加速度/减速度限制，让当前值平滑逼近目标值。
 def _step_towards(current: float, target: float, max_accel: float, max_decel: float, dt: float) -> float:
     current = float(current)
     target = float(target)
@@ -913,14 +874,16 @@ def _step_towards(current: float, target: float, max_accel: float, max_decel: fl
     return current - delta
 
 
+# 对线速度和角速度做平滑处理，避免控制输出突变。
+# 这里把加速度单独压低，重点解决“起步太猛”，但保持停车减速能力不变。
 def _smooth_control_command(target_velocity: float, target_yaw_rate: float, now: float | None = None, forced_stop: bool = False) -> tuple[float, float]:
     current_time = time.time() if now is None else float(now)
     updated_at = float(CONTROL_OUTPUT_STATE.get("updated_at", 0.0) or 0.0)
     dt = CONTROL_PUBLISH_INTERVAL_SEC if updated_at <= 0.0 else max(0.001, min(1.0, current_time - updated_at))
-    linear_accel = max(0.01, float(CONFIG.ultrasonic_safety.linear_accel_mps2))
-    linear_decel = max(0.01, float(CONFIG.ultrasonic_safety.linear_emergency_decel_mps2 if forced_stop else CONFIG.ultrasonic_safety.linear_decel_mps2))
-    angular_accel = max(0.01, float(CONFIG.ultrasonic_safety.angular_accel_rps2))
-    angular_decel = max(0.01, float(CONFIG.ultrasonic_safety.angular_emergency_decel_rps2 if forced_stop else CONFIG.ultrasonic_safety.angular_decel_rps2))
+    linear_accel = CONTROL_LINEAR_ACCEL_MPS2
+    linear_decel = CONTROL_LINEAR_EMERGENCY_DECEL_MPS2 if forced_stop else CONTROL_LINEAR_DECEL_MPS2
+    angular_accel = CONTROL_ANGULAR_ACCEL_RPS2
+    angular_decel = CONTROL_ANGULAR_EMERGENCY_DECEL_RPS2 if forced_stop else CONTROL_ANGULAR_DECEL_RPS2
     next_velocity = _step_towards(float(CONTROL_OUTPUT_STATE.get("velocity", 0.0) or 0.0), float(target_velocity), linear_accel, linear_decel, dt)
     next_yaw_rate = _step_towards(float(CONTROL_OUTPUT_STATE.get("yaw_rate", 0.0) or 0.0), float(target_yaw_rate), angular_accel, angular_decel, dt)
     CONTROL_OUTPUT_STATE["velocity"] = float(next_velocity)
@@ -929,6 +892,7 @@ def _smooth_control_command(target_velocity: float, target_yaw_rate: float, now:
     return float(next_velocity), float(next_yaw_rate)
 
 
+# 记录控制指令发布来源，并在速度或来源变化时输出日志。
 def _record_control_publish_source(source: str, velocity: float, yaw_rate: float) -> None:
     CONTROL_RUNTIME["last_publish_source"] = source
     velocity = float(velocity)
@@ -963,18 +927,21 @@ def _record_control_publish_source(source: str, velocity: float, yaw_rate: float
         CONTROL_RUNTIME["last_zero_at"] = time.time()
 
 
+# 发布最终控制命令：先做平滑，再发给 ROS。
 def _publish_control_command(velocity: float, yaw_rate: float, source: str, now: float | None = None) -> None:
-    gated_velocity, gated_yaw_rate, gate_reason = _apply_ultrasonic_control_gate(velocity, yaw_rate, now=now)
-    forced_stop = gate_reason != "clear" and (abs(float(velocity)) > 1e-9 or abs(float(yaw_rate)) > 1e-9)
-    publish_source = source if gate_reason == "clear" else f"{source}_ultrasonic_{gate_reason}"
-    smoothed_velocity, smoothed_yaw_rate = _smooth_control_command(gated_velocity, gated_yaw_rate, now=now, forced_stop=forced_stop)
-    _record_control_publish_source(publish_source, smoothed_velocity, smoothed_yaw_rate)
-    if ros.enabled and ros.bridge is not None:
-        ros.bridge.publish_cmd_vel(smoothed_velocity, smoothed_yaw_rate)
-    else:
-        sim.set_motion(smoothed_velocity, smoothed_yaw_rate)
+    if ros.bridge is None:
+        return
+    smoothed_velocity, smoothed_yaw_rate = _smooth_control_command(
+        velocity,
+        yaw_rate,
+        now=now,
+        forced_stop=False,
+    )
+    _record_control_publish_source(source, smoothed_velocity, smoothed_yaw_rate)
+    ros.bridge.publish_cmd_vel(smoothed_velocity, smoothed_yaw_rate)
 
 
+# 后台控制发布循环：持续维持目标速度，并在目标超时后发送停车 burst。
 async def _control_publisher_loop() -> None:
     global CONTROL_STOP_BURST_REMAINING
     stale_logged = False
@@ -1006,25 +973,20 @@ async def _control_publisher_loop() -> None:
             await asyncio.sleep(CONTROL_PUBLISH_INTERVAL_SEC)
 
 
+# 服务启动钩子：检测 ROS 并启动控制后台任务。
 @app.on_event("startup")
 async def startup() -> None:
     global control_task, ros
 
-    map_dir.mkdir(parents=True, exist_ok=True)
     loop = asyncio.get_running_loop()
     ros = detect_ros(bus=bus, loop=loop, config=CONFIG.ros)
 
-    if ros.enabled:
-        logger.info("Server startup. ROS enabled=True reason=%s", ros.reason)
-    else:
-        logger.warning("Server startup. ROS enabled=False reason=%s", ros.reason)
-        if CONFIG.ros.fallback_to_simulator_on_failure:
-            await sim.start()
-            logger.info("Simulator fallback started")
-    ULTRASONIC_RUNTIME.start()
+    logger.info("server startup ros_enabled=%s reason=%s", ros.enabled, ros.reason)
+
     control_task = asyncio.create_task(_control_publisher_loop())
 
 
+# 服务关闭钩子：取消后台任务并停止 ROS 桥接。
 @app.on_event("shutdown")
 async def shutdown() -> None:
     global control_task
@@ -1035,13 +997,13 @@ async def shutdown() -> None:
         except asyncio.CancelledError:
             pass
         control_task = None
-    ULTRASONIC_RUNTIME.stop()
-    if ros.enabled and ros.bridge is not None:
+
+    if ros.bridge is not None:
         ros.bridge.stop()
-    if sim._running:
-        await sim.stop()
 
 
+
+# 健康检查接口：返回 ROS、扫描、PCD、控制、地图来源和容量等综合状态。
 @app.get("/health")
 async def health() -> dict:
     mapping_prereq = _mapping_prereq_summary()
@@ -1063,28 +1025,27 @@ async def health() -> dict:
         "mapping_blockers": list(mapping_prereq["blockers"]),
         "mapping_warnings": list(mapping_prereq["warnings"]),
         "control_target": _control_target_health(),
-        "simulator_active": bool(sim._running),
         "map_source": _current_map_source(),
         "frames": {
             "odom": CONFIG.ros.topics.odom_frame,
             "base": CONFIG.ros.topics.robot_base_frame,
-            "lidar": CONFIG.ros.topics.lidar_frame,
         },
         "capacity": _server_capacity_summary(),
     }
 
 
+# 建图前置条件诊断接口：便于前端展示为什么当前不能开始建图。
 @app.get("/diag/mapping_prereq")
 async def diag_mapping_prereq() -> dict:
     return {
         "ok": True,
         "ros_enabled": ros.enabled,
-        "simulator_active": bool(sim._running),
         "mapping_prereq": _mapping_prereq_summary(),
         "ros_diag": _ros_diag(),
     }
 
 
+# 实时数据流诊断接口：返回 TopicBus 统计、序号、扫描摘要和容量信息。
 @app.get("/diag/stream_stats")
 async def diag_stream_stats() -> dict:
     return {
@@ -1099,6 +1060,7 @@ async def diag_stream_stats() -> dict:
     }
 
 
+# 开始扫描接口：校验模式、启动依赖、等待建图条件，然后切换扫描状态。
 @app.post("/scan/start")
 async def start_scan(req: StartScanRequest | None = None) -> dict:
     global SCAN_START_CANCEL_SEQ
@@ -1110,12 +1072,14 @@ async def start_scan(req: StartScanRequest | None = None) -> dict:
         str(SCAN_SESSION.get("mode", "2d")),
         bool(SCAN_SESSION["active"]),
     )
+    # 扫描模式非法时直接拒绝，避免进入依赖启动流程。
     if mode is None:
         return {
             "ok": False,
             "reason": "invalid_scan_mode",
             "scan_active": False,
         }
+    # 同一时间只允许一个扫描会话，防止重复启动外部依赖。
     if bool(SCAN_SESSION["active"]):
         return {
             "ok": False,
@@ -1123,6 +1087,7 @@ async def start_scan(req: StartScanRequest | None = None) -> dict:
             "scan_active": True,
             "scan_mode": str(SCAN_SESSION["mode"]),
         }
+    # 使用非阻塞锁保护启动流程，避免多个 /scan/start 并发进入。
     if not SCAN_START_LOCK.acquire(blocking=False):
         logger.info("scan start ignored because another start is already in progress mode=%s", mode)
         return {
@@ -1133,6 +1098,7 @@ async def start_scan(req: StartScanRequest | None = None) -> dict:
         }
     start_cancel_seq = int(SCAN_START_CANCEL_SEQ)
     try:
+        # 先确保模式依赖进程可用，例如建图或点云处理相关 ROS 节点。
         dependency_status = _ensure_scan_mode_dependencies(mode)
         SCAN_SESSION["dependency_status"] = copy.deepcopy(dependency_status)
         if dependency_status.get("missing_processes") or dependency_status["errors"]:
@@ -1154,6 +1120,7 @@ async def start_scan(req: StartScanRequest | None = None) -> dict:
                 "dependency_status": dependency_status,
                 "ros_enabled": ros.enabled,
             }
+        # 依赖启动后继续检查建图输入、网络和数据源是否真的就绪。
         mapping_prereq = _wait_for_mapping_prereq_after_dependency_start(dependency_status)
         if not mapping_prereq["ready"]:
             logger.warning("scan start rejected blockers=%s warnings=%s", mapping_prereq["blockers"], mapping_prereq["warnings"])
@@ -1174,6 +1141,7 @@ async def start_scan(req: StartScanRequest | None = None) -> dict:
                 "dependency_status": dependency_status,
                 "ros_enabled": ros.enabled,
             }
+        # 所有前置条件通过后，再重置并开启新的扫描会话。
         _reset_scan_session()
         SCAN_SESSION["mode"] = mode
         SCAN_SESSION["dependency_status"] = copy.deepcopy(dependency_status)
@@ -1181,8 +1149,6 @@ async def start_scan(req: StartScanRequest | None = None) -> dict:
         SCAN_SESSION["started_at"] = time.time()
         if ros.enabled and ros.bridge is not None:
             ros.bridge.set_scan_active(True)
-        else:
-            sim.scanning = True
         logger.info("scan started mode=%s active=%s", mode, bool(SCAN_SESSION["active"]))
         return {
             "ok": True,
@@ -1196,6 +1162,7 @@ async def start_scan(req: StartScanRequest | None = None) -> dict:
         SCAN_START_LOCK.release()
 
 
+# 停止扫描接口：取消正在进行的启动流程，停止依赖进程，并关闭 ROS 扫描标志。
 @app.post("/scan/stop")
 async def stop_scan(req: StopScanRequest | None = None) -> dict:
     global SCAN_START_CANCEL_SEQ
@@ -1213,6 +1180,7 @@ async def stop_scan(req: StopScanRequest | None = None) -> dict:
             "reason": "invalid_scan_mode",
             "scan_active": bool(SCAN_SESSION["active"]),
         }
+    # 即使当前没有 active 扫描，也递增取消序号并尝试清理可能残留的依赖进程。
     if not bool(SCAN_SESSION["active"]):
         SCAN_START_CANCEL_SEQ += 1
         process_stop_status = _stop_launched_scan_processes()
@@ -1225,13 +1193,12 @@ async def stop_scan(req: StopScanRequest | None = None) -> dict:
             "process_stop_status": process_stop_status,
         }
     SCAN_START_CANCEL_SEQ += 1
+    # 标记会话停止，并记录停止时间，供 scan_summary 计算耗时。
     SCAN_SESSION["active"] = False
     SCAN_SESSION["stopped_at"] = time.time()
     process_stop_status = _stop_launched_scan_processes()
     if ros.enabled and ros.bridge is not None:
         ros.bridge.set_scan_active(False)
-    else:
-        sim.scanning = False
     logger.info("scan stopped session_mode=%s active=%s", str(SCAN_SESSION.get("mode", "2d")), bool(SCAN_SESSION["active"]))
     if str(SCAN_SESSION["mode"]) == "3d":
         SCAN_SESSION["pcd_transfer_state"] = "idle"
@@ -1246,14 +1213,18 @@ async def stop_scan(req: StopScanRequest | None = None) -> dict:
     }
 
 
+# 下载 3D 扫描 PCD 接口：先降采样再返回，避免直接传输超大原始点云。
 @app.get("/scan/pcd", response_model=None)
-async def download_scan_pcd():
+async def download_scan_pcd(voxel_size: float =PCD_DEFAULT_VOXEL_SIZE):
     logger.info(
-        "scan pcd request session_mode=%s active=%s transfer_state=%s",
+        "scan pcd request session_mode=%s active=%s transfer_state=%s voxel_size=%.3f",
         str(SCAN_SESSION.get("mode", "2d")),
         bool(SCAN_SESSION.get("active", False)),
         str(SCAN_SESSION.get("pcd_transfer_state", "idle")),
+        float(voxel_size),
     )
+
+    # 找到当前 3D 扫描生成的原始 PCD 文件。
     pcd_path, error = _scan_pcd_path()
     if error is not None or pcd_path is None:
         logger.warning(
@@ -1272,8 +1243,10 @@ async def download_scan_pcd():
             },
             status_code=int(error.get("status_code", 400)),
         )
+
+    # 先 stat 原始文件，确认文件可读，也用于 response header 记录源文件大小。
     try:
-        size = pcd_path.stat().st_size
+        source_size = pcd_path.stat().st_size
     except OSError as exc:
         SCAN_SESSION["pcd_transfer_state"] = "error"
         return JSONResponse(
@@ -1285,56 +1258,114 @@ async def download_scan_pcd():
             },
             status_code=500,
         )
+
+    try:
+        # 标记当前正在降采样，health 接口里可以看到状态。
+        SCAN_SESSION["pcd_transfer_state"] = "downsampling"
+
+        # 生成或复用降采样缓存文件。
+        # 注意：这里不会把原始全量 PCD 返回给 client。
+        downsampled_path, downsample_meta = downsample_pcd_to_cache(pcd_path, float(voxel_size))
+        downsampled_size = downsampled_path.stat().st_size
+
+    except Exception as exc:  # noqa: BLE001
+        SCAN_SESSION["pcd_transfer_state"] = "error"
+        logger.exception(
+            "scan pcd downsample failed path=%s voxel_size=%.3f",
+            pcd_path,
+            float(voxel_size),
+        )
+
+        # 降采样失败时直接返回错误。
+        # 不要 fallback 返回原始 pcd，否则还是会把全量文件发给 client。
+        return JSONResponse(
+            {
+                "ok": False,
+                "reason": "pcd_downsample_failed",
+                "error": str(exc),
+                "scan_mode": str(SCAN_SESSION.get("mode", "2d")),
+                "source_pcd": {
+                    "name": pcd_path.name,
+                    "size": int(source_size),
+                },
+            },
+            status_code=500,
+        )
+
+    # 更新 session 状态。
     SCAN_SESSION["pcd_transfer_state"] = "ready"
-    SCAN_SESSION["pcd_file"] = {"name": pcd_path.name, "size": int(size)}
-    logger.info("scan pcd download ready name=%s size=%s", pcd_path.name, size)
+    SCAN_SESSION["pcd_file"] = {
+        "name": downsampled_path.name,
+        "size": int(downsampled_size),
+        "source_name": pcd_path.name,
+        "source_size": int(source_size),
+        "voxel_size": float(voxel_size),
+        "downsampled": True,
+    }
+
+    logger.info(
+        "scan pcd download ready source=%s source_size=%s output=%s output_size=%s meta=%s",
+        pcd_path.name,
+        source_size,
+        downsampled_path.name,
+        downsampled_size,
+        downsample_meta,
+    )
+
+    # 返回的是降采样后的 PCD，不是原始全量 PCD。
     return FileResponse(
-        pcd_path,
+        downsampled_path,
         media_type="application/octet-stream",
-        filename=pcd_path.name,
+        filename=downsampled_path.name,
         headers={
-            "Content-Length": str(size),
-            "X-Scan-PCD-Name": pcd_path.name,
-            "X-Scan-PCD-Size": str(size),
+            "Content-Length": str(downsampled_size),
+
+            # 返回给 client 的实际文件信息。
+            "X-Scan-PCD-Name": downsampled_path.name,
+            "X-Scan-PCD-Size": str(downsampled_size),
+
+            # 原始 PCD 信息，方便前端展示压缩比例。
+            "X-Scan-PCD-Source-Name": pcd_path.name,
+            "X-Scan-PCD-Source-Size": str(source_size),
+
+            # 明确告诉 client 这是降采样后的文件。
+            "X-Scan-PCD-Downsampled": "true",
+            "X-Scan-PCD-Voxel-Size": f"{float(voxel_size):.3f}",
         },
     )
 
 
+# 重置扫描接口：清空扫描会话统计与传输状态。
 @app.post("/scan/reset")
 async def reset_scan() -> dict:
     _reset_scan_session()
     return {"ok": True, "scan_summary": _scan_summary()}
 
 
+# 短时移动接口：执行一段持续时间的速度命令，到时自动停车。
 @app.post("/control/move")
 async def move(cmd: MoveCommand) -> dict:
-    if ros.enabled and ros.bridge is not None:
-        global motion_command_seq
-        motion_command_seq += 1
-        command_seq = motion_command_seq
-        CONTROL_TARGET["velocity"] = float(cmd.velocity)
-        CONTROL_TARGET["yaw_rate"] = float(cmd.yaw_rate)
-        CONTROL_TARGET["updated_at"] = time.time()
-        _publish_control_command(float(cmd.velocity), float(cmd.yaw_rate), "api_move")
-        await asyncio.sleep(cmd.duration)
-        if command_seq == motion_command_seq:
-            CONTROL_TARGET["velocity"] = 0.0
-            CONTROL_TARGET["yaw_rate"] = 0.0
-            CONTROL_TARGET["updated_at"] = time.time()
-            _publish_control_command(0.0, 0.0, "api_move_stop")
-        state = {
-            "pose": ros.bridge.latest_pose(),
-            "gps": ros.bridge.latest_gps(),
-            "chassis": ros.bridge.latest_chassis(),
-        }
-        return {"ok": True, "msg": "ros cmd_vel applied", "state": state}
+    if not ros.enabled or ros.bridge is None:
+        return {"ok": False, "msg": "ros bridge unavailable"}
 
-    sim.set_motion(cmd.velocity, cmd.yaw_rate)
+    # 直接向 cmd_vel 发布；用 command_seq 防止旧的 move 延时停车覆盖新命令。
+    global motion_command_seq
+    motion_command_seq += 1
+    command_seq = motion_command_seq
+    CONTROL_TARGET["velocity"] = float(cmd.velocity)
+    CONTROL_TARGET["yaw_rate"] = float(cmd.yaw_rate)
+    CONTROL_TARGET["updated_at"] = time.time()
+    _publish_control_command(float(cmd.velocity), float(cmd.yaw_rate), "api_move")
     await asyncio.sleep(cmd.duration)
-    sim.stop_motion()
-    return {"ok": True, "msg": "sim motion applied", "state": sim.state.__dict__}
+    if command_seq == motion_command_seq:
+        CONTROL_TARGET["velocity"] = 0.0
+        CONTROL_TARGET["yaw_rate"] = 0.0
+        CONTROL_TARGET["updated_at"] = time.time()
+        _publish_control_command(0.0, 0.0, "api_move_stop")
+    return {"ok": True, "msg": "ros cmd_vel applied", "state": {"pose": ros.bridge.latest_pose()}}
 
 
+# 设置持续控制目标接口：由后台发布循环保持目标速度，超时后自动停车。
 @app.post("/control/target")
 async def set_control_target(cmd: ControlTargetRequest) -> dict:
     CONTROL_TARGET["velocity"] = float(cmd.velocity)
@@ -1342,16 +1373,11 @@ async def set_control_target(cmd: ControlTargetRequest) -> dict:
     CONTROL_TARGET["updated_at"] = time.time()
     if ros.enabled and ros.bridge is not None:
         _publish_control_command(float(cmd.velocity), float(cmd.yaw_rate), "api_target")
-        state = {
-            "pose": ros.bridge.latest_pose(),
-            "gps": ros.bridge.latest_gps(),
-            "chassis": ros.bridge.latest_chassis(),
-        }
-        return {"ok": True, "msg": "control target applied", "state": state}
-    _publish_control_command(float(cmd.velocity), float(cmd.yaw_rate), "api_target")
-    return {"ok": True, "msg": "control target applied", "state": sim.state.__dict__}
+        return {"ok": True, "msg": "control target applied", "state": {"pose": ros.bridge.latest_pose()}}
+    return {"ok": False, "msg": "ros bridge unavailable", "state": {}}
 
 
+# 立即停车接口：更新控制序号并发布零速度命令。
 @app.post("/control/stop")
 async def stop() -> dict:
     global motion_command_seq
@@ -1362,183 +1388,12 @@ async def stop() -> dict:
     _publish_control_command(0.0, 0.0, "api_stop")
     return {"ok": True}
 
-
-@app.post("/path/plan")
-async def plan_path(req: PlanPathRequest) -> dict:
-    sim.state.path = [node.model_dump() for node in req.nodes]
-    return {"ok": True, "path_nodes": sim.state.path, "algo": "manual-waypoint"}
-
-
-@app.post("/map/poi")
-async def add_poi(req: AddPoiRequest) -> dict:
-    sim.state.poi.append(req.poi.model_dump())
-    return {"ok": True, "poi_count": len(sim.state.poi)}
-
-
-@app.post("/map/reset")
-async def reset_map() -> dict:
-    global latest_points, latest_occupancy_grid
-
-    if not (ros.enabled and ros.bridge is not None):
-        return {"ok": False, "reason": "ros_unavailable", "map_source": _current_map_source()}
-    if not hasattr(ros.bridge, "reset_map"):
-        return {"ok": False, "reason": "reset_unavailable", "map_source": _current_map_source()}
-    if not bool(ros.bridge.reset_map()):
-        return {"ok": False, "reason": "slam_toolbox_reset_failed", "map_source": _current_map_source()}
-
-    latest_points = []
-    _reset_scan_session()
-    logger.info("map reset requested via slam_toolbox")
-    return {"ok": True, "map_source": _current_map_source(), "scan_summary": _scan_summary()}
-
-
-@app.post("/map/save")
-async def save_map(req: SaveMapRequest) -> dict:
-    points_to_save = _current_map_points()
-    grid_to_save = copy.deepcopy(latest_occupancy_grid)
-    if req.voxel_size is not None:
-        SCAN_SESSION["voxel_size"] = max(0.02, float(req.voxel_size))
-    if not points_to_save:
-        return {"ok": False, "reason": "map_unavailable", "map_source": _current_map_source(), "scan_summary": _scan_summary()}
-    if not isinstance(grid_to_save, dict):
-        grid_to_save = _occupancy_payload_to_grid({"occupied": [{"x": x, "y": y} for x, y, _intensity in points_to_save], "resolution": float(SCAN_SESSION["voxel_size"])})
-    if not isinstance(grid_to_save, dict):
-        return {"ok": False, "reason": "map_unavailable", "map_source": _current_map_source(), "scan_summary": _scan_summary()}
-    logger.info(
-        "map save requested name=%s session_mode=%s active=%s point_count=%s",
-        req.name,
-        str(SCAN_SESSION.get("mode", "2d")),
-        bool(SCAN_SESSION.get("active", False)),
-        len(points_to_save),
-    )
-
-    pose = ros.bridge.latest_pose() if ros.enabled and ros.bridge is not None else {
-        "x": sim.state.x,
-        "y": sim.state.y,
-        "yaw": sim.state.yaw,
-    }
-    gps = ros.bridge.latest_gps() if ros.enabled and ros.bridge is not None else {}
-    imu = ros.bridge.latest_imu() if ros.enabled and ros.bridge is not None else {}
-    filename = f"{req.name}_{int(time.time())}.slam"
-    target = map_dir / filename
-    pcd_file = None
-    if str(SCAN_SESSION.get("mode", "2d")) == "3d":
-        pcd_file, pcd_error = _load_scan_pcd_file("3d")
-        if pcd_error is not None:
-            logger.warning(
-                "map save missing_pcd session_mode=%s reason=%s error=%s",
-                str(SCAN_SESSION.get("mode", "2d")),
-                pcd_error["reason"],
-                pcd_error.get("error", ""),
-            )
-            return {
-                "ok": False,
-                "reason": pcd_error["reason"],
-                "error": pcd_error.get("error", ""),
-                "map_source": _current_map_source(),
-                "scan_summary": _scan_summary(),
-                "scan_mode": str(SCAN_SESSION.get("mode", "2d")),
-            }
-    bundle = {
-        "version": "slam.v4",
-        "scan_mode": str(SCAN_SESSION.get("mode", "2d")),
-        "notes": req.notes,
-        "created_at": time.time(),
-        "source": "ros" if ros.enabled else "sim",
-        "map_source": _current_map_source(),
-        "pose": pose,
-        "gps": gps,
-        "imu": imu,
-        "poi": sim.state.poi,
-        "path": sim.state.path,
-        "trajectory": sim.state.trajectory,
-        "gps_track": sim.state.gps_track,
-        "chassis_track": sim.state.chassis_track,
-        "scan_summary": _scan_summary(),
-        "ros_diag": _ros_diag(),
-        "occupancy_grid": grid_to_save,
-    }
-    if isinstance(pcd_file, dict):
-        bundle["pcd_file"] = pcd_file
-    save_stcm(target, bundle)
-    response = {
-        "ok": True,
-        "file": str(target),
-        "contains": {
-            "poi": len(sim.state.poi),
-            "path": len(sim.state.path),
-            "trajectory": len(sim.state.trajectory),
-            "gps_track": len(sim.state.gps_track),
-            "chassis_track": len(sim.state.chassis_track),
-            "grid_cells": int(grid_to_save["width"]) * int(grid_to_save["height"]),
-            "pcd": isinstance(pcd_file, dict),
-        },
-        "scan_summary": _scan_summary(),
-        "scan_mode": str(SCAN_SESSION.get("mode", "2d")),
-        "ros_enabled": ros.enabled,
-    }
-    if getattr(req, "reset_after_save", False):
-        _reset_scan_session(voxel_size=float(SCAN_SESSION["voxel_size"]))
-    logger.info(
-        "map save completed file=%s session_mode=%s included_pcd=%s point_count=%s",
-        str(target),
-        str(SCAN_SESSION.get("mode", "2d")),
-        isinstance(pcd_file, dict),
-        len(points_to_save),
-    )
-    return response
-
-
-@app.post("/map/load")
-async def load_map(req: LoadMapRequest) -> dict:
-    global latest_points, latest_occupancy_grid
-
-    bundle = load_stcm(map_dir / req.filename)
-    grid = bundle.get("occupancy_grid") if isinstance(bundle.get("occupancy_grid"), dict) else {}
-    latest_occupancy_grid = copy.deepcopy(grid) if isinstance(grid, dict) else None
-    latest_points = []
-    if isinstance(grid, dict):
-        width = int(grid.get("width", 0) or 0)
-        resolution = max(0.02, float(grid.get("resolution", 0.05) or 0.05))
-        origin = grid.get("origin") if isinstance(grid.get("origin"), dict) else {}
-        origin_x = float(origin.get("x", 0.0))
-        origin_y = float(origin.get("y", 0.0))
-        for index, value in enumerate(grid.get("data", [])):
-            if int(value) >= 50:
-                row = index // width
-                col = index % width
-                latest_points.append((origin_x + col * resolution, origin_y + row * resolution, 1.0))
-    sim.state.poi = bundle.get("poi", [])
-    sim.state.path = bundle.get("path", [])
-    sim.state.trajectory = bundle.get("trajectory", [])
-    sim.state.gps_track = bundle.get("gps_track", [])
-    sim.state.chassis_track = bundle.get("chassis_track", [])
-
-    _reset_scan_session(keep_points=True)
-    SCAN_SESSION["mode"] = str(bundle.get("scan_mode", "2d"))
-    SCAN_SESSION["pcd_file"] = copy.deepcopy(bundle.get("pcd_file"))
-    return {
-        "ok": True,
-        "point_count": len(latest_points),
-        "poi_count": len(sim.state.poi),
-        "path_count": len(sim.state.path),
-        "chassis_count": len(sim.state.chassis_track),
-        "scan_mode": str(SCAN_SESSION["mode"]),
-        "contains": {"pcd": isinstance(bundle.get("pcd_file"), dict)},
-        "scan_summary": _scan_summary(),
-    }
-
-
-@app.get("/map/list")
-async def list_map() -> dict:
-    files = sorted([path.name for path in map_dir.glob("*.slam")])
-    return {"ok": True, "files": files}
-
-
+# 实时数据 WebSocket：只订阅核心 pose/grid 主题，做流控后推送给前端。
 @app.websocket("/ws/stream")
 async def ws_stream(websocket: WebSocket) -> None:
-    global latest_points
+    global latest_occupancy_grid
 
+    # 接受连接后，为该客户端创建独立的发送队列和订阅任务。
     await websocket.accept()
     ws_id = id(websocket)
     ws_clients.add(ws_id)
@@ -1547,7 +1402,6 @@ async def ws_stream(websocket: WebSocket) -> None:
     tasks = []
     outbound_queue: asyncio.Queue = asyncio.Queue(maxsize=CONFIG.ws_queue_size * 2)
     last_sent_at: dict[str, float] = {}
-    last_lidar_keyframe_at: dict[str, float] = {}
 
     ws_overflow_local = 0
     ws_near_capacity_local = 0
@@ -1557,6 +1411,7 @@ async def ws_stream(websocket: WebSocket) -> None:
     disconnect_reason = "client_disconnect"
     disconnect_detail = ""
 
+    # 队列接近容量上限时限频输出告警，避免日志过多。
     def maybe_warn_capacity(fill_ratio: float, reason: str) -> None:
         nonlocal ws_last_warn_local
         now = time.time()
@@ -1573,6 +1428,7 @@ async def ws_stream(websocket: WebSocket) -> None:
             ws_last_warn_local = now
             SERVER_RUNTIME["ws_last_warn_at"] = now
 
+    # 非阻塞入队：队列满时丢弃最旧消息，优先保持连接实时性。
     def enqueue_nonblocking(item: tuple[str, dict | str], reason: str) -> None:
         nonlocal ws_overflow_local, ws_near_capacity_local
         while True:
@@ -1594,8 +1450,9 @@ async def ws_stream(websocket: WebSocket) -> None:
                 except asyncio.QueueEmpty:
                     continue
 
+    # 从 TopicBus 订阅单个主题，按主题策略限频/抽样后放入发送队列。
     async def enqueue_topic(topic: str) -> None:
-        global latest_points, latest_occupancy_grid
+        global latest_occupancy_grid
 
         async for message in bus.subscribe(topic):
             now = time.time()
@@ -1606,37 +1463,15 @@ async def ws_stream(websocket: WebSocket) -> None:
                     continue
                 last_sent_at[topic] = now
 
-            if topic == "/lidar/front":
-                SCAN_SESSION["front_frames"] += 1
-                SCAN_SESSION["raw_points"] += len(message["payload"].get("points", []))
-            elif topic == "/lidar/rear":
-                SCAN_SESSION["rear_frames"] += 1
-                SCAN_SESSION["raw_points"] += len(message["payload"].get("points", []))
             elif topic == "/map/grid":
-                latest_points = _occupancy_payload_to_points(message["payload"])
                 latest_occupancy_grid = _occupancy_payload_to_grid(message["payload"])
 
             outbound_message = message
-            if topic in {"/lidar/front", "/lidar/rear"}:
-                points = message["payload"].get("points", [])
-                last_kf = last_lidar_keyframe_at.get(topic, 0.0)
-                keyframe = (now - last_kf) >= LIDAR_KEYFRAME_INTERVAL_SEC
-                if keyframe:
-                    last_lidar_keyframe_at[topic] = now
-                thinned = points if keyframe else _thin_points(points, LIDAR_MAX_WS_POINTS)
-                outbound_message = {
-                    **message,
-                    "payload": {
-                        **message["payload"],
-                        "points": thinned,
-                        "raw_points": len(points),
-                        "keyframe": keyframe,
-                    },
-                }
 
             packed = _pack_message(outbound_message)
             enqueue_nonblocking(("json", packed), reason=topic)
 
+    # 监控客户端活跃度；长时间无收发时主动断开，释放服务端资源。
     async def monitor_client_idle() -> None:
         nonlocal closed_by_server_timeout, disconnect_reason, disconnect_detail
         while True:
@@ -1654,6 +1489,7 @@ async def ws_stream(websocket: WebSocket) -> None:
                     logger.info("ws close ignored id=%s reason=idle_timeout detail=%s", ws_id, exc)
                 return
 
+    # 从发送队列取消息并写入 WebSocket，统一处理断开和 close 后发送异常。
     async def send_outbound() -> None:
         nonlocal last_client_activity, disconnect_reason, disconnect_detail
         while True:
@@ -1678,6 +1514,7 @@ async def ws_stream(websocket: WebSocket) -> None:
                     raise WebSocketDisconnect() from exc
                 raise
 
+    # 接收客户端 keepalive；收到 ping 时回复 pong，并刷新活跃时间。
     async def receive_keepalive() -> None:
         nonlocal last_client_activity, disconnect_reason, disconnect_detail
         while True:
@@ -1692,6 +1529,7 @@ async def ws_stream(websocket: WebSocket) -> None:
                 enqueue_nonblocking(("text", "pong"), reason="keepalive")
 
     try:
+        # 为每个主题创建一个订阅任务，再创建发送、保活接收和空闲监控任务。
         for topic in STREAM_TOPICS:
             tasks.append(asyncio.create_task(enqueue_topic(topic)))
         tasks.append(asyncio.create_task(send_outbound()))
@@ -1711,6 +1549,7 @@ async def ws_stream(websocket: WebSocket) -> None:
         logger.info("ws task cancelled id=%s", ws_id)
         raise
     finally:
+        # 无论正常断开还是异常退出，都取消所有子任务并清理客户端状态。
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

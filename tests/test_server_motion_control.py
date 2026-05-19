@@ -9,8 +9,7 @@ import pytest
 
 from server.app import main
 from server.app.config import ScanLaunchCommandConfig, ScanModesConfig
-from server.app.models import ControlTargetRequest, MoveCommand, SaveMapRequest, StartScanRequest, StopScanRequest
-from server.app.ultrasonic_safety import UltrasonicSafetyRuntime
+from server.app.models import ControlTargetRequest, MoveCommand, StartScanRequest, StopScanRequest
 
 
 class FakeBridge:
@@ -29,15 +28,6 @@ class FakeBridge:
     def latest_pose(self) -> dict:
         return {}
 
-    def latest_gps(self) -> dict:
-        return {}
-
-    def latest_chassis(self) -> dict:
-        return {}
-
-    def latest_map_points(self) -> list[tuple[float, float, float]]:
-        return []
-
     def set_scan_active(self, active: bool) -> None:
         self.scan_states.append(bool(active))
 
@@ -46,11 +36,6 @@ class FakeBridge:
 
     def diagnostics(self) -> dict:
         return {"bridge": "fake"}
-
-    def reset_map(self) -> bool:
-        self.reset_calls += 1
-        return True
-
 
 class FakeWebSocket:
     def __init__(self) -> None:
@@ -119,103 +104,6 @@ def test_ws_stream_logs_disconnect_reason_after_send_close_race(monkeypatch, cap
     assert any("reason=send_after_close" in message for message in caplog.messages)
 
 
-def test_ultrasonic_runtime_blocks_after_consecutive_faults() -> None:
-    runtime = UltrasonicSafetyRuntime(
-        SimpleNamespace(
-            enabled=True,
-            mode="single",
-            danger_distance_m=0.35,
-            resume_distance_m=0.45,
-            fault_trip_count=3,
-            recover_count=2,
-            max_valid_distance_m=4.0,
-            sudden_jump_m=0.45,
-        ),
-        serial_factory=None,
-        time_fn=lambda: 10.0,
-    )
-
-    runtime.update_from_measurement(None, error="short_frame", now=10.0)
-    runtime.update_from_measurement(None, error="short_frame", now=10.1)
-    snapshot = runtime.update_from_measurement(None, error="short_frame", now=10.2)
-
-    assert snapshot.blocked is True
-    assert snapshot.reason == "sensor_fault"
-    assert snapshot.consecutive_faults == 3
-
-
-def test_ultrasonic_runtime_recovers_only_after_resume_distance_repeats() -> None:
-    runtime = UltrasonicSafetyRuntime(
-        SimpleNamespace(
-            enabled=True,
-            mode="single",
-            danger_distance_m=0.35,
-            resume_distance_m=0.45,
-            fault_trip_count=3,
-            recover_count=2,
-            max_valid_distance_m=4.0,
-            sudden_jump_m=0.45,
-        ),
-        serial_factory=None,
-        time_fn=lambda: 20.0,
-    )
-
-    runtime.update_from_measurement([0.3], now=20.0)
-    first_recover = runtime.update_from_measurement([0.5], now=20.1)
-    second_recover = runtime.update_from_measurement([0.55], now=20.2)
-
-    assert first_recover.blocked is True
-    assert second_recover.blocked is False
-    assert second_recover.reason == ""
-
-
-def test_ultrasonic_runtime_parses_a22_single_frames_and_rejects_fffd_sentinel() -> None:
-    runtime = UltrasonicSafetyRuntime(
-        SimpleNamespace(
-            enabled=True,
-            mode="single",
-            frame_length=4,
-            sensor_count=1,
-            max_valid_distance_m=4.0,
-            danger_distance_m=0.35,
-            resume_distance_m=0.45,
-            fault_trip_count=3,
-            recover_count=2,
-            sudden_jump_m=0.45,
-        ),
-        serial_factory=None,
-        time_fn=lambda: 40.0,
-    )
-
-    distances, error = runtime._parse_payload(bytes.fromhex("ff005d5c"))
-    assert distances == [0.093]
-    assert error is None
-
-    distances, error = runtime._parse_payload(bytes.fromhex("ff017f7f"))
-    assert distances == [0.383]
-    assert error is None
-
-    distances, error = runtime._parse_payload(bytes.fromhex("ff00a6a5"))
-    assert distances == [0.166]
-    assert error is None
-
-    distances, error = runtime._parse_payload(bytes.fromhex("fffffdfb"))
-    assert distances is None
-    assert error == "sensor_no_echo"
-
-
-def test_ultrasonic_gate_blocks_nonzero_command_when_sensor_blocked(monkeypatch) -> None:
-    monkeypatch.setattr(
-        main,
-        "ULTRASONIC_RUNTIME",
-        SimpleNamespace(gate_command=lambda velocity, yaw_rate, now=None: (0.0, 0.0, "distance")),
-    )
-
-    velocity, yaw_rate, reason = main._apply_ultrasonic_control_gate(0.4, 0.2, now=30.0)
-
-    assert (velocity, yaw_rate, reason) == (0.0, 0.0, "distance")
-
-
 def test_smooth_control_command_uses_emergency_decel_for_forced_stop(monkeypatch) -> None:
     monkeypatch.setattr(
         main,
@@ -253,6 +141,21 @@ def test_older_move_request_does_not_stop_newer_ros_command(monkeypatch) -> None
     asyncio.run(scenario())
 
 
+def test_health_only_reports_pose_and_grid_topics(monkeypatch) -> None:
+    bridge = FakeBridge()
+    monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, reason="ROS2 bridge active", bridge=bridge))
+    monkeypatch.setattr(main, "STREAM_TOPICS", ["/robot/pose", "/map/grid"])
+
+    payload = asyncio.run(main.health())
+
+    assert payload["topics"] == ["/robot/pose", "/map/grid"]
+    assert payload["frames"] == {
+        "odom": main.CONFIG.ros.topics.odom_frame,
+        "base": main.CONFIG.ros.topics.robot_base_frame,
+    }
+    assert "simulator_active" not in payload
+
+
 def test_scan_start_request_accepts_2d_and_3d() -> None:
     assert StartScanRequest(mode="2d").mode == "2d"
     assert StartScanRequest(mode="3d").mode == "3d"
@@ -271,7 +174,6 @@ def test_scan_mode_config_exposes_2d_and_3d_defaults() -> None:
     ]
     assert config.mode_3d.launch_commands == [
         ScanLaunchCommandConfig(command=["ros2", "launch", "caddie_hardware", "navigation_hardware.launch.py"], processes=["navigation_hardware.launch.py"]),
-        ScanLaunchCommandConfig(command=["ros2", "launch", "caddie_velocity_controller", "caddie_velocity_controller_launch.py"], processes=["caddie_velocity_controller_launch.py"]),
     ]
     assert config.mode_3d.pcd_output_path == "/tmp/point_lio_map.pcd"
 
@@ -300,7 +202,6 @@ def test_start_scan_rejects_when_mapping_prereq_not_ready(monkeypatch) -> None:
         "checks": {"tf_tree": {"ok": False}, "odom": {"ok": False}},
     }
     monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
-    monkeypatch.setattr(main, "sim", SimpleNamespace(_running=False, scanning=False))
     monkeypatch.setattr(main, "_ensure_scan_mode_dependencies", lambda mode: {"required_nodes": [], "missing_nodes": [], "started_nodes": [], "errors": []})
     main._reset_scan_session()
 
@@ -316,7 +217,6 @@ def test_start_scan_rejects_when_mapping_prereq_not_ready(monkeypatch) -> None:
 def test_start_scan_rejects_invalid_mode(monkeypatch) -> None:
     bridge = FakeBridge()
     monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
-    monkeypatch.setattr(main, "sim", SimpleNamespace(_running=False, scanning=False))
 
     result = asyncio.run(main.start_scan(StartScanRequest.model_construct(mode="bad")))
 
@@ -328,7 +228,6 @@ def test_start_scan_rejects_invalid_mode(monkeypatch) -> None:
 def test_start_scan_records_mode_and_dependency_status(monkeypatch) -> None:
     bridge = FakeBridge()
     monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
-    monkeypatch.setattr(main, "sim", SimpleNamespace(_running=False, scanning=False))
     monkeypatch.setattr(main, "_mapping_prereq_summary", lambda: {"ready": True, "severity": "ok", "blockers": [], "warnings": [], "checks": {}})
     monkeypatch.setattr(main, "_ensure_scan_mode_dependencies", lambda mode: {"required_nodes": ["/slam_toolbox"], "missing_nodes": [], "started_nodes": [], "errors": []})
     main._reset_scan_session()
@@ -349,7 +248,6 @@ def test_start_scan_waits_for_mapping_prereq_after_dependencies(monkeypatch) -> 
         {"ready": True, "severity": "ok", "blockers": [], "warnings": [], "checks": {}},
     ]
     monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
-    monkeypatch.setattr(main, "sim", SimpleNamespace(_running=False, scanning=False))
     monkeypatch.setattr(main, "_ensure_scan_mode_dependencies", lambda mode: {"required_nodes": ["/slam_toolbox"], "missing_nodes": [], "started_nodes": ["/slam_toolbox"], "errors": []})
     monkeypatch.setattr(main, "_mapping_prereq_summary", lambda: prereq_checks.pop(0))
     monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
@@ -367,7 +265,6 @@ def test_start_scan_waits_for_mapping_prereq_after_dependencies(monkeypatch) -> 
 def test_start_scan_rejects_when_scan_already_active(monkeypatch) -> None:
     bridge = FakeBridge()
     monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
-    monkeypatch.setattr(main, "sim", SimpleNamespace(_running=False, scanning=False))
     main._reset_scan_session()
     main.SCAN_SESSION["active"] = True
 
@@ -414,7 +311,6 @@ def test_start_scan_obeys_cancel_seq_changed_during_dependency_start(monkeypatch
 def test_start_scan_returns_node_start_failed_when_dependencies_fail(monkeypatch) -> None:
     bridge = FakeBridge()
     monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
-    monkeypatch.setattr(main, "sim", SimpleNamespace(_running=False, scanning=False))
     monkeypatch.setattr(main, "_mapping_prereq_summary", lambda: {"ready": True, "severity": "ok", "blockers": [], "warnings": [], "checks": {}})
     monkeypatch.setattr(
         main,
@@ -434,7 +330,6 @@ def test_start_scan_returns_node_start_failed_when_dependencies_fail(monkeypatch
 def test_stop_scan_rejects_when_scan_not_active(monkeypatch) -> None:
     bridge = FakeBridge()
     monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
-    monkeypatch.setattr(main, "sim", SimpleNamespace(_running=False, scanning=False))
     main._reset_scan_session()
 
     result = asyncio.run(main.stop_scan(StopScanRequest(mode="2d")))
@@ -447,7 +342,6 @@ def test_stop_scan_inactive_still_attempts_process_cleanup(monkeypatch) -> None:
     bridge = FakeBridge()
     calls = []
     monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
-    monkeypatch.setattr(main, "sim", SimpleNamespace(_running=False, scanning=False))
     monkeypatch.setattr(main, "_stop_launched_scan_processes", lambda: calls.append(True) or {"stopped_pids": [1234], "stopped_patterns": [], "errors": []})
     main._reset_scan_session()
 
@@ -1057,7 +951,6 @@ def test_stop_scan_3d_only_stops_scan_without_returning_pcd(tmp_path: Path, monk
     pcd = tmp_path / "map.pcd"
     pcd.write_bytes(b"pcd-bytes")
     monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
-    monkeypatch.setattr(main, "sim", SimpleNamespace(_running=False, scanning=False))
     monkeypatch.setattr(main, "_pcd_output_path_for_mode", lambda mode: pcd)
     main._reset_scan_session()
     main.SCAN_SESSION["active"] = True
@@ -1076,7 +969,6 @@ def test_stop_scan_3d_requires_configured_pcd_path(monkeypatch) -> None:
     bridge = FakeBridge()
     logs = []
     monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
-    monkeypatch.setattr(main, "sim", SimpleNamespace(_running=False, scanning=False))
     monkeypatch.setattr(main, "_pcd_output_path_for_mode", lambda mode: None)
     monkeypatch.setattr(
         main,
@@ -1101,7 +993,6 @@ def test_stop_scan_3d_requires_configured_pcd_path(monkeypatch) -> None:
 def test_stop_scan_3d_rejects_missing_pcd_file(tmp_path: Path, monkeypatch) -> None:
     bridge = FakeBridge()
     monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
-    monkeypatch.setattr(main, "sim", SimpleNamespace(_running=False, scanning=False))
     monkeypatch.setattr(main, "_pcd_output_path_for_mode", lambda mode: tmp_path / "missing.pcd")
     main._reset_scan_session()
     main.SCAN_SESSION["active"] = True
@@ -1116,6 +1007,7 @@ def test_download_scan_pcd_returns_file_response(tmp_path: Path, monkeypatch) ->
     pcd = tmp_path / "map.pcd"
     pcd.write_bytes(b"pcd-bytes")
     monkeypatch.setattr(main, "_pcd_output_path_for_mode", lambda mode: pcd)
+    monkeypatch.setattr(main, "downsample_pcd_to_cache", lambda path, voxel_size: (path, {"voxel_size": voxel_size}))
     main._reset_scan_session()
     main.SCAN_SESSION["mode"] = "3d"
 
@@ -1124,7 +1016,14 @@ def test_download_scan_pcd_returns_file_response(tmp_path: Path, monkeypatch) ->
     assert result.status_code == 200
     assert result.headers["x-scan-pcd-name"] == "map.pcd"
     assert result.headers["x-scan-pcd-size"] == "9"
-    assert main.SCAN_SESSION["pcd_file"] == {"name": "map.pcd", "size": 9}
+    assert main.SCAN_SESSION["pcd_file"] == {
+        "name": "map.pcd",
+        "size": 9,
+        "source_name": "map.pcd",
+        "source_size": 9,
+        "voxel_size": 0.05,
+        "downsampled": True,
+    }
 
 
 def test_health_includes_mapping_prereq_summary(monkeypatch) -> None:
@@ -1137,7 +1036,6 @@ def test_health_includes_mapping_prereq_summary(monkeypatch) -> None:
         "checks": {"network": {"ok": False, "level": "warn"}},
     }
     monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
-    monkeypatch.setattr(main, "sim", SimpleNamespace(_running=False))
     main._reset_scan_session()
 
     result = asyncio.run(main.health())
@@ -1150,140 +1048,6 @@ def test_health_includes_mapping_prereq_summary(monkeypatch) -> None:
     assert result["scan_mode"] == "3d"
     assert result["dependency_status"]["required_nodes"] == []
     assert result["pcd_transfer_state"] == "idle"
-
-
-def test_current_map_points_ignores_scan_accumulation_without_occupancy_grid(monkeypatch) -> None:
-    monkeypatch.setattr(main, "latest_points", [(9.0, 9.0, 1.0)])
-    monkeypatch.setattr(
-        main,
-        "ros",
-        SimpleNamespace(
-            enabled=True,
-            bridge=SimpleNamespace(latest_map_points=lambda: []),
-        ),
-    )
-    main.SCAN_SESSION["accumulated"] = {"1:1": {"x": 1.0, "y": 1.0, "intensity": 1.0}}
-
-    points = main._current_map_points()
-
-    assert points == [(9.0, 9.0, 1.0)]
-
-
-def test_save_map_fails_when_no_map_source_is_available(monkeypatch) -> None:
-    monkeypatch.setattr(main, "latest_points", [])
-    monkeypatch.setattr(
-        main,
-        "ros",
-        SimpleNamespace(
-            enabled=True,
-            bridge=SimpleNamespace(latest_map_points=lambda: [], latest_pose=lambda: {}, latest_gps=lambda: {}, latest_imu=lambda: {}),
-        ),
-    )
-    monkeypatch.setattr(main, "sim", SimpleNamespace(state=SimpleNamespace(x=0.0, y=0.0, yaw=0.0, poi=[], path=[], trajectory=[], gps_track=[], chassis_track=[])))
-
-    result = asyncio.run(main.save_map(SaveMapRequest(name="demo", notes="demo", voxel_size=0.1, reset_after_save=False)))
-
-    assert result["ok"] is False
-    assert result["reason"] == "map_unavailable"
-
-
-def test_save_map_writes_new_slam_layout_without_pcd(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(main, "latest_points", [(1.0, 2.0, 1.0)])
-    monkeypatch.setattr(main, "map_dir", tmp_path)
-    monkeypatch.setattr(
-        main,
-        "ros",
-        SimpleNamespace(
-            enabled=False,
-            bridge=None,
-            reason="disabled",
-        ),
-    )
-    monkeypatch.setattr(
-        main,
-        "sim",
-        SimpleNamespace(
-            state=SimpleNamespace(x=0.0, y=0.0, yaw=0.0, poi=[], path=[], trajectory=[], gps_track=[], chassis_track=[]),
-        ),
-    )
-    main._reset_scan_session()
-    main.SCAN_SESSION["mode"] = "2d"
-
-    result = asyncio.run(main.save_map(SaveMapRequest(name="demo", notes="demo", voxel_size=0.1, reset_after_save=False)))
-
-    assert result["ok"] is True
-    assert result["contains"]["pcd"] is False
-    target = Path(result["file"])
-    with zipfile.ZipFile(target, "r") as zf:
-        assert set(zf.namelist()) == {"manifest.json", "grid.bin"}
-
-
-def test_save_map_writes_optional_pcd_into_slam(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(main, "latest_points", [(1.0, 2.0, 1.0)])
-    monkeypatch.setattr(main, "map_dir", tmp_path)
-    pcd = tmp_path / "map.pcd"
-    pcd.write_bytes(b"pcd-bytes")
-    monkeypatch.setattr(
-        main,
-        "ros",
-        SimpleNamespace(
-            enabled=False,
-            bridge=None,
-            reason="disabled",
-        ),
-    )
-    monkeypatch.setattr(
-        main,
-        "sim",
-        SimpleNamespace(
-            state=SimpleNamespace(x=0.0, y=0.0, yaw=0.0, poi=[], path=[], trajectory=[], gps_track=[], chassis_track=[]),
-        ),
-    )
-    main._reset_scan_session()
-    main.SCAN_SESSION["mode"] = "3d"
-    monkeypatch.setattr(main, "_pcd_output_path_for_mode", lambda mode: pcd)
-
-    result = asyncio.run(main.save_map(SaveMapRequest(name="demo3d", notes="demo", voxel_size=0.1, reset_after_save=False)))
-
-    assert result["ok"] is True
-    assert result["contains"]["pcd"] is True
-    target = Path(result["file"])
-    with zipfile.ZipFile(target, "r") as zf:
-        assert set(zf.namelist()) == {"manifest.json", "grid.bin", "map.pcd"}
-        assert zf.read("map.pcd") == b"pcd-bytes"
-
-
-def test_save_map_3d_fails_when_pcd_file_missing(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(main, "latest_points", [(1.0, 2.0, 1.0)])
-    monkeypatch.setattr(main, "map_dir", tmp_path)
-    monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=False, bridge=None, reason="disabled"))
-    monkeypatch.setattr(
-        main,
-        "sim",
-        SimpleNamespace(
-            state=SimpleNamespace(x=0.0, y=0.0, yaw=0.0, poi=[], path=[], trajectory=[], gps_track=[], chassis_track=[]),
-        ),
-    )
-    main._reset_scan_session()
-    main.SCAN_SESSION["mode"] = "3d"
-    monkeypatch.setattr(main, "_pcd_output_path_for_mode", lambda mode: tmp_path / "missing.pcd")
-
-    result = asyncio.run(main.save_map(SaveMapRequest(name="demo3d", notes="demo", voxel_size=0.1, reset_after_save=False)))
-
-    assert result["ok"] is False
-    assert result["reason"] == "pcd_file_missing"
-
-
-def test_reset_map_calls_bridge_and_clears_cached_points(monkeypatch) -> None:
-    bridge = FakeBridge()
-    monkeypatch.setattr(main, "latest_points", [(1.0, 2.0, 1.0)])
-    monkeypatch.setattr(main, "ros", SimpleNamespace(enabled=True, bridge=bridge, reason="ok"))
-
-    result = asyncio.run(main.reset_map())
-
-    assert result["ok"] is True
-    assert bridge.reset_calls == 1
-    assert main.latest_points == []
 
 
 def test_set_control_target_updates_server_target_without_sleeping(monkeypatch) -> None:
